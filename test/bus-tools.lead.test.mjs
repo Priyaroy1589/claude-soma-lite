@@ -716,6 +716,111 @@ test('a dep that returns a promise cannot float a rejection out of wake', async 
 });
 
 // ---------------------------------------------------------------------------
+// wake: only into a pane on this bus's own tmux server (issue #1)
+// ---------------------------------------------------------------------------
+
+// A pane id is a small per-server counter, so `%40` on one tmux server and `%40` on another are
+// two strangers' terminals. Seen in the field: two fleets on two sockets, both orchestrators in
+// `%40` of their own server, and every NEEDS_INPUT and COMPLETED wake from the second fleet's
+// leads typed into the FIRST fleet's orchestrator. The lead's bus did not know its fleet's socket,
+// fell back to `soma`, and never compared that with the socket the lease records.
+// `test/wake-sockets.test.mjs` reproduces it on real tmux; these pin the rule itself.
+
+/** An idle orchestrator pane, read through the real `readPane`, with every read recorded. */
+const countedReader = () => {
+  const reads = [];
+  return {
+    reads,
+    deps: { paneReading: (target) => { reads.push(target); return readPane(target, { panes: orchPanes(), capture: () => IDLE_FRAME }); } },
+  };
+};
+
+/** A wake ctx: the bus's env (beside the lead name) and the lease it reads, all effects recorded. */
+const wakeCtx = (env, lease) => {
+  const gate = countedReader();
+  const order = [];
+  const c = ctx({ SOMA_LEAD_NAME: 'cr-1', ...env }, {
+    ...gate.deps,
+    readLease: () => lease,
+    stampWake: () => order.push('stamp'),
+    sendKeys: (t, text) => { order.push('keys'); c._keys.push({ t, text }); },
+  });
+  return { c, reads: gate.reads, order };
+};
+
+const NEEDS_INPUT = { type: 'NEEDS_INPUT', payload: { question: 'which branch?' } };
+const TYPED = [{ t: '%1', text: '[soma] cr-1 NEEDS_INPUT. Call soma_inbox.' }];
+
+test('a lease on another tmux server is never typed into: no pane read, no stamp, no keys, and the toast says why', async () => {
+  const bt = await load();
+  const { c, reads, order } = wakeCtx({ SOMA_TMUX_SOCKET: 'soma' }, { tmux_socket: 'soma_pers', tmux_pane: '%1', wake: 'tmux' });
+  const r = await bt.leadTools(c).get('soma_report')(NEEDS_INPUT);
+  assert.equal(r.delivered, true, 'the report is on the log either way: the inject hook and soma_inbox carry it');
+  assert.deepEqual(c._keys, [], "%1 on this bus's server is a stranger's pane, not the orchestrator's");
+  assert.deepEqual(reads, [], "the pane gate reads %1 on this bus's server, so even looking would judge a stranger's pane");
+  assert.deepEqual(order, [], 'a push never attempted must not spend the fleet-wide debounce');
+  assert.deepEqual(c._toasts, [{ title: 'soma', body: "[soma] cr-1 NEEDS_INPUT — not typed: the orchestrator's pane is on tmux server soma_pers, not this bus's soma" }]);
+});
+
+test("a bus that was never told its socket is on the default server, so it holds a lease on any other (the field report's own case)", async () => {
+  const bt = await load();
+  // `''` is how soma spells unset, so it falls back exactly as the absent variable does.
+  for (const env of [{}, { SOMA_TMUX_SOCKET: '' }]) {
+    const { c, reads } = wakeCtx(env, { tmux_socket: 'soma2', tmux_pane: '%1', wake: 'tmux' });
+    await bt.leadTools(c).get('soma_report')(NEEDS_INPUT);
+    assert.deepEqual(c._keys, [], JSON.stringify(env));
+    assert.deepEqual(reads, [], JSON.stringify(env));
+    assert.deepEqual(c._toasts.map((x) => x.body), ["[soma] cr-1 NEEDS_INPUT — not typed: the orchestrator's pane is on tmux server soma2, not this bus's soma"], JSON.stringify(env));
+  }
+});
+
+test('a lease on the same server is typed exactly as before: one reading of the pane, stamp, then keys', async () => {
+  const bt = await load();
+  const { c, reads, order } = wakeCtx({ SOMA_TMUX_SOCKET: 'soma_pers' }, { tmux_socket: 'soma_pers', tmux_pane: '%1', wake: 'tmux' });
+  await bt.leadTools(c).get('soma_report')(NEEDS_INPUT);
+  assert.deepEqual(c._keys, TYPED);
+  assert.deepEqual(reads, ['%1']);
+  assert.deepEqual(order, ['stamp', 'keys']);
+  assert.deepEqual(c._toasts, [{ title: 'soma', body: '[soma] cr-1 NEEDS_INPUT' }]);
+});
+
+test('the default fleet is unchanged: a lease on soma is typed by a bus with no socket, an empty one, or soma', async () => {
+  const bt = await load();
+  for (const env of [{}, { SOMA_TMUX_SOCKET: '' }, { SOMA_TMUX_SOCKET: 'soma' }]) {
+    const { c } = wakeCtx(env, { tmux_socket: 'soma', tmux_pane: '%1', wake: 'tmux' });
+    await bt.leadTools(c).get('soma_report')(NEEDS_INPUT);
+    assert.deepEqual(c._keys, TYPED, JSON.stringify(env));
+    assert.deepEqual(c._toasts.map((x) => x.body), ['[soma] cr-1 NEEDS_INPUT'], JSON.stringify(env));
+  }
+});
+
+test('a lease that records no socket is typed as it always was, by the rule demote() already follows', async () => {
+  const bt = await load();
+  // Nothing to compare, so nothing to refuse on: a lease written before the socket was recorded,
+  // or by hand. `acquireLease` writes `tmux_socket || null`, so `''` only arrives by hand edit.
+  for (const lease of [{ tmux_socket: null, tmux_pane: '%1', wake: 'tmux' }, { tmux_pane: '%1', wake: 'tmux' }, { tmux_socket: '', tmux_pane: '%1', wake: 'tmux' }]) {
+    const { c } = wakeCtx({ SOMA_TMUX_SOCKET: 'soma_pers' }, lease);
+    await bt.leadTools(c).get('soma_report')(NEEDS_INPUT);
+    assert.deepEqual(c._keys, TYPED, JSON.stringify(lease));
+  }
+});
+
+test('the hold names the two servers without echoing a path or an unbounded string out of the lease', async () => {
+  const bt = await load();
+  // The lease is a file an operator can edit and a model can fill, so what it says is not quoted
+  // into a toast unless it is shaped like a socket name: short, and no slash.
+  for (const odd of ['/private/tmp/tmux-501/default', 'x'.repeat(10_000), 'two words']) {
+    const { c } = wakeCtx({ SOMA_TMUX_SOCKET: 'soma' }, { tmux_socket: odd, tmux_pane: '%1', wake: 'tmux' });
+    await bt.leadTools(c).get('soma_report')(NEEDS_INPUT);
+    assert.deepEqual(c._keys, [], 'it is still another server, so still held');
+    const body = c._toasts[0]?.body ?? '';
+    assert.match(body, /^\[soma\] cr-1 NEEDS_INPUT — not typed: the orchestrator's pane is on tmux server .+, not this bus's soma$/, body.slice(0, 200));
+    assert.ok(!body.includes('/'), `a path reached the toast: ${body.slice(0, 200)}`);
+    assert.ok(body.length <= 200, `the toast grew with the lease: ${body.length} characters`);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // soma_task
 // ---------------------------------------------------------------------------
 

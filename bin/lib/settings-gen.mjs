@@ -110,6 +110,7 @@ import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 import { SOMA_HOME, leadDir, p } from './paths.mjs';
 import { loadConfig } from './config.mjs';
+import { socketName } from './tmux.mjs';
 
 /**
  * The installed `bin/` directory — this file's parent's parent.
@@ -450,6 +451,11 @@ export function enumerateUserMcpServers(home = homedir(), env = process.env, opt
  * expose (`leadTools`, not `orchTools`), and `SOMA_LEAD_NAME` to attribute every
  * event it appends. `SOMA_HOME` is passed explicitly because the lead is started
  * `env -i` and must not fall back to `$HOME/.soma` when the fleet lives elsewhere.
+ * `SOMA_TMUX_SOCKET` likewise must not fall back to `soma`: a bus on the wrong server types
+ * its wakes into whatever pane holds the orchestrator's pane id there, which in the field was
+ * another fleet's orchestrator (issue #1). Both values are the ones the spawner itself uses
+ * (`paths.SOMA_HOME()`, `tmux.socketName()`), the same two `spawn.buildLeadEnv` injects, so
+ * the lead's env and this file cannot name two roots or two servers.
  *
  * `sequential-thinking` is the second and only other server. It is here because
  * `buildLeadArgv` passes `--strict-mcp-config`, so this file is the lead's ENTIRE MCP
@@ -473,7 +479,7 @@ export function writeLeadMcpConfig(id, busPath = join(BIN_DIR, 'soma-bus.mjs')) 
       soma: {
         command: 'node',
         args: [fwd(busPath)],
-        env: { SOMA_ROLE: 'lead', SOMA_LEAD_NAME: id, SOMA_HOME: SOMA_HOME() },
+        env: { SOMA_ROLE: 'lead', SOMA_LEAD_NAME: id, SOMA_HOME: SOMA_HOME(), SOMA_TMUX_SOCKET: socketName() },
       },
       'sequential-thinking': {
         command: 'npx',

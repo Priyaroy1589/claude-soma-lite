@@ -15,6 +15,7 @@ import { dirname, join } from 'node:path';
 import { leadDir, logPath, worktreeDir, SOMA_HOME } from '../bin/lib/paths.mjs';
 import { enumerateUserMcpServers, writeWorktreeGuardrails } from '../bin/lib/settings-gen.mjs';
 import { withRepoLock } from '../bin/lib/worktree.mjs';
+import { socketName, tmuxArgs } from '../bin/lib/tmux.mjs';
 import * as s from '../bin/lib/spawn.mjs';
 
 // --- helpers -----------------------------------------------------------------
@@ -435,6 +436,28 @@ test('SOMA_HOME reaches the lead resolved and identical to what the bus config r
   const env = s.buildLeadEnv({ id: 'cr-1', env: { ...SPAWNER_ENV, SOMA_HOME: `${SOMA_HOME()}/` } });
   assert.equal(env.SOMA_HOME, SOMA_HOME(),
     'settings-gen writes SOMA_HOME() into mcp.json; two spellings of one root make the bus and the lead disagree about where state lives');
+});
+
+/**
+ * Issue #1. `env -i` dropped the socket and nothing put it back, so every lead's bus fell back to
+ * `soma` and typed its wakes into whatever pane held the orchestrator's pane id THERE: in the
+ * field, another fleet's orchestrator. Injected like SOMA_HOME, from the spawner's own module,
+ * because that is the server `tmux.newSession` creates the lead on: equal by construction.
+ */
+test('SOMA_TMUX_SOCKET reaches the lead as the server the spawner creates it on, injected and never copied', () => {
+  const env = s.buildLeadEnv({ id: 'cr-1', env: SPAWNER_ENV });
+  assert.equal(env.SOMA_TMUX_SOCKET, socketName());
+  assert.deepEqual(tmuxArgs([]), ['-L', env.SOMA_TMUX_SOCKET], 'the socket every tmux call from this process, newSession included, runs under');
+  const copied = s.buildLeadEnv({ id: 'cr-1', env: { ...SPAWNER_ENV, SOMA_TMUX_SOCKET: 'not-the-spawners-server' } });
+  assert.equal(copied.SOMA_TMUX_SOCKET, socketName(),
+    'a copied value can name a server the lead was not created on; the injected one cannot');
+  assert.ok(!s.ENV_ALLOW.includes('SOMA_TMUX_SOCKET'), 'injected, so it must not also ride the copy');
+});
+
+test('the env tmux starts the lead with names the server it is started on', () => {
+  const { deps, calls } = harness();
+  s.spawnLead({ id: 'cr-1', repo: 'r', brief: 'do x' }, deps);
+  assert.equal(calls.newSession[0].env.SOMA_TMUX_SOCKET, socketName());
 });
 
 test('an allow-listed variable set to empty is dropped, so "" cannot read as set', () => {

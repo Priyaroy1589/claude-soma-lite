@@ -176,6 +176,19 @@ const ORCH_STREAM = 'orch';
 const DEFAULT_TMUX_SOCKET = 'soma';
 
 /**
+ * The tmux server this bus talks to: `SOMA_TMUX_SOCKET` from the env it was handed, else the
+ * default, with `''` read as unset the way every soma reader reads it.
+ *
+ * ONE spelling, shared by `wake()` (which compares it with the lease's socket before typing) and
+ * the orchestrator's `socket()` (which writes it into the lease), because those two answers must
+ * agree: a lease written with one spelling and checked against another could refuse every wake on
+ * its own server, or clear one for another. It mirrors `tmux.mjs`'s own resolution
+ * (`process.env.SOMA_TMUX_SOCKET || 'soma'`) rather than importing it: this module imports
+ * nothing, and a bus is handed its env rather than owning one.
+ */
+const busSocket = (env) => (nonEmpty(env?.SOMA_TMUX_SOCKET) ? env.SOMA_TMUX_SOCKET : DEFAULT_TMUX_SOCKET);
+
+/**
  * The terminal event types, and what a task row becomes when one arrives.
  *
  * Design §185: "the bus flips the task row on terminal events … so a finished lead
@@ -338,6 +351,14 @@ const WAKE_HOLDS = new Map([
   ['absent', () => 'the orchestrator\'s pane is gone from the soma tmux server'],
   ['unobservable', (r) => `the orchestrator's pane could not be read (${r.why})`],
 ]);
+
+/**
+ * A tmux socket name as the wake toast may print it, or a placeholder. Only a name shaped like one
+ * is quoted (`TMUX_NAME_RE`'s class: no slash, at most 64 characters), because the lease's half
+ * comes out of a file an operator can edit and a model can fill, and the toast stays path-free
+ * and bounded whatever that file says.
+ */
+const socketWord = (name) => (typeof name === 'string' && TMUX_NAME_RE.test(name) ? name : '(name not shown)');
 
 /** The reading when a bus has no pane reader at all: not a verdict of any kind, and said so. */
 const UNREAD_PANE = Object.freeze({ state: null, fine: null, kind: null, cmd: null, source: null, why: 'this bus has no pane reader wired' });
@@ -609,11 +630,12 @@ function clampPayload(payload) {
  *
  * Two channels, two policies, and both of them best-effort:
  *
- * - send-keys into the lease's pane, debounced fleet-wide to one per 30 s. This
- *   types a line into a live Claude Code composer and submits it, so it is a turn
- *   spent on the orchestrator's behalf: worth it for the four urgent types,
- *   ruinous per milestone across eight leads. The message says who and what, so
- *   the orchestrator can decide whether to read its inbox at all.
+ * - send-keys into the lease's pane, debounced fleet-wide to one per 30 s, and only
+ *   when the lease's tmux server is this bus's own. This types a line into a live
+ *   Claude Code composer and submits it, so it is a turn spent on the
+ *   orchestrator's behalf: worth it for the four urgent types, ruinous per
+ *   milestone across eight leads. The message says who and what, so the
+ *   orchestrator can decide whether to read its inbox at all.
  * - a desktop toast, always, for the same four types — even when the pane wake
  *   landed, because an orchestrator session with a pushed prompt is still an
  *   orchestrator nobody is looking at.
@@ -624,7 +646,7 @@ function clampPayload(payload) {
  * tool call, and a lead that believes its report was lost files it again.
  */
 export function wake(ctx, event) {
-  const { deps } = ctx;
+  const { deps, env } = ctx;
   const type = event?.type;
   // Everything that is not urgent leaves without touching a single effect — not
   // even the lease read. This is the design's "NEEDS_INPUT, ERROR and COMPLETED
@@ -648,20 +670,32 @@ export function wake(ctx, event) {
   try {
     const lease = deps.readLease();
     if (lease && lease.wake === 'tmux' && deps.lastWakeAgeMs() > WAKE_DEBOUNCE_MS) {
-      // Look before typing (the pane gate): the orchestrator's pane is a pane too, and this is the
-      // same literal-then-Enter idiom that approved a live permission dialog when measured. A
-      // hazard or an unreadable pane withholds the push — the pull path (the inject hook,
-      // `soma_inbox`) still carries the event — and the toast below says why.
-      const pane = wakePaneReading(deps, lease.tmux_pane);
-      held = WAKE_HOLDS.get(pane.state)?.(pane) ?? null;
-      if (held === null) {
-        // Stamped before the send, not after: the debounce is a rate limit on
-        // *attempts*, so a pane that has gone away (or a tmux call that throws)
-        // costs one pair of send-keys per 30 s rather than one per report. Optional
-        // because only the real wiring owns `state/last-wake`; a stub without it
-        // simply never debounces.
-        fireAndForget(deps.stampWake?.());
-        fireAndForget(deps.sendKeys(lease.tmux_pane, `${summary}. Call soma_inbox.`));
+      // The server before the pane (issue #1). `sendKeys` talks to THIS bus's server, and a pane
+      // id is a small per-server counter, so on any other server the lease's pane names a
+      // stranger: in the field, two fleets' orchestrators both sat in `%40` of their own servers
+      // and one fleet's wakes were typed into the other's. Checked ahead of the pane gate because
+      // the gate reads that pane id on this server too, so it would judge the stranger's pane and
+      // could clear it for typing. A lease that records no socket keeps the old behaviour, the
+      // rule `demote()` follows: there is nothing to compare.
+      const ours = busSocket(env);
+      if (nonEmpty(lease.tmux_socket) && lease.tmux_socket !== ours) {
+        held = `the orchestrator's pane is on tmux server ${socketWord(lease.tmux_socket)}, not this bus's ${socketWord(ours)}`;
+      } else {
+        // Look before typing (the pane gate): the orchestrator's pane is a pane too, and this is
+        // the same literal-then-Enter idiom that approved a live permission dialog when measured.
+        // A hazard or an unreadable pane withholds the push — the pull path (the inject hook,
+        // `soma_inbox`) still carries the event — and the toast below says why.
+        const pane = wakePaneReading(deps, lease.tmux_pane);
+        held = WAKE_HOLDS.get(pane.state)?.(pane) ?? null;
+        if (held === null) {
+          // Stamped before the send, not after: the debounce is a rate limit on
+          // *attempts*, so a pane that has gone away (or a tmux call that throws)
+          // costs one pair of send-keys per 30 s rather than one per report. Optional
+          // because only the real wiring owns `state/last-wake`; a stub without it
+          // simply never debounces.
+          fireAndForget(deps.stampWake?.());
+          fireAndForget(deps.sendKeys(lease.tmux_pane, `${summary}. Call soma_inbox.`));
+        }
       }
     }
   } catch {
@@ -931,16 +965,17 @@ export function orchTools(ctx) {
   };
 
   /**
-   * The tmux server this session's panes live on.
+   * The tmux server this session's panes live on — `busSocket`, the one spelling `wake()` uses too.
    *
-   * Mirrors `tmux.mjs`'s own resolution (`process.env.SOMA_TMUX_SOCKET || 'soma'`)
-   * rather than importing it, and it is written into the lease on purpose: the
-   * lease's `degraded` check only looks at the pane, so a `wake: 'tmux'` claim with
-   * no socket would send-keys to whatever server the reader happens to use — which
-   * is the socket split-brain measured while building `tmux.mjs`, where a watchdog on
-   * the wrong server declares every lead dead.
+   * It is written into the lease on purpose, because a pane id only means something on the server
+   * that numbered it, and the lease's `degraded` check only looks at the pane. A `wake: 'tmux'`
+   * claim without its server leaves each reader to assume its own: the socket split-brain measured
+   * while building `tmux.mjs` (a watchdog on the wrong server declares every lead dead), arriving
+   * through the lease. The two readers that type into the lease's pane, `wake()` and `demote()`,
+   * compare it with their own socket and do not type across servers; a lease that records no socket
+   * gives them nothing to compare, and they type on their own server as they always did.
    */
-  const socket = () => (nonEmpty(env?.SOMA_TMUX_SOCKET) ? env.SOMA_TMUX_SOCKET : DEFAULT_TMUX_SOCKET);
+  const socket = () => busSocket(env);
 
   /**
    * This session's tmux pane, or null outside tmux. One spelling, shared by `claimOf` (which

@@ -254,7 +254,8 @@ soma2() {
   the first fleet's watchdog live: `soma2 up` starts nothing, and the second queue never drains.
 - Run `soma2 init` once, so the bus it registers in the second config root pins that socket, and
   drive the second fleet only through `soma2`. Start its orchestrator under the second config root
-  (`CLAUDE_CONFIG_DIR="$HOME/.claude-second" claude`) and outside tmux; the warning in
+  (`CLAUDE_CONFIG_DIR="$HOME/.claude-second" claude`), inside that fleet's own tmux server
+  (`tmux -L soma_second new-session -s orchestrator`); the warning in
   [A first supervised run](#7-a-first-supervised-run) says why.
 
 ## 4. `soma init`
@@ -415,8 +416,9 @@ Stay at the terminal for this. It is the use RUNBOOK §11 says the project is re
 > slower. **Never start the orchestrator in your own tmux while leads are running:** the bus
 > records your pane's id without checking which tmux server it is on, and a wake-up is typed into
 > the pane with that id on soma's server, which can be a lead's or a teammate's. For a fleet on
-> another socket, such as `soma2`'s, start the orchestrator outside tmux: on this build, leads
-> send every wake-up to the default `soma` server ([issue #1](https://github.com/techfreakworm/claude-soma-lite/issues/1)).
+> another socket, such as `soma2`'s, start the orchestrator inside that fleet's own tmux server
+> (`tmux -L soma_second new-session -s orchestrator`): a lead types its wake-ups only on its own
+> fleet's server.
 
 3. **Check the promotion.** From a second terminal, or after detaching:
 
