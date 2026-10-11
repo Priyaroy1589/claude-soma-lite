@@ -55,7 +55,7 @@ const T0 = Date.now() - 60_000;
 /** A task row with every field `fleet.enqueue` writes, so nothing reads undefined. */
 const rowsOf = (tasks) => tasks.map((t) => ({
   id: t.id, title: null, repo: 'r', source: {}, brief: 'b', status: 'queued', base_branch: null,
-  budget_class: null, lead_session_uuid: null, tmux_session: null, attempts: 0, base_sha: null, seat: null, rotations: [],
+  budget_class: null, budget_override: null, lead_session_uuid: null, tmux_session: null, attempts: 0, base_sha: null, seat: null, rotations: [],
   created: T0, updated: T0, ...t,
 }));
 
@@ -170,10 +170,14 @@ function orch(opts = {}) {
     tailLog: (lead, n) => `${lead}:${n}`,
     buildDigest: () => ({ path: '/d/today.md', done: 1 }),
     // harness.validateHarnessReport, in shape: it takes the lead's spelling
-    // ("H2 — the suite already runs") and answers with the registry's canonical pair.
-    validateHarnessReport: (p) => (/^h2\b/i.test(String(p?.harness_id))
-      ? { ok: true, harness_id: 'H2', budget_class: 'iterate' }
-      : { ok: false, error: 'unknown harness_id' }),
+    // ("H2 — the suite already runs") and answers with the registry's canonical pair. H1 and H4
+    // are here for the documented H1 -> H4 degrade, the supersede the fold has to follow.
+    validateHarnessReport: (p) => {
+      const n = /^h([124])\b/i.exec(String(p?.harness_id))?.[1];
+      return n === undefined
+        ? { ok: false, error: 'unknown harness_id' }
+        : { ok: true, harness_id: `H${n}`, budget_class: { 1: 'standard', 2: 'iterate', 4: 'review' }[n] };
+    },
     ...(opts.deps ?? {}),
   };
   return { env: { SOMA_ROLE: 'orchestrator', SOMA_SESSION_ID: 'S1', SOMA_TMUX_PANE: '%1', ...(opts.env ?? {}) }, deps, s };
@@ -801,6 +805,59 @@ test('a configured fleet catches a repo typo at intake; an unconfigured one queu
   assert.deepEqual(r2.queued, ['cr-9']);
 });
 
+test('a budget class soma.json does not define is refused at intake, and the reply names the ones it does', async () => {
+  const bt = await load();
+  // The watchdog prices a lead at its pinned class from the first tick, and passes over a pin it
+  // cannot bind without a word when the lead's harness prices it. So the door is where a typo
+  // in the class has to be caught.
+  const c = orch({ config: { max_leads: 10, repos: {}, budgets: { standard: { tokens_cap: 1000 }, babysit: { tokens_cap: 400 }, flat: 42 } } });
+  const r = await bt.orchTools(c).get('soma_enqueue')({ tasks: [
+    { id: 'cr-1', budget_class: 'babysit' },
+    { id: 'cr-2' },                                       // no pin: the lead's harness prices it
+    { id: 'cr-3', budget_class: null },                   // the same, spelled out
+    { id: 'cr-4', budget_class: 'premium' },              // never written in soma.json
+    { id: 'cr-5', budget_class: 'constructor' },          // Object.prototype's, not soma.json's
+    { id: 'cr-6', budget_class: 'flat' },                 // an own key with no caps behind it
+    { id: 'cr-7', budget_class: 'Babysit' },              // matched exactly, as the breaker matches it
+    { id: 'cr-8', budget_class: 7 },
+    { id: 'cr-9', budget_class: '' },
+  ] });
+  assert.deepEqual(r.queued, ['cr-1', 'cr-2', 'cr-3']);
+  assert.deepEqual(r.skipped, ['cr-4', 'cr-5', 'cr-6', 'cr-7', 'cr-8', 'cr-9'].map((id) => ({ id, reason: 'unknown-budget-class' })));
+  assert.deepEqual(r.known_budget_classes, ['standard', 'babysit'], 'only the classes the breaker can bind');
+  assert.deepEqual(c.s.fleet.tasks.map((t) => t.id), ['cr-1', 'cr-2', 'cr-3']);
+
+  // No refusal of that kind, no list: the reply carries what the caller needs to act on.
+  const fine = await bt.orchTools(c).get('soma_enqueue')({ tasks: [{ id: 'cr-10', budget_class: 'standard' }] });
+  assert.deepEqual(fine.queued, ['cr-10']);
+  assert.equal(fine.known_budget_classes, undefined);
+});
+
+test('the class check reads own keys only, and stands down when there is nothing to check against', async () => {
+  const bt = await load();
+  // A record on the budgets' prototype is a class nobody wrote in soma.json; an `in` lookup
+  // would admit it.
+  const budgets = Object.assign(Object.create({ premium: { tokens_cap: 1 } }), { standard: { tokens_cap: 1000 } });
+  const proto = orch({ config: { max_leads: 10, repos: {}, budgets } });
+  const r = await bt.orchTools(proto).get('soma_enqueue')({ tasks: [{ id: 'cr-1', budget_class: 'premium' }] });
+  assert.deepEqual(r.skipped, [{ id: 'cr-1', reason: 'unknown-budget-class' }]);
+  assert.deepEqual(r.known_budget_classes, ['standard']);
+
+  // As with an unknown repo: a config that cannot be read, or that defines no class at all,
+  // validates nothing rather than refusing every pin.
+  const unreadable = orch({ deps: { loadConfig: () => { throw new Error('Unexpected token } in JSON at position 9'); } } });
+  for (const c of [
+    unreadable,
+    orch({ config: { max_leads: 10, repos: {} } }),
+    orch({ config: { max_leads: 10, repos: {}, budgets: null } }),
+    orch({ config: { max_leads: 10, repos: {}, budgets: {} } }),
+  ]) {
+    const out = await bt.orchTools(c).get('soma_enqueue')({ tasks: [{ id: 'cr-1', budget_class: 'anything' }] });
+    assert.deepEqual(out.queued, ['cr-1']);
+    assert.equal(out.known_budget_classes, undefined);
+  }
+});
+
 test('an unbounded brief is refused rather than written into the checkpoint', async () => {
   const bt = await load();
   const c = orch();
@@ -1420,12 +1477,51 @@ test('a refused or unvalidatable harness is not folded at all', async () => {
 test('an operator-chosen budget class survives the fold', async () => {
   const bt = await load();
   const c = orch({
-    tasks: [{ id: 'cr-1', budget_class: 'research' }],
+    // A row enqueued with `budget_class: 'research'` since `budget_override` exists: `fleet.enqueue`
+    // writes the class into both fields, and the pin is what the fold defers to.
+    tasks: [{ id: 'cr-1', budget_class: 'research', budget_override: 'research' }],
     events: [{ type: 'HARNESS', lead: 'cr-1', payload: { harness_id: 'H2' } }],
   });
   await bt.orchTools(c).get('soma_inbox')({});
   assert.equal(c.s.fleet.tasks[0].harness, 'H2');
   assert.equal(c.s.fleet.tasks[0].budget_class, 'research');
+});
+
+test('a superseding HARNESS moves the row\'s class to the new harness\'s when nobody pinned one', async () => {
+  const bt = await load();
+  // The documented H1 -> H4 degrade, after the first report was drained. Left at `standard`, the
+  // row shows a review lead's spend against standard's cap in `soma_status`, and nothing on it
+  // could tell that class from an operator's pin.
+  const c = orch({
+    tasks: [{ id: 'cr-1', status: 'spawned', harness: 'H1', budget_class: 'standard' }],
+    events: [{ type: 'HARNESS', lead: 'cr-1', payload: { harness_id: 'H4 — the review loop' } }],
+  });
+  const r = await bt.orchTools(c).get('soma_inbox')({});
+  assert.equal(r.folded, 1);
+  assert.equal(c.s.fleet.tasks[0].harness, 'H4');
+  assert.equal(c.s.fleet.tasks[0].budget_class, 'review');
+});
+
+test('a pinned class survives a superseding HARNESS, and a drain with nothing else to say writes nothing', async () => {
+  const bt = await load();
+  const c = orch({
+    tasks: [{ id: 'cr-1', status: 'spawned', harness: 'H1', budget_class: 'babysit', budget_override: 'babysit' }],
+    events: [{ type: 'HARNESS', lead: 'cr-1', payload: { harness_id: 'H4' } }],
+  });
+  const r = await bt.orchTools(c).get('soma_inbox')({});
+  assert.equal(r.folded, 1, 'the harness still moves');
+  assert.equal(c.s.fleet.tasks[0].harness, 'H4');
+  assert.equal(c.s.fleet.tasks[0].budget_class, 'babysit');
+
+  // The harness already matches and the pin outranks the harness's class: the row disagrees with
+  // nothing, so `updateFleet` is not paid for.
+  const still = orch({
+    tasks: [{ id: 'cr-1', status: 'spawned', harness: 'H4', budget_class: 'babysit', budget_override: 'babysit' }],
+    events: [{ type: 'HARNESS', lead: 'cr-1', payload: { harness_id: 'H4' } }],
+  });
+  const again = await bt.orchTools(still).get('soma_inbox')({});
+  assert.equal(again.folded, 0);
+  assert.equal(still.s.updates, 0);
 });
 
 test('a COMPLETED event folds its PR url onto the row', async () => {

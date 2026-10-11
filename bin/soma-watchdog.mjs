@@ -125,10 +125,17 @@ const TRIP_PCT = 100;
 const DEATH_SCENE_LINES = 12;
 const DEATH_SCENE_CHARS = 800;
 
-/** The harness `budgetClassFor` is asked for when a row has not reported one (design's table). */
+/**
+ * The harness a lead that has declared nothing is priced at: no class pinned at enqueue, and no
+ * HARNESS on its stream or its row. Every lead spends its first minutes like this, before its
+ * step-1 report, and it is not announced (`budgetClassOf`, rule 3).
+ */
 const DEFAULT_HARNESS = 'H1';
 
-/** The class every lead falls back to, so `HARNESS_DEFAULTED` has something to bind. */
+/**
+ * The class bound when something was declared and nothing declared can be priced, and the class
+ * `HARNESS_DEFAULTED` names (`budgetClassOf`, rule 4). The same class H1 reserves, as shipped.
+ */
 const DEFAULT_CLASS = 'standard';
 
 /** Floor and fallback for the loop's own cadence, so a bad `tick_ms` cannot spin the process. */
@@ -239,6 +246,8 @@ function newestOf(rows, types) {
 const NEEDS_INPUT = new Set(['NEEDS_INPUT']);
 /** The three that mean a lead stopped needing anybody. Mirrors `bus-tools.TERMINAL_STATUS`. */
 const TERMINAL_EVENTS = new Set(['COMPLETED', 'ERROR', 'GAVE_UP']);
+/** A lead's own plan of record; the newest one that names a harness prices it (`budgetClassOf`). */
+const HARNESS_EVENTS = new Set(['HARNESS']);
 
 /**
  * The statuses in which a lead holds a live, answerable session — the rows the breaker owns.
@@ -456,6 +465,91 @@ function fallbackClass(cfg) {
   const budgets = cfg?.budgets;
   if (budgets === null || typeof budgets !== 'object') return null;
   return Object.hasOwn(budgets, DEFAULT_CLASS) ? budgets[DEFAULT_CLASS] : null;
+}
+
+/** A name as a row or a payload declares one: a string with something in it, else null. */
+const declaredName = (value) => (typeof value === 'string' && value !== '' ? value : null);
+
+/**
+ * The class soma.json defines under exactly `name`, or null.
+ *
+ * Own key and record value, never truthiness and never `in`, for `fallbackClass`'s reason:
+ * `constructor` resolves through `Object.prototype` to a function nobody wrote in soma.json. The
+ * record check is `harness.readBudgets`'s, and it matters more here than in `fallbackClass`. A
+ * pinned class that cannot be bound still has the lead's harness behind it, so it is passed over;
+ * handed to `checkBudget` instead, it would be refused on every tick, and the lead would go
+ * unmetered for as long as the row exists.
+ */
+function definedClass(cfg, name) {
+  const budgets = cfg?.budgets;
+  if (name === null || budgets === null || typeof budgets !== 'object' || Array.isArray(budgets) || !Object.hasOwn(budgets, name)) return null;
+  const cls = budgets[name];
+  return cls !== null && typeof cls === 'object' && !Array.isArray(cls) ? cls : null;
+}
+
+/**
+ * The budget class that prices `task`, as `{cls, defaulted}`: `defaulted` is the HARNESS_DEFAULTED
+ * payload when the fallback class was bound, and null when there is nothing to announce.
+ *
+ * The first rule that prices the lead wins:
+ *
+ * 1. **The class the operator pinned at enqueue**, when soma.json defines it. Read from
+ *    `budget_override`, which only `fleet.enqueue` writes, and never from `budget_class`. The inbox
+ *    fold keeps `budget_class` following the lead's newest harness, so on a row nobody pinned it is
+ *    the harness's class restated. On a row folded before `budget_override` existed it is the class
+ *    of the FIRST report: after the documented H1 -> H4 degrade, a resolver reading it as a pin
+ *    prices a review lead at standard.
+ * 2. **The harness the lead declared**: the newest HARNESS on its OWN stream that names one, else
+ *    the row's `harness`. The stream comes first because the row learns the harness only when the
+ *    orchestrator drains its inbox, and until that drain this file priced every lead as H1: an
+ *    iterate lead tripped at standard's cap with its reservation already on disk. A stream that
+ *    cannot be read leaves the row's harness standing and is not reported here: the lead is still
+ *    metered, and for a `spawned` lead phase 4's read of the same stream reports the failure on the
+ *    same tick.
+ * 3. **Nothing declared at all**: H1's class, and nothing is announced. Every lead spends its first
+ *    minutes here, before its step-1 HARNESS, and an event on every spawn is an alarm an operator
+ *    learns to mute.
+ * 4. **Something declared, and nothing declared can be priced**: a harness the registry does not
+ *    carry or soma.json cannot price, a pinned class soma.json does not define with no priceable
+ *    harness behind it, or H1 itself unpriceable. The fallback class is bound, and the payload says
+ *    what was declared, each name cut to 32 characters because one event is one atomic append.
+ *
+ * A pinned class soma.json does not define, on a lead whose harness prices, is passed over without
+ * a word: the lead is priced by its harness. `soma_enqueue` refuses such a class at the door. One
+ * can still reach a row through `soma enqueue --file`, which does not check it, or by being removed
+ * from soma.json after the enqueue.
+ *
+ * `cls` can still be null (rule 4 with no `standard` defined either), and the caller hands it to
+ * `checkBudget` regardless, which refuses it out loud.
+ */
+function budgetClassOf(deps, cfg, task) {
+  const override = declaredName(task.budget_override);
+  const pinned = definedClass(cfg, override);
+  if (pinned !== null) return { cls: pinned, defaulted: null };
+
+  let harness = declaredName(task.harness);
+  try {
+    const rows = deps.leadEvents(task.id);
+    const newest = newestOf((Array.isArray(rows) ? rows : []).filter((e) => declaredName(e?.payload?.harness_id) !== null), HARNESS_EVENTS);
+    if (newest !== null) harness = newest.event.payload.harness_id;
+  } catch {
+    // The row's harness stands; rule 2 above says why this is not reported.
+  }
+
+  // Rules 2 and 3. A pinned class that could not be bound is a declaration too, so a row carrying
+  // one never reaches H1 silently.
+  if (harness !== null || override === null) {
+    const cls = deps.budgetClassFor(harness ?? DEFAULT_HARNESS);
+    if (cls !== null && cls !== undefined) return { cls, defaulted: null };
+  }
+  return {
+    cls: fallbackClass(cfg),
+    defaulted: {
+      harness: harness === null ? null : harness.slice(0, 32),
+      budget_override: override === null ? null : override.slice(0, 32),
+      budget_class: DEFAULT_CLASS,
+    },
+  };
 }
 
 /**
@@ -1040,21 +1134,14 @@ function meter(deps, cfg, task, history, now) {
     turns: own === null ? 0 : reqNum('tick: the lead session\'s own turns', own.turns),
   };
 
-  // Never `cls ? checkBudget(…) : null`. That ternary short-circuits precisely when
-  // `budgetClassFor` returns null — the real failure mode, and what the original
-  // prototype-pollution bug produced — so `checkBudget`'s own guard never runs and the verdict
-  // is silently null: a lead with no breaker at all. The class is bound and announced instead,
-  // and if even `standard` is missing, `checkBudget` refuses out loud.
-  let cls = deps.budgetClassFor(task.harness || DEFAULT_HARNESS);
-  if (cls === null || cls === undefined) {
-    cls = fallbackClass(cfg);
-    if (!history.defaulted.has(task.id)) {
-      deps.appendEvent(ORCH, {
-        type: 'HARNESS_DEFAULTED',
-        payload: { harness: task.harness ?? null, budget_class: DEFAULT_CLASS },
-        lead: task.id,
-      });
-    }
+  // Never `cls ? checkBudget(…) : null`. That ternary short-circuits precisely when no class
+  // resolves — the real failure mode, and what the original prototype-pollution bug produced —
+  // so `checkBudget`'s own guard never runs and the verdict is silently null: a lead with no
+  // breaker at all. `budgetClassOf` binds the fallback class instead and this announces it, once
+  // per lead; if even `standard` is missing, `checkBudget` refuses out loud.
+  const { cls, defaulted } = budgetClassOf(deps, cfg, task);
+  if (defaulted !== null && !history.defaulted.has(task.id)) {
+    deps.appendEvent(ORCH, { type: 'HARNESS_DEFAULTED', payload: defaulted, lead: task.id });
   }
   const caps = { tokens_cap: cls?.tokens_cap ?? null, turn_cap: cls?.turn_cap ?? null, wall_ms: cls?.wall_ms ?? null };
 

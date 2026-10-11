@@ -1448,6 +1448,20 @@ export function orchTools(ctx) {
     return names.length ? new Set(names) : null;
   };
 
+  /**
+   * The budget classes soma.json defines, or null when there is nothing to check a pin against.
+   *
+   * A class counts only as an own key whose value is a record of caps: the rule the watchdog binds
+   * a pinned class by and `harness.readBudgets` prices a harness by, so a class this door admits is
+   * one the breaker can bind. Null, validating nothing, for the reason `knownRepos` gives.
+   */
+  const knownBudgetClasses = async () => {
+    const budgets = (await configOf())?.budgets;
+    if (!isRecord(budgets)) return null;
+    const names = Object.keys(budgets).filter((name) => isRecord(budgets[name]));
+    return names.length ? new Set(names) : null;
+  };
+
   def('soma_enqueue', async ({ tasks } = {}) => {
     if (!Array.isArray(tasks)) {
       return refuse('tasks must be an array of task objects, e.g. [{"id":"task-42","title":"…","repo":"…","brief":"…"}]');
@@ -1456,6 +1470,7 @@ export function orchTools(ctx) {
       return refuse(`${tasks.length} tasks in one call is more than a backlog; send at most ${MAX_ENQUEUE} per call`);
     }
     const known = await knownRepos();
+    const classes = await knownBudgetClasses();
     const rejected = [];
     const accepted = [];
     for (const task of tasks) {
@@ -1479,6 +1494,14 @@ export function orchTools(ctx) {
         rejected.push({ id, reason: 'unknown-repo' });
         continue;
       }
+      // The watchdog prices a lead at its pinned class from the first tick, and passes over a pin
+      // it cannot bind without a word whenever the lead's harness prices it. A typo has to be
+      // caught here, or the pin is simply never applied. `classes` holds only names, so a pin
+      // that is not a string at all fails the same `has`.
+      if (classes && task.budget_class !== undefined && task.budget_class !== null && !classes.has(task.budget_class)) {
+        rejected.push({ id, reason: 'unknown-budget-class' });
+        continue;
+      }
       accepted.push(task);
     }
 
@@ -1497,6 +1520,7 @@ export function orchTools(ctx) {
       : [];
     const out = { queued: Array.isArray(result.queued) ? result.queued : [], skipped: [...fromFleet, ...rejected] };
     if (known && rejected.some((row) => row.reason === 'unknown-repo')) out.known_repos = [...known].slice(0, 50);
+    if (classes && rejected.some((row) => row.reason === 'unknown-budget-class')) out.known_budget_classes = [...classes].slice(0, 50);
     return out;
   });
 
@@ -1933,9 +1957,10 @@ export function orchTools(ctx) {
    *
    * The validator is asked because it is the thing that owns the registry, and it
    * returns the canonical pair — a lead writes `harness_id: "H2 — the suite already
-   * runs"` and the row must say `H2`, because the watchdog prices a breaker by that
-   * string. A refusal means no fold at all: a wrong harness on the row is worse
-   * than a null one, since it would bind the budget breaker to the wrong class.
+   * runs"` and the row must say `H2`, because `soma_status` shows that string and the
+   * watchdog prices a breaker by it whenever the lead's own stream cannot be read. A
+   * refusal means no fold at all: a wrong harness on the row is worse than a null
+   * one, since it would bind the budget breaker to the wrong class.
    */
   const canonicalHarness = async (payload) => {
     if (has('validateHarnessReport')) {
@@ -1992,7 +2017,7 @@ export function orchTools(ctx) {
   /** Does this row disagree with what the events say? */
   const foldNeeded = (task, patch) => !!task && !!patch && (
     (nonEmpty(patch.harness) && task.harness !== patch.harness)
-    || (nonEmpty(patch.budget_class) && !nonEmpty(task.budget_class))
+    || (nonEmpty(patch.budget_class) && !nonEmpty(task.budget_override) && task.budget_class !== patch.budget_class)
     || (nonEmpty(patch.pr_url) && task.pr_url !== patch.pr_url)
     || (nonEmpty(patch.status) && FLIPPABLE.has(task.status) && task.status !== patch.status
       && decidesFateOf(patch.at, task.updated)));
@@ -2055,9 +2080,12 @@ export function orchTools(ctx) {
           const patch = patches.get(task?.id);
           if (!foldNeeded(task, patch)) continue;
           if (nonEmpty(patch.harness)) task.harness = patch.harness;
-          // Only when the row has none: an operator's per-task budget override at
-          // enqueue outranks the class the harness reserves.
-          if (nonEmpty(patch.budget_class) && !nonEmpty(task.budget_class)) task.budget_class = patch.budget_class;
+          // The class follows the lead's newest harness unless the operator pinned one
+          // at enqueue, in `budget_override`, which only `fleet.enqueue` writes. The row's
+          // own `budget_class` cannot be that test: this fold used to keep the class of
+          // the FIRST report forever, so after an H1 -> H4 supersede the row read
+          // `standard` whether an operator had chosen it or not.
+          if (nonEmpty(patch.budget_class) && !nonEmpty(task.budget_override)) task.budget_class = patch.budget_class;
           if (nonEmpty(patch.pr_url)) task.pr_url = patch.pr_url;
           // Assigned rather than routed through `setTaskStatus`: this is already
           // inside the transaction the whole fold shares, so it saves a nested lock

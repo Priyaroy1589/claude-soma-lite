@@ -172,12 +172,17 @@ test('a queued task carries the whole record, and the checkpoint round-trips thr
 
   const [one, two] = f.readFleet().tasks;
   assert.deepEqual(Object.keys(one).sort(), [
-    'attempts', 'base_branch', 'base_sha', 'brief', 'budget_class', 'created', 'id',
+    'attempts', 'base_branch', 'base_sha', 'brief', 'budget_class', 'budget_override', 'created', 'id',
     'lead_session_uuid', 'repo', 'rotations', 'seat', 'source', 'status', 'title', 'tmux_session', 'updated',
   ]);
   assert.equal(one.status, 'queued');
   assert.equal(one.attempts, 0);
   assert.equal(one.base_branch, 'develop');
+  // A class given at enqueue is written twice: `budget_class` for display, which the inbox fold
+  // then keeps following the lead's harness, and `budget_override`, the pin the breaker reads
+  // first and nothing else ever writes.
+  assert.equal(one.budget_class, 'standard');
+  assert.equal(one.budget_override, 'standard');
   assert.deepEqual(one.source, { kind: 'md', ref: 'x' });
   assert.ok(Number.isInteger(one.created) && one.created === one.updated);
 
@@ -189,6 +194,8 @@ test('a queued task carries the whole record, and the checkpoint round-trips thr
   assert.equal(two.repo, null);
   assert.deepEqual(two.source, {});
   assert.equal(two.brief, '');
+  assert.equal(two.budget_class, null);
+  assert.equal(two.budget_override, null, 'no class pinned: the lead is priced by its harness');
 
   const onDisk = JSON.parse(readFileSync(p('state', 'fleet.json'), 'utf8'));
   assert.deepEqual(onDisk.tasks.map((x) => x.id), ['cr-1', 'cr-2']);

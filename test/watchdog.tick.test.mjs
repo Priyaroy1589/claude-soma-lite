@@ -59,6 +59,7 @@ const row = (over = {}) => ({
   status: 'queued',
   base_branch: null,
   budget_class: null,
+  budget_override: null,
   lead_session_uuid: null,
   tmux_session: null,
   attempts: 0,
@@ -840,6 +841,228 @@ test('a lead already warned in the log is not warned again', async () => {
   });
   await tick(c.deps);
   assert.deepEqual(eventsOf(c, 'BUDGET'), []);
+});
+
+// ════════════════════════ Which class prices a lead ════════════════════════
+//
+// The breaker priced every lead off `task.harness || 'H1'`, and `task.harness` reaches the row
+// only when the orchestrator drains the lead's HARNESS through `soma_inbox`. So until that drain
+// every lead was metered as H1, and a class the operator pinned at enqueue never reached the
+// breaker at all. Each class below carries a token cap no other class has, so the `tokens_cap` in
+// a BUDGET payload names the class that priced the lead.
+
+/** Four classes with four different token caps: a BUDGET payload says which one was bound. */
+const PRICED = {
+  standard: { ...CLASS },                                             // 1,000,000
+  iterate: { tokens_cap: 3_000_000, turn_cap: 600, wall_ms: 12 * 3600 * 1000 },
+  review: { tokens_cap: 2_000_000, turn_cap: 600, wall_ms: 10 * 3600 * 1000 },
+  babysit: { tokens_cap: 400_000, turn_cap: 0, wall_ms: 0 },
+};
+
+/** The class each harness reserves, as `prompts/harnesses.json` ships the table. */
+const RESERVES = { H1: 'standard', H2: 'iterate', H3: 'iterate', H4: 'review', H5: 'babysit', H6: 'research' };
+
+/**
+ * A lead priced the way `harness.budgetClassFor` prices one: the class its harness reserves, read
+ * off the fixture's own config, and null for a harness the table does not carry or a class the
+ * config does not define (`research` is not configured here). `budgets` is used as given, so a
+ * prototype on it survives.
+ */
+const priced = (over = {}, budgets = structuredClone(PRICED)) => {
+  const cfg = cfgOf({ budgets });
+  return ctx({
+    cfg,
+    alive: new Set(['lead-a']),
+    budgetClassFor: (h) => (Object.hasOwn(RESERVES, h) && Object.hasOwn(cfg.budgets, RESERVES[h]) ? cfg.budgets[RESERVES[h]] : null),
+    ...over,
+  });
+};
+
+/** A worktree whose lead and team have spent `est` est_tokens, the lead three turns in. */
+const spent = (est) => () => dirUsage({ est_tokens: est, sessions: [usage({ uuid: 'u', turns: 3 })] });
+
+/** A HARNESS report as `soma_report` stores it on the lead's own stream. */
+const declared = (id, ts, cls) => ev('HARNESS', 'a', ts, { harness_id: id, budget_class: cls, plan_summary: 'p' });
+
+test('a class pinned at enqueue prices the lead from its first tick, before it declares a harness', async () => {
+  const { tick } = await load('bc1-' + Date.now());
+  const c = priced({
+    // What `fleet.enqueue` writes for `budget_class: 'babysit'`. No HARNESS has been filed yet.
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', budget_class: 'babysit', budget_override: 'babysit' })] },
+    // Over babysit's 400,000 and half of standard's 1,000,000: only the pinned class trips this.
+    readDirUsage: spent(500_000),
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.tripBudget, ['a'], 'priced as H1, the pinned class never reaches the breaker');
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.babysit.tokens_cap);
+  assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), []);
+});
+
+test('the lead\'s own HARNESS report prices it at once, without waiting for the orchestrator\'s drain', async () => {
+  const { tick } = await load('bc2-' + Date.now());
+  const c = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u' })] },          // undrained: no harness on the row
+    leadEvents: { a: [ev('STARTED', 'a', NOW - 9 * MIN), declared('H3', NOW - 8 * MIN, 'iterate')] },
+    // 2.5x standard's cap and 83% of iterate's: H1 trips this lead, H3 only warns it.
+    readDirUsage: spent(2_500_000),
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.tripBudget, [], 'an iterate lead tripped at standard\'s cap because its report was still unread');
+  const budget = oneEvent(c, 'BUDGET');
+  assert.equal(budget.payload.pct, 80);
+  assert.equal(budget.payload.tokens_cap, PRICED.iterate.tokens_cap);
+  assert.ok(c.calls.budgetClassFor.includes('H3'), `budgetClassFor was asked for ${JSON.stringify(c.calls.budgetClassFor)}`);
+  assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), []);
+});
+
+test('the newest HARNESS on the lead\'s stream beats the stale harness its row still carries', async () => {
+  const { tick } = await load('bc3-' + Date.now());
+  // The documented H1 -> H4 degrade: the orchestrator drained the first report and not the second.
+  const stream = { a: [declared('H1', NOW - 30 * MIN, 'standard'), declared('H4', NOW - 5 * MIN, 'review')] };
+  const c = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', harness: 'H1', budget_class: 'standard' })] },
+    leadEvents: stream,
+    // 1.8x standard's cap and 90% of review's.
+    readDirUsage: spent(1_800_000),
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.tripBudget, [], 'priced off the row, an H4 lead trips at H1\'s cap');
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap);
+
+  // A row the fold wrote before `budget_override` existed: drained to H4, with the class of the
+  // FIRST report, which that fold never updated. Nothing on such a row says whether an operator
+  // chose `standard`, so a resolver that read `budget_class` as a pin would price this H4 lead
+  // at H1's cap. Only `budget_override` is a pin, and this row has none.
+  const legacy = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', harness: 'H4', budget_class: 'standard' })] },
+    leadEvents: stream,
+    readDirUsage: spent(1_800_000),
+  });
+  await tick(legacy.deps);
+  assert.deepEqual(legacy.calls.tripBudget, []);
+  assert.equal(oneEvent(legacy, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap);
+});
+
+test('a pinned class beats the harness the lead declared', async () => {
+  const { tick } = await load('bc4-' + Date.now());
+  const c = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', harness: 'H4', budget_class: 'babysit', budget_override: 'babysit' })] },
+    leadEvents: { a: [declared('H4', NOW - 5 * MIN, 'review')] },
+    // Over babysit's 400,000 and a quarter of review's 2,000,000.
+    readDirUsage: spent(500_000),
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.tripBudget, ['a']);
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.babysit.tokens_cap);
+  assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), []);
+});
+
+test('a pinned class soma.json does not define falls through to the harness, without a word', async () => {
+  const { tick } = await load('bc5-' + Date.now());
+  // A name soma.json never wrote; `constructor`, which a truthiness lookup finds on
+  // Object.prototype (a function); an own key whose value is not a record; and a record class
+  // reachable only through the budgets' prototype, which an `in` lookup would bind.
+  const inherited = Object.assign(Object.create({ premium: { tokens_cap: 1, turn_cap: 0, wall_ms: 0 } }), structuredClone(PRICED));
+  for (const [pinned, budgets] of [
+    ['premium', structuredClone(PRICED)],
+    ['constructor', structuredClone(PRICED)],
+    ['flat', { ...structuredClone(PRICED), flat: 42 }],
+    ['premium', inherited],
+  ]) {
+    const c = priced({
+      fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', budget_class: pinned, budget_override: pinned })] },
+      leadEvents: { a: [declared('H4', NOW - 5 * MIN, 'review')] },
+      readDirUsage: spent(1_800_000),
+    }, budgets);
+    await tick(c.deps);
+    assert.deepEqual(c.calls.tripBudget, [], pinned);
+    assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap, pinned);
+    assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), [], `${pinned}: the harness priced this lead, so nothing was defaulted`);
+    assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), [], pinned);
+  }
+});
+
+test('a lead that has declared nothing yet is priced as H1, and that is not announced', async () => {
+  const { tick } = await load('bc6-' + Date.now());
+  const c = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u' })] },
+    leadEvents: { a: [ev('STARTED', 'a', NOW - 9 * MIN)] },
+    readDirUsage: spent(1_200_000),
+  });
+  await tick(c.deps);
+  // Every lead spends its first minutes here, before its step-1 HARNESS report. Announcing it
+  // would announce every spawn, and an alarm that fires on every spawn is one an operator mutes.
+  assert.deepEqual(c.calls.budgetClassFor, ['H1']);
+  assert.deepEqual(c.calls.tripBudget, ['a']);
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.standard.tokens_cap);
+  assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), []);
+});
+
+test('a declaration nothing can price binds standard and says so once, naming what was declared', async () => {
+  const { tick } = await load('bc7-' + Date.now());
+  const cases = [
+    { name: 'a harness the registry does not carry, read off the stream before any drain',
+      over: {}, stream: [declared('H9', NOW - 5 * MIN, 'standard')],
+      payload: { harness: 'H9', budget_override: null, budget_class: 'standard' } },
+    { name: 'a harness on the row whose class soma.json does not define',
+      over: { harness: 'H6' }, stream: [],
+      payload: { harness: 'H6', budget_override: null, budget_class: 'standard' } },
+    { name: 'a pinned class soma.json does not define, with no harness declared behind it',
+      over: { budget_class: 'premium', budget_override: 'premium' }, stream: [],
+      payload: { harness: null, budget_override: 'premium', budget_class: 'standard' } },
+    // Both cut to 32: one event is one atomic append, so nothing unbounded rides in a payload.
+    { name: 'long spellings of both',
+      over: { budget_class: 'p'.repeat(100), budget_override: 'p'.repeat(100) }, stream: [declared('X'.repeat(100), NOW - 5 * MIN, 'standard')],
+      payload: { harness: 'X'.repeat(32), budget_override: 'p'.repeat(32), budget_class: 'standard' } },
+  ];
+  for (const { name, over, stream, payload } of cases) {
+    const mk = (extra = {}) => priced({
+      fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', ...over })] },
+      leadEvents: { a: stream },
+      readDirUsage: spent(1_200_000),
+      ...extra,
+    });
+    const c = mk();
+    await tick(c.deps);
+    const said = oneEvent(c, 'HARNESS_DEFAULTED');
+    assert.equal(said.lead, 'a', name);
+    assert.deepEqual(said.payload, payload, name);
+    assert.deepEqual(c.calls.tripBudget, ['a'], `${name}: the fallback class still trips`);
+    assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.standard.tokens_cap, name);
+
+    // Once per lead, off the durable log; the breaker keeps running under it.
+    const again = mk({ orchEvents: [ev('HARNESS_DEFAULTED', 'a', NOW - MIN, payload)] });
+    await tick(again.deps);
+    assert.deepEqual(eventsOf(again, 'HARNESS_DEFAULTED'), [], name);
+    assert.deepEqual(again.calls.tripBudget, ['a'], `${name}: the dedupe is on the announcement, never on the breaker`);
+  }
+});
+
+test('a lead stream that cannot be read costs the pricing its freshest input, never the lead its breaker', async () => {
+  const { tick } = await load('bc8-' + Date.now());
+  const c = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', harness: 'H4', budget_class: 'review' })] },
+    readDirUsage: spent(1_800_000),
+    deps: { leadEvents: () => { throw new Error('EACCES reading the lead stream'); } },
+  });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap, 'priced by the harness the row carries');
+  assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR').filter((e) => e.payload?.where === 'budget'), []);
+  assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), []);
+});
+
+test('a HARNESS that names no harness declares nothing, so the one before it still prices the lead', async () => {
+  const { tick } = await load('bc9-' + Date.now());
+  // `soma_report` refuses such a report before it is stored, so only a hand-written line can be
+  // one. It must not mask the real declaration filed before it.
+  const c = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u' })] },
+    leadEvents: { a: [declared('H4', NOW - 9 * MIN, 'review'), ev('HARNESS', 'a', NOW - 2 * MIN, {})] },
+    readDirUsage: spent(1_800_000),
+  });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap);
+  assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), []);
 });
 
 // ════════════════════════ Model deviation ════════════════════════

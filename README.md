@@ -448,10 +448,19 @@ The retired key `resume_token_guard` is stripped with a warning if your file sti
   teammates every tool except the soma bus: a tripped lead can still call its bus tools, and the
   denial tells it to file `COMPLETED` or `ERROR` with what exists. **No verb clears a trip**: delete
   the file by hand, or kill the lead.
-- The class comes from the harness the lead declares (H1 standard, H2 and H3 iterate, H4 review,
-  H5 babysit, H6 research). The harness reaches the task row when the orchestrator drains the
-  lead's `HARNESS` report; until then the lead is priced as H1, `standard`. A `budget_class` given
-  at enqueue is recorded on the row and shown in `soma_status`, but the breaker does not read it.
+- The breaker prices a lead at the first class that resolves. A `budget_class` given at enqueue
+  comes first, when soma.json's `budgets` defines it. Next is the class of the harness the lead
+  declares (H1 standard, H2 and H3 iterate, H4 review, H5 babysit, H6 research), read from the
+  lead's own newest `HARNESS` report, so it binds on the next tick without waiting for the
+  orchestrator to drain it. A lead with neither, which is every unpinned lead for its first
+  minutes, is priced as H1, `standard`, with no event. The fallback, `standard` with
+  `HARNESS_DEFAULTED` logged once for that lead, applies in exactly two cases: something was
+  declared and none of it can be priced (a harness the registry does not carry or soma.json cannot
+  price, or an enqueue class soma.json does not define with no priceable harness behind it), or
+  nothing was declared and even H1 cannot be priced, which means a broken install.
+- An enqueue class soma.json does not define is ignored without an event whenever the lead's
+  harness can be priced. `soma_enqueue` refuses one (`unknown-budget-class`, with the classes
+  soma.json does define); `soma enqueue --file` does not check it.
 - The caps are calibrated against real one-ticket sessions, none of them a soma lead with a team;
   the team multiplier is an estimate (about 2.5×, in a 1.5× to 4× band). RUNBOOK §10 describes the
   measurement run that settles it.
@@ -600,7 +609,8 @@ may still be running.
 `soma enqueue --file` takes a JSON **array** (an object keyed by id is refused). Each row needs an
 `id` matching `^[a-z][a-z0-9-]{0,63}$`, because it becomes a directory name, a tmux session and an
 event stream. Fields kept on the row: `id`, `title`, `repo`, `brief`, `base_branch`, `budget_class`,
-`source`. Anything else is dropped, **including `verify_hint`**, so put the verify command inside
+`source`. A `budget_class` is also copied to `budget_override`, the pin the breaker reads first.
+Anything else is dropped, **including `verify_hint`**, so put the verify command inside
 the `brief`. Invalid and duplicate rows are skipped rather than fatal, and the counts are printed:
 compare them with what you sent.
 

@@ -179,6 +179,9 @@ an unconfigured repo cannot spawn:
 `turn_cap` is calibrated per lead and is a backstop, not a budget. Warn at 80 %, hard trip at 100 %;
 a trip writes `leads/<id>/BUDGET_TRIPPED`, which the PreToolUse gate reads to deny every tool except
 the soma bus — so a tripped lead can still file `COMPLETED` or `ERROR`, and nothing else.
+A lead is priced at the class pinned at enqueue when soma.json defines it, else at the class its
+newest `HARNESS` report reserves, else at `standard`; README's budget section has the exact rule
+and when `HARNESS_DEFAULTED` fires.
 
 ### Config keys that are declared and read by nothing
 
@@ -517,7 +520,10 @@ soma enqueue --file tasks.json
 `tasks.json` is a **JSON array** (an object keyed by id is the likely mistake and is refused by
 name). Each row needs at least `id`, matching `^[a-z][a-z0-9-]{0,63}$` — it becomes a directory
 name, a tmux target and an event stream, so nothing else is admitted. Fields that survive into the
-fleet row: `id`, `title`, `repo`, `source`, `brief`, `base_branch`, `budget_class`.
+fleet row: `id`, `title`, `repo`, `source`, `brief`, `base_branch`, `budget_class`, and
+`budget_override`, a copy of `budget_class` that pins the breaker to it. This verb does not check
+that soma.json defines the class (`soma_enqueue` does); one it does not define is ignored without
+an event whenever the lead's harness can be priced.
 
 ```json
 [

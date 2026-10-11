@@ -287,6 +287,12 @@ export function enqueue(tasks) {
         status: 'queued',
         base_branch: t.base_branch ?? null,
         budget_class: t.budget_class ?? null,
+        // The same class again, as the operator's PIN, and this is its only writer. `budget_class`
+        // is for display, and the inbox fold rewrites it to follow the lead's newest harness unless
+        // this is set; the watchdog prices the lead at this class first. Two fields because one
+        // could not tell a pin from a class the fold derived: after an H1 -> H4 supersede the row
+        // read `budget_class: 'standard'` either way.
+        budget_override: t.budget_class ?? null,
         lead_session_uuid: null,
         tmux_session: null,
         attempts: 0,

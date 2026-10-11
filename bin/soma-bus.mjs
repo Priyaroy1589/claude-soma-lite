@@ -574,7 +574,7 @@ const SPECS = {
   soma_enqueue: {
     description:
       'Add tasks to the queue. Each row needs an id and a brief you authored — the brief is the assignment a lead will work from, so write it, do not paste the ticket. '
-      + 'Rows are validated per task and the reply lists what was `skipped` and why (duplicate, invalid-id, reserved-id, unknown-repo, brief-too-long); a batch that is too large is refused whole.',
+      + 'Rows are validated per task and the reply lists what was `skipped` and why (duplicate, invalid-id, reserved-id, unknown-repo, unknown-budget-class, brief-too-long); a batch that is too large is refused whole.',
     inputSchema: obj({
       tasks: {
         type: 'array',
@@ -586,7 +586,7 @@ const SPECS = {
           repo: str('Repo name as configured in soma.json (a name, not a path).'),
           brief: str('The assignment: goal, constraints, and a checkable definition of done. Authored by you.'),
           base_branch: str('Branch to cut the worktree from. Defaults to the repo\'s configured base.'),
-          budget_class: str('Override the token budget class instead of letting the lead\'s harness pick it.'),
+          budget_class: str('Pin the lead\'s token budget class. It must name a class in soma.json\'s budgets; the breaker prices the lead at it from its first tick, in place of the class its harness reserves. Omit it to let the harness pick.'),
           source: { type: 'object', description: 'Provenance, e.g. {ref: "PROJ-42"}.' },
         }, ['id']),
       },
