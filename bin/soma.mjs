@@ -1083,6 +1083,22 @@ export async function dispatch(argv, deps = {}) {
       if (live0 !== null && live0.has(WATCHDOG)) {
         d.print(`watchdog: live already (tmux session ${WATCHDOG}) — nothing was started and no new`
           + ' spend was authorised.');
+        // SOMA.JSON IS READ ON THIS PATH TOO, for the reason the pause flag is (below): a live
+        // watchdog is not an open queue. It loads the same file at the top of every tick, so a file
+        // the loader refuses — one that does not parse, a `seats` that is not an array — throws
+        // there on every tick, which logs WATCHDOG_ERROR and admits nothing. This path used to
+        // return without reading it and print "the queue is already open" over exactly that, while
+        // a fresh `up` on the same file exits 2 naming the key (#53). Same loader, same exit.
+        try {
+          d.loadConfig();
+        } catch (e) {
+          d.warn(`soma up: ${reason(e)} — the watchdog already running loads this same soma.json at`
+            + ' the start of every tick and is refusing it too, so it admits nothing (and revives and'
+            + ' meters nothing) until the file is fixed: the queue is NOT open. Fix soma.json (`soma'
+            + ' doctor` reads it too); the running watchdog takes the fix on its next tick, with no'
+            + ' restart, and until then `soma digest` shows its WATCHDOG_ERROR on every one.');
+          return ENV;
+        }
         // THE PAUSE FLAG IS READ ON THIS PATH TOO, and that is what this line is for. A LIVE
         // WATCHDOG IS NOT AN OPEN QUEUE: the flag has one home (`queue.queuePaused`), it survives
         // `soma down` and back up on purpose — a paused queue must stay paused across a restart,

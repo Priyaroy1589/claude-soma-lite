@@ -390,8 +390,8 @@ soma2() {
 key (objects merge; arrays such as `seats` replace). Unknown keys are kept. The file is re-read on
 every watchdog tick, so most edits apply on the next tick. An unreadable file is an error, never a
 silent fall-back to the defaults, and so is a `seats` that is not an array: `soma up` exits 2 naming
-the key, and a running watchdog logs `WATCHDOG_ERROR` every tick and does nothing until the file is
-fixed. soma never writes this file.
+the key, whether or not a watchdog is already running, and a running watchdog logs `WATCHDOG_ERROR`
+every tick and does nothing until the file is fixed. soma never writes this file.
 
 **`repos` is the key you must fill in.** A task's `repo` field is a key into this map, not a path.
 With `repos` empty, a task cannot spawn: the watchdog retries it three times and then marks it

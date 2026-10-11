@@ -139,10 +139,11 @@ forever.
 
 Optional. `loadConfig()` is `DEFAULTS` with your file layered over it, key by key, and unknown keys
 are preserved. A file that does not parse is refused, never read as the defaults, and so is a
-`seats` that is not an array. `soma up` then exits 2 with a message naming the key; a watchdog
-already running logs `WATCHDOG_ERROR` on every tick and acts on nothing until the file is fixed,
-exactly as it does for an unparseable file. Minimum useful file — **`repos` is the one you must fill
-in**, because a task naming an unconfigured repo cannot spawn:
+`seats` that is not an array. `soma up` then exits 2 with a message naming the key, whether or not a
+watchdog is already running; a watchdog already running logs `WATCHDOG_ERROR` on every tick and acts
+on nothing until the file is fixed, exactly as it does for an unparseable file, and `up`'s refusal
+beside it says so. Minimum useful file — **`repos` is the one you must fill in**, because a task
+naming an unconfigured repo cannot spawn:
 
 ```json
 {
@@ -409,9 +410,12 @@ soma up
 Order of operations, and every step can stop it:
 
 1. `ensureTree()` and the hard-link probe → **exit 2** on failure.
-2. **Already-live short-circuit.** If tmux reports `soma-watchdog` live, nothing is started, no new
-   spend is authorised, and the **pause flag is still read and reported** — a live watchdog is *not*
-   an open queue. Exit 0 — **unless you passed `--canary`**: then the canary runs here too (§5.4),
+2. **Already-live short-circuit.** If tmux reports `soma-watchdog` live, nothing is started and no
+   new spend is authorised, but **`soma.json` and the pause flag are still read** — a live watchdog
+   is *not* an open queue. A `soma.json` the loader refuses (step 3) is **exit 2** here too: the
+   refusal names the key and says that the running watchdog, which loads the same file at the start
+   of every tick, is refusing it and admits nothing until it is fixed. Otherwise the pause flag is
+   reported and it is exit 0 — **unless you passed `--canary`**: then the canary runs here too (§5.4),
    with no projection and no prompt, and anything but a pass is **exit 3**. The watchdog that was
    already running is left exactly as it is, and the refusal says so, then carries the same NOTE as
    §5.4:

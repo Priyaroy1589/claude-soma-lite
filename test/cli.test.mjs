@@ -1250,6 +1250,33 @@ test('up refuses a seats that is not an array before it projects, asks, or start
   assert.equal(h.calls.newSession.length, 0, 'a watchdog was started on a refused config');
 });
 
+test('up beside a watchdog already running reads soma.json too, and refuses one that watchdog is refusing (#53)', async (t) => {
+  const home = root(t);
+  // The already-live path returned before soma.json was ever read: on a file the loader refuses it
+  // printed "the queue is already open" and exited 0, while the running watchdog — which loads the
+  // same file at the top of every tick — logged WATCHDOG_ERROR on each one and admitted nothing. A
+  // fresh `soma up` on the same file exits 2 naming the key. The REAL loader, as in the test above.
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ seats: {} }));
+  const h = mk({ loadConfig, liveSessions: () => new Set(['soma-watchdog']) }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 2, 'the exit a fresh `soma up` gives the same file');
+  assert.match(h.stderr(), /^soma up: .*\bseats\b/m, 'the refusal must name the key');
+  assert.match(h.stderr(), /watchdog .*is refusing it/, 'and say the running watchdog is refusing the same file');
+  assert.match(h.stderr(), /admits nothing/, 'and what that costs: nothing is admitted until it is fixed');
+  assert.doesNotMatch(h.stdout(), /queue is already open/, 'the false claim, in its own words');
+  assert.equal(h.calls.confirm.length, 0);
+  assert.equal(h.calls.newSession.length, 0);
+
+  // THE CONTROL: the same path over a file the loader accepts is unchanged — exit 0, the queue line,
+  // and nothing on stderr. Without it, an arm that refused every live `up` would pass the above.
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ seats: [] }));
+  const ok = mk({ loadConfig, liveSessions: () => new Set(['soma-watchdog']) }, { answer: true });
+  assert.equal(await dispatch(['up'], ok.deps), 0, ok.stderr());
+  assert.match(ok.stdout(), /queue is already open/);
+  assert.equal(ok.stderr(), '');
+  assert.equal(ok.calls.confirm.length, 0);
+});
+
 test('up --canary does not open the queue on a verdict that is not a pass', async (t) => {
   root(t);
   const bad = mk({ canary: async () => false }, { answer: true });
