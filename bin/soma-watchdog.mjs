@@ -44,9 +44,9 @@
  *   lead. `checkBudget` is called unconditionally here, and a class that cannot be resolved is
  *   defaulted-and-announced or refused, never skipped.
  * - **Nothing is announced twice.** `drained` needs no quiet window, a tripped lead stays over
- *   cap forever, a given-up row stays `spawned` until the orchestrator folds it — so every
- *   emit here is idempotent against the durable log or against a flag file. An alarm that
- *   fires every 30 s is one an operator mutes, which is the same thing as no alarm.
+ *   cap until a clear grants it more, a given-up row stays `spawned` until the orchestrator folds
+ *   it — so every emit here is idempotent against the durable log or against a flag file. An
+ *   alarm that fires every 30 s is one an operator mutes, which is the same thing as no alarm.
  * - **A degraded reading is loud and local.** One lead whose transcript is mid-rotation must not
  *   cost the other nine their breaker, so per-lead work is wrapped and reported as
  *   WATCHDOG_ERROR against that lead. Reported, not swallowed.
@@ -96,7 +96,7 @@ import { modelDeviation, readDirUsage, readTailRows, readUsage } from './lib/tok
 import { nextAdmission } from './lib/wd/admission.mjs';
 import { MIN_EPOCH_MS, STORM_REASON, clearBackpressure, detectStorm, readBackpressure, writeBackpressure } from './lib/wd/backpressure.mjs';
 import { resolveBudgetClass } from './lib/wd/budget-class.mjs';
-import { checkBudget, tripPath, warnPath } from './lib/wd/budget.mjs';
+import { METERED, checkBudget, grantCount, grantedClass, grantsOf, tripPath, warnPath } from './lib/wd/budget.mjs';
 import { classifyLimit } from './lib/wd/limit-state.mjs';
 import { CAPTURE_TIMEOUT_MS, CENSUS_LINES, takeCensus } from './lib/wd/pane-state.mjs';
 import { reconcile } from './lib/wd/reconcile.mjs';
@@ -236,8 +236,10 @@ const NEEDS_INPUT = new Set(['NEEDS_INPUT']);
 /** The three that mean a lead stopped needing anybody. Mirrors `bus-tools.TERMINAL_STATUS`. */
 const TERMINAL_EVENTS = new Set(['COMPLETED', 'ERROR', 'GAVE_UP']);
 
-/**
- * The statuses in which a lead holds a live, answerable session — the rows the breaker owns.
+/*
+ * `METERED`, imported from `wd/budget.mjs`: the statuses in which a lead holds a live, answerable
+ * session — the rows the breaker owns. One set, shared with `clearTrip`, so a clear grants an
+ * allowance to exactly the rows this meter judges.
  *
  * **`blocked` is in this set, and its absence is what let a lead run with no token cap, no turn
  * cap and no wall cap while its row and `soma_status` both looked healthy.** The chain, and
@@ -268,12 +270,13 @@ const TERMINAL_EVENTS = new Set(['COMPLETED', 'ERROR', 'GAVE_UP']);
  *
  * **Terminal rows are out, deliberately.** A `done`/`failed`/`skipped` lead has reported that it
  * stopped; its transcript is not growing, and `BUDGET_TRIPPED` written against it is a flag only
- * an explicit unlink clears. Their panes do linger — there is no `linger_minutes` reaper on this
- * build — but a finished lead's lingering pane is that reaper's business, and metering every
- * terminal row would grow per-tick I/O with the fleet's whole history, since v1 never removes a
- * task. `queued` rows have no session, and no worktree whose transcripts could be read.
+ * an explicit unlink clears (`clearTrip` refuses those rows: nothing meters them, so there is no
+ * allowance to grant, and nothing re-trips them either). Their panes do linger — there is no
+ * `linger_minutes` reaper on this build — but a finished lead's lingering pane is that reaper's
+ * business, and metering every terminal row would grow per-tick I/O with the fleet's whole
+ * history, since v1 never removes a task. `queued` rows have no session, and no worktree whose
+ * transcripts could be read.
  */
-const METERED = new Set(['spawned', 'blocked']);
 
 /**
  * What the orchestrator stream already says, so nothing is announced twice.
@@ -309,17 +312,21 @@ function orchHistory(deps) {
       revertRefusedAt: NEVER_FRESH,
     };
   }
-  // BUDGET is said once per lead SESSION, not once per lead. Spend is the worktree directory's, so it
-  // carries across revivals, and a lead revived `fresh` is a new session with none of the old context:
-  // deduped per lead, it started past 80% of the same budget and was never told. So each BUDGET names
-  // the session it covers (`session_uuid`, null for a row with no uuid), and a BUDGET with no own
-  // `session_uuid` at all was logged before events named one: it covers every session of its lead,
-  // so a lead in flight at the upgrade is not told twice. Maps and Sets keyed by lead id, never
-  // objects (the `constructor` reason above).
-  const budgetSessions = new Map();
+  // BUDGET is said once per lead SESSION and ALLOWANCE, not once per lead. Spend is the worktree
+  // directory's, so it carries across revivals, and a lead revived `fresh` is a new session with none
+  // of the old context: deduped per lead, it started past 80% of the same budget and was never told.
+  // And a cleared trip grants a new allowance (`budget_grants` on the row), whose own 80% the lead has
+  // not been told about either. So each BUDGET names the session it covers (`session_uuid`, null for
+  // a row with no uuid) and the allowance it judged (`grants`). A BUDGET with no own `grants` was
+  // logged before allowances existed and counts as grants 0. One with no own `session_uuid` at all
+  // was logged before events named a session: it covers every session of its lead, at grants 0 only,
+  // so a lead in flight at the upgrade is not told twice, and a clear still re-arms its note. Maps
+  // and Sets keyed by lead id, never objects (the `constructor` reason above).
+  const budgetSeen = new Map();
   const budgetEverySession = new Set();
   const budget = {
-    has: (lead, session) => budgetEverySession.has(lead) || budgetSessions.get(lead)?.has(session) === true,
+    has: (lead, session, grants) => (grants === 0 && budgetEverySession.has(lead))
+      || budgetSeen.get(lead)?.get(grants)?.has(session) === true,
   };
   const deviation = new Set();
   const defaulted = new Set();
@@ -356,10 +363,14 @@ function orchHistory(deps) {
           budgetEverySession.add(lead);
           break;
         }
-        // Read back with `declaredName`, the rule `meter` writes it with, so a uuid and its own
-        // event can never disagree about which session is meant.
-        if (!budgetSessions.has(lead)) budgetSessions.set(lead, new Set());
-        budgetSessions.get(lead).add(declaredName(p.session_uuid));
+        // Read back with the rules `meter` writes them with — `declaredName` for the session,
+        // `grantCount` for the allowance — so a row and its own event can never disagree about
+        // which session, or which allowance, is meant.
+        const grants = Object.hasOwn(p, 'grants') ? grantCount(p.grants) : 0;
+        if (!budgetSeen.has(lead)) budgetSeen.set(lead, new Map());
+        const byGrants = budgetSeen.get(lead);
+        if (!byGrants.has(grants)) byGrants.set(grants, new Set());
+        byGrants.get(grants).add(declaredName(p.session_uuid));
         break;
       }
       case 'MODEL_DEVIATION': if (lead) deviation.add(lead); break;
@@ -1102,7 +1113,13 @@ function meter(deps, cfg, task, history, now) {
   if (defaulted !== null && !history.defaulted.has(task.id)) {
     deps.appendEvent(ORCH, { type: 'HARNESS_DEFAULTED', payload: defaulted, lead: task.id });
   }
-  const caps = { tokens_cap: cls?.tokens_cap ?? null, turn_cap: cls?.turn_cap ?? null, wall_ms: cls?.wall_ms ?? null };
+  // The allowance: every cap the class carries, times 1 + the clears granted on this row
+  // (`wd/budget.clearTrip`, behind `soma clear-trip` and `soma_clear_trip`). Read off the tick's
+  // snapshot, so the trip write below re-checks it on the live row. Garbage reads as 0, the strict
+  // direction, and a class `grantedClass` cannot price passes through to `checkBudget`'s refusal.
+  const grants = grantsOf(task);
+  const allowance = grantedClass(cls, grants);
+  const caps = { tokens_cap: allowance?.tokens_cap ?? null, turn_cap: allowance?.turn_cap ?? null, wall_ms: allowance?.wall_ms ?? null };
 
   // `ownSession` returning null has TWO causes and they are not the same subject, which is how
   // one silent 0 came to stand for both. A row WITH a uuid whose session is not in the
@@ -1133,36 +1150,53 @@ function meter(deps, cfg, task, history, now) {
   // to whichever lead started most recently and would trip a one-minute-old lead because a
   // sibling started nine hours ago. It is deliberately NOT reset by a revival: the wall cap asks
   // how long the operator has been paying for this task.
-  const verdict = checkBudget(usage, cls, { now, startedAt: startedAtOf(deps, task, now) });
+  const verdict = checkBudget(usage, allowance, { now, startedAt: startedAtOf(deps, task, now) });
 
   // The session this verdict is for, and the one every BUDGET below names: the row's own uuid, or
-  // null for a row with none. The 80% note is deduped per session (`orchHistory`), so this is read
-  // after phase 2, off the row a fresh revival has just written its new uuid onto.
+  // null for a row with none. The 80% note is deduped per session and allowance (`orchHistory`), so
+  // this is read after phase 2, off the row a fresh revival has just written its new uuid onto.
   const session = declaredName(task.lead_session_uuid);
 
   if (verdict === 'trip') {
     // Presence is the whole protocol for `BUDGET_TRIPPED`, so the flag file is also the
-    // dedupe. A tripped lead stays over its cap forever; unguarded, this toasts every 30 s
-    // for as long as the row exists, which is how a real alarm becomes one people mute.
+    // dedupe. A tripped lead stays over its cap until a clear grants it more; unguarded, this
+    // toasts every 30 s for as long as the row exists, which is how a real alarm becomes one
+    // people mute.
+    //
+    // The write goes INSIDE a fleet transaction, and only while the live row still has the grants
+    // this verdict used. The snapshot is the tick's start, and phases 0-2 can take seconds: a clear
+    // that lands in that window removes the flag and raises `budget_grants`, and judged on the old
+    // allowance this verdict is still 'trip'. Written unguarded, it would undo the clear with a
+    // second BUDGET 100 and a second toast. `clearTrip` holds the same lock, so the two cannot
+    // interleave; on a mismatch nothing is written this tick, and the next one judges the new
+    // allowance. The BUDGET and the toast follow only a write that happened.
     if (!deps.tripped(task.id)) {
-      deps.tripBudget(task.id);
-      deps.appendEvent(ORCH, { type: 'BUDGET', payload: { pct: TRIP_PCT, ...usage, ...caps, session_uuid: session }, lead: task.id });
-      deps.notify('soma', `${task.id} budget tripped: it can report but not act`);
+      const wrote = deps.updateFleet((live) => {
+        const r = (Array.isArray(live?.tasks) ? live.tasks : []).find((x) => x?.id === task.id);
+        if (!r || grantsOf(r) !== grants) return false;
+        deps.tripBudget(task.id);
+        return true;
+      });
+      if (wrote === true) {
+        deps.appendEvent(ORCH, { type: 'BUDGET', payload: { pct: TRIP_PCT, ...usage, ...caps, grants, session_uuid: session }, lead: task.id });
+        deps.notify('soma', `${task.id} budget tripped: it can report but not act`);
+      }
     }
-  } else if (verdict === 'warn' && !history.budget.has(task.id, session)) {
+  } else if (verdict === 'warn' && !history.budget.has(task.id, session, grants)) {
     // No toast: `prompts/orchestrator.md` says a BUDGET at 80 % is usually nothing to do, and
     // the once-per-session dedupe comes off the durable log. Once per SESSION, not per lead: the
     // spend is the directory's and carries across a revival, so a lead revived `fresh` (a new
     // uuid, none of the old context) starts past 80% and is told again, on the tick it relaunches,
-    // while a `resume` keeps its uuid and the note it already had. `BUDGET_WARNED` is not a dedupe:
-    // the BUDGET event lands on the orchestrator's stream, which the lead never reads, so this flag
-    // is the lead's copy — the PreToolUse gate hands the lead a note on its next allowed tool call
-    // and renames the flag to `.delivered`. The flag goes FIRST because the logged BUDGET is the
-    // dedupe: a write that throws here logs nothing, the throw becomes this lead's WATCHDOG_ERROR,
-    // and the next tick tries both again. Logged first, a failed write would be deduped away and
-    // the lead never told.
+    // while a `resume` keeps its uuid and the note it already had. And once per ALLOWANCE: a
+    // cleared trip is a new allowance with an 80% of its own, so the payload's `grants` is part of
+    // the key. `BUDGET_WARNED` is not a dedupe: the BUDGET event lands on the orchestrator's
+    // stream, which the lead never reads, so this flag is the lead's copy — the PreToolUse gate
+    // hands the lead a note on its next allowed tool call and renames the flag to `.delivered`.
+    // The flag goes FIRST because the logged BUDGET is the dedupe: a write that throws here logs
+    // nothing, the throw becomes this lead's WATCHDOG_ERROR, and the next tick tries both again.
+    // Logged first, a failed write would be deduped away and the lead never told.
     deps.warnBudget(task.id);
-    deps.appendEvent(ORCH, { type: 'BUDGET', payload: { pct: WARN_PCT, ...usage, ...caps, session_uuid: session }, lead: task.id });
+    deps.appendEvent(ORCH, { type: 'BUDGET', payload: { pct: WARN_PCT, ...usage, ...caps, grants, session_uuid: session }, lead: task.id });
   }
 
   // Deviation is judged on the LEAD's own session, never the directory's model union: nothing

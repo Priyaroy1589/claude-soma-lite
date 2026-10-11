@@ -183,18 +183,32 @@ in**, because a task naming an unconfigured repo cannot spawn:
 `tokens_cap` meters **the lead and its whole team** (teammate turns go to their own transcripts).
 `turn_cap` is calibrated per lead and is a backstop, not a budget. Warn at 80 %, hard trip at 100 %.
 A warning logs `BUDGET` on the orchestrator's stream and writes `leads/<id>/BUDGET_WARNED`, once per
-lead session; the PreToolUse gate attaches a one-time `soma:` note to the lead's next allowed tool
-call and renames the flag to `BUDGET_WARNED.delivered`, and teammates never get it. Per session, not
-per lead: the spend is the worktree's and carries across a revival, so a lead revived onto a fresh
-session (a new session uuid, none of the old context) is warned again on the tick it relaunches,
-while a resumed lead keeps its session and its note. A trip writes
+lead session and allowance; the PreToolUse gate attaches a one-time `soma:` note to the lead's next
+allowed tool call and renames the flag to `BUDGET_WARNED.delivered`, and teammates never get it. Per
+session, not per lead: the spend is the worktree's and carries across a revival, so a lead revived
+onto a fresh session (a new session uuid, none of the old context) is warned again on the tick it
+relaunches, while a resumed lead keeps its session and its note. Per allowance, because a cleared
+trip is a new one (below). Every `BUDGET` names both: `session_uuid` and `grants`. A trip writes
 `leads/<id>/BUDGET_TRIPPED`, which the PreToolUse gate reads to deny every tool except the soma bus —
-so a tripped lead can still file `COMPLETED` or `ERROR`, and nothing else.
+so a tripped lead can still file `COMPLETED`, `ERROR` or a `NEEDS_INPUT` saying how much more it
+needs and why, and nothing else.
+
+**Clearing a trip: `soma clear-trip <lead>`**, or the orchestrator's `soma_clear_trip(lead)`. Both
+go through one function (`wd/budget.clearTrip`), which removes the flag and raises the row's
+`budget_grants` in one fleet transaction: each clear grants one more allowance of the lead's class,
+and the meter judges every cap at (1 + grants) times the class's from its next tick. Each clear is
+logged as `TRIP_CLEARED`, and the lead is told again at 80% of the new allowance. Both refuse a lead
+that is not tripped, and a row the breaker does not meter (anything but `spawned` and `blocked`).
+**`rm leads/<id>/BUDGET_TRIPPED` alone is not a clear**: the lead is still over its cap, so the next
+tick trips it again, with a second `BUDGET` at 100 % and a second toast. One limit, stated plainly:
+a wall-clock trip cleared long after it fired can still be past (1 + grants) × `wall_ms`, so the
+next tick trips it again, and another clear adds another allowance.
 A lead is priced at the class pinned at enqueue when soma.json defines it, else at the class its
 newest `HARNESS` report reserves, else at `standard`; README's budget section has the exact rule
-and when `HARNESS_DEFAULTED` fires. `soma_status` shows that class as `budget_class`, and as
-`budget_pct` the share of its `tokens_cap` the lead and its team have spent (`budget_est_tokens`),
-for a spawned or blocked lead, the only rows the breaker meters.
+and when `HARNESS_DEFAULTED` fires. `soma_status` shows that class as `budget_class`, the clears as
+`budget_grants`, and as `budget_pct` the share of the allowance, (1 + `budget_grants`) × its
+`tokens_cap`, the lead and its team have spent (`budget_est_tokens`), for a spawned or blocked lead,
+the only rows the breaker meters.
 
 ### Config keys that are declared and read by nothing
 
@@ -683,6 +697,7 @@ Confirmed against the `switch` in `bin/soma.mjs`. Nothing below is aspirational.
 | `soma kill <lead> ["reason"]` | kill the session, mark the row `failed` |
 | `soma resume <lead> [--force]` | restart a dead lead from its recorded claude session, on the seat `pick()` chooses — written to the row's `seat`; with no pool configured, this process's own `CLAUDE_CONFIG_DIR` and `seat: null`. The seat is picked **before** the kill, and every seat closed or unverified is a refusal (exit 3), not a launch on this shell's own account. A `soma.json` that `loadConfig()` refuses (§4) is refused before the kill too, with the loader's reason (exit 2) |
 | `soma retry <lead>` | re-queue a `failed` or `skipped` row |
+| `soma clear-trip <lead>` | clear a budget trip by granting one more allowance of the lead's class (§4, *Budget classes*), and log `TRIP_CLEARED`; **refuses a lead that is not tripped or not metered, exit 3** |
 | `soma digest [--lines N]` | recent events, oldest first, **consuming nothing** |
 | `soma enqueue --file <f>` | add tasks from a JSON array |
 | `soma thaw` | clear an org spend-cap freeze (`state/backpressure.json`) and print the record cleared; **refuses a live storm and an unreadable record, exit 3** — see §9 |
@@ -935,7 +950,7 @@ prompt discipline, not a tracked ledger), **RC URL capture on spawn** — and wi
 notification coalescing** (notifications are per-event and chatty at ten leads). The **Claude Code
 version gate** is no longer on this list: it is wired and enforced, see §4.
 
-### Five more gaps, declared here because this is where you would meet them
+### Four more gaps, declared here because this is where you would meet them
 
 Found by the final whole-branch review and **declared rather than fixed** on this branch. Each is
 recorded in `docs/ROADMAP.md` as v1.x.
@@ -943,12 +958,12 @@ recorded in `docs/ROADMAP.md` as v1.x.
 | gap | what you actually see | what to do |
 |---|---|---|
 | **No `PostCompact` installer.** `bin/hooks/lead-postcompact.mjs` exists; nothing registers it (the generator writes `PostToolUse`, `Stop` and `PreToolUse` only). | After an auto-compact — routine, measured on this build around a ~994k prompt — a lead loses its HARNESS contract and its standing orders with nothing to restore them. It keeps working and stops being the thing you briefed. | `soma_send` the lead a pointer to `soma_task()`, which is the tool the missing injected line would have named. Watch for a lead whose reports change shape mid-run. |
-| **A tripped budget cannot be cleared.** Nothing unlinks `leads/<id>/BUDGET_TRIPPED` — no CLI verb, no MCP tool — and the deny message tells the lead *"Ask the orchestrator to clear the trip"*, which the orchestrator has no way to do. | A tripped lead is alive, holding its slot, and able to call nothing but the bus. It will ask, and nothing can answer. | Delete the file by hand (`rm "$SOMA_HOME/leads/<id>/BUDGET_TRIPPED"`) or `soma kill` the lead. There is no third option. |
 | **`soma up` never calls doctor.** Spec §13's "the queue refuses to open until all three pass" is not enforced anywhere; `runDoctor` is reachable only through `soma doctor`. | A fleet opens on a machine with a failing MCP-deny-drift check, an erased guard file, or unauthenticated `gh`. This is **wider than the `--canary` gap in §5.4**. | Run `soma doctor` yourself, every time, before `soma up`. Treat the golden path in §5 as three commands and not two. |
 | **`serialize_with` does not exist.** The orchestrator prompt used to instruct it; `soma_enqueue`'s schema sets `additionalProperties:false` and omits it, and admission is pure FIFO. The instruction is removed as of this branch. | Two tickets touching one module get two leads and two draft PRs that fight. | Enqueue same-module tickets one at a time — the second after the first reports `COMPLETED`. The orchestrator prompt now says so. |
 | **A Claude Code build that prompts under bypass** (the stalled-lead incident). Claude Code 2.1.259 raised a bypass-immune permission prompt on `cd <dir> && grep <relative file>` whenever a `Read()` deny existed — leads carry 13 — and `tested_claude` admits patch releases by design. 2.1.263 fixed it; the fleet cannot tell which build a lead runs from inside a hook. | A lead or teammate sits on `Do you want to proceed?` with nobody at the pane: measured 79 stalls summing 214 hours, the worst 40 hours, all on 2.1.259. `soma doctor`'s `claude cd-compound read runs` check is **FAIL** on such a build. | Cycle the leads onto a fixed build (`soma kill` + `soma_resume` relaunches `claude` from PATH). If the fleet must keep running on the asking build, arm the gate's emergency lever **per lead**: `touch "$SOMA_HOME/leads/<id>/CD_COMPOUND_ASKS"` — the PreToolUse gate then denies the asking shape with a reason that says what to type instead (one retry turn per matching call, ~14% of Bash calls on a 2.1.259-class build) — and `rm` the flag once the lead is on a fixed build. Unarmed it costs nothing and does nothing; never leave it armed on a build that does not ask. |
 
-The **revival cooldown** is no longer on this list: it ships, and §6.3 gives the schedule.
+The **revival cooldown** is no longer on this list: it ships, and §6.3 gives the schedule. Nor is
+**clearing a tripped budget**: `soma clear-trip` ships (§4, *Budget classes*).
 
 ---
 

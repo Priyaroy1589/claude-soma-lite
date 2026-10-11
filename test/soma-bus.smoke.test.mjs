@@ -79,7 +79,7 @@ after(() => {
 
 const ORCH_TOOLS = [
   'soma_adopt', 'soma_release', 'soma_enqueue', 'soma_queue', 'soma_spawn', 'soma_status',
-  'soma_inbox', 'soma_send', 'soma_kill', 'soma_resume', 'soma_transcript', 'soma_digest',
+  'soma_inbox', 'soma_send', 'soma_kill', 'soma_resume', 'soma_clear_trip', 'soma_transcript', 'soma_digest',
 ];
 
 /** `orchTools` behind the real wiring, for the environment given. */
@@ -141,7 +141,7 @@ test('buildTools returns lead set for role=lead, candidate set for role=candidat
   assert.deepEqual(candNames.sort(), ['soma_adopt', 'soma_status']);
 });
 
-test('the orchestrator gets twelve tools, the lead three, and anything unrecognised is a candidate', () => {
+test('the orchestrator gets thirteen tools, the lead three, and anything unrecognised is a candidate', () => {
   freshHome();
   assert.deepEqual([...bus.buildTools({ SOMA_ROLE: 'orchestrator' }).tools.keys()].sort(), [...ORCH_TOOLS].sort());
   assert.deepEqual([...bus.buildTools({ SOMA_ROLE: 'lead', SOMA_LEAD_NAME: 'cr-1' }).tools.keys()].sort(),
@@ -192,7 +192,7 @@ test('realDeps wires every dep bus-tools reaches for, and the only absences are 
   freshHome();
   const deps = bus.realDeps();
   const consumed = [...consumedDeps()].sort();
-  assert.ok(consumed.length >= 34, `expected the full dep surface, found ${consumed.length}: ${consumed}`);
+  assert.ok(consumed.length >= 35, `expected the full dep surface, found ${consumed.length}: ${consumed}`);
 
   const unwired = consumed.filter((name) => typeof deps[name] !== 'function').sort();
   // `buildDigest` is the declared v1.x gap (spec §16's cut line). The two spawn deps
@@ -768,7 +768,7 @@ test('a session that already holds the lease starts as the orchestrator, so the 
   // A session with no identity, on a fleet with no lease, is a candidate — its own
   // case because the two absences compare EQUAL: an unguarded
   // `readLease()?.session_id === id` is `undefined === undefined`, which would hand
-  // twelve control tools to every fresh session on a machine that has no fleet.
+  // thirteen control tools to every fresh session on a machine that has no fleet.
   freshHome();
   assert.equal(lease.readLease(), null);
   assert.equal(wire({ env: {} }).role, 'candidate');
@@ -818,7 +818,7 @@ const handlerParams = () => {
 
 test('every tool declares the arguments its handler actually reads', () => {
   const params = handlerParams();
-  assert.equal(params.size, 15, `expected all 15 registrations, found ${[...params.keys()]}`);
+  assert.equal(params.size, 16, `expected all 16 registrations, found ${[...params.keys()]}`);
 
   for (const [name, expected] of params) {
     const spec = bus.describe(name);

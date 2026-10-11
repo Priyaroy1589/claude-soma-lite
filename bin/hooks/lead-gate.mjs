@@ -1866,11 +1866,14 @@ export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
   // (a) The breaker, first and above every other rule — including the session
   // discriminator. In a worktree this reaches teammates too, and that is deliberate:
   // a lead's three teammates are most of what the budget was spent on, so a trip that
-  // stopped only the lead would be a breaker with no teeth. The orchestrator can
-  // clear the flag; the model cannot.
+  // stopped only the lead would be a breaker with no teeth. The orchestrator
+  // (`soma_clear_trip`) or the operator (`soma clear-trip`) can clear the flag, through
+  // `wd/budget.clearTrip`, which grants one more allowance of the class in the same
+  // transaction; the model cannot. So the reason asks for a clear the only way a tripped
+  // lead still can, with a report: a NEEDS_INPUT that says how much more and why.
   if (typeof id === 'string' && LEAD_RE.test(id) && flagExists(join(home, 'leads', id, 'BUDGET_TRIPPED'))) {
     if (!BUS_TOOL.test(tool)) {
-      return deny('soma: this task\'s budget is spent (BUDGET_TRIPPED). You may still talk and call soma_report — wind down now and file COMPLETED or ERROR with what exists. Ask the orchestrator to clear the trip if you need more.');
+      return deny('soma: this task\'s budget is spent (BUDGET_TRIPPED). You may still talk and call soma_report — wind down now and file COMPLETED or ERROR with what exists. If the work needs more, file NEEDS_INPUT saying how much and why: the orchestrator or the operator can clear the trip, which grants one more allowance of this task\'s budget class.');
     }
     return {};
   }

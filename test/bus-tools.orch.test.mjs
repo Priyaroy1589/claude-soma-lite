@@ -1,7 +1,7 @@
 import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
@@ -234,7 +234,7 @@ const liveLease = (over = {}) => ({ session_id: 'S0', tmux_socket: 'soma', tmux_
 const drain = () => new Promise((resolve) => setImmediate(resolve));
 
 const ORCH_TOOLS = ['soma_adopt', 'soma_release', 'soma_enqueue', 'soma_queue', 'soma_spawn', 'soma_status',
-  'soma_inbox', 'soma_send', 'soma_kill', 'soma_resume', 'soma_transcript', 'soma_digest'];
+  'soma_inbox', 'soma_send', 'soma_kill', 'soma_resume', 'soma_clear_trip', 'soma_transcript', 'soma_digest'];
 
 // ---------------------------------------------------------------------------
 // The original spec tests, verbatim.
@@ -281,7 +281,7 @@ test('candidate role exposes only adopt + read-only status', async () => {
 // The surface
 // ---------------------------------------------------------------------------
 
-test('the orchestrator is handed exactly the twelve tools the design names', async () => {
+test('the orchestrator is handed exactly the thirteen tools the design names', async () => {
   const bt = await load();
   const tools = bt.orchTools(orch());
   assert.deepEqual([...tools.keys()].sort(), [...ORCH_TOOLS].sort());
@@ -303,7 +303,7 @@ test('every handler survives being called with nothing, and answers with JSON', 
   }
 });
 
-test('the candidate map shares the orchestrator handlers, and hides the other ten', async () => {
+test('the candidate map shares the orchestrator handlers, and hides the other eleven', async () => {
   const bt = await load();
   const c = orch();
   const cand = bt.candidateTools(c);
@@ -1754,6 +1754,50 @@ test('a row whose id is not a lead id reads no stream and no directory; one with
   assert.deepEqual(c.s.dirReads, [], 'and no directory is read for either row');
 });
 
+/** The budget columns of one status row, with the allowance count beside them. */
+const grantCols = (row) => ({ budget_class: row.budget_class, budget_grants: row.budget_grants, budget_est_tokens: row.budget_est_tokens, budget_pct: row.budget_pct });
+
+test('a cleared lead is priced against its whole allowance: budget_pct is the spend over (1 + grants) times the token cap', async () => {
+  const bt = await load();
+  // Each clear (`soma_clear_trip`, `soma clear-trip`) grants one more allowance of the class, and the
+  // breaker judges every cap at (1 + grants) times the class's. Priced against the class alone, a
+  // lead cleared once and working inside its new allowance would read 150%, a trip that is not there.
+  const c = orch({
+    config: structuredClone(CLASSES),
+    tasks: [
+      { id: 'cr-1', status: 'spawned', harness: 'H4', lead_session_uuid: 'u1' },
+      { id: 'cr-2', status: 'spawned', harness: 'H4', lead_session_uuid: 'u2', budget_grants: 1 },
+      { id: 'cr-3', status: 'blocked', harness: 'H4', lead_session_uuid: 'u3', budget_grants: 3 },
+      { id: 'cr-4', status: 'done', harness: 'H4', lead_session_uuid: 'u4', budget_grants: 2 },
+    ],
+    dirUsage: () => ({ est_tokens: 3000, turns: 40 }),
+  });
+  const r = await bt.orchTools(c).get('soma_status')({});
+  assert.deepEqual(r.leads.map(grantCols), [
+    { budget_class: 'review', budget_grants: 0, budget_est_tokens: 3000, budget_pct: 150 },
+    { budget_class: 'review', budget_grants: 1, budget_est_tokens: 3000, budget_pct: 75 },
+    { budget_class: 'review', budget_grants: 3, budget_est_tokens: 3000, budget_pct: 38 },   // 3000 of 8000
+    // Not metered, so no spend and no percentage, but the count is the row's own fact.
+    { budget_class: 'review', budget_grants: 2, budget_est_tokens: null, budget_pct: null },
+  ]);
+});
+
+test('budget_grants reads the row the way the breaker does: wd/budget\'s grantsOf rule, garbage as no grant', async () => {
+  const bt = await load();
+  const { grantsOf } = await import('../bin/lib/wd/budget.mjs');
+  // `bus-tools` imports nothing, so it carries a copy of the rule. Held to the original here over
+  // every shape, by the column AND by the percentage the column prices.
+  const values = [undefined, 0, 1, 7, null, '2', -1, 1.5, Number.NaN, Infinity, 2 ** 53, {}, [], true];
+  for (const v of values) {
+    const task = { id: 'cr-1', status: 'spawned', harness: 'H4', lead_session_uuid: 'u1', ...(v === undefined ? {} : { budget_grants: v }) };
+    const c = orch({ config: structuredClone(CLASSES), tasks: [task], dirUsage: () => ({ est_tokens: 1000, turns: 1 }) });
+    const row = (await bt.orchTools(c).get('soma_status')({})).leads[0];
+    const want = grantsOf(task);
+    assert.equal(row.budget_grants, want, `budget_grants ${String(v)}`);
+    assert.equal(row.budget_pct, Math.round((1000 / (2000 * (1 + want))) * 100), `budget_grants ${String(v)}: the percentage`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // soma_inbox
 // ---------------------------------------------------------------------------
@@ -2265,6 +2309,115 @@ test('a log that will not take the KILLED event does not undo the kill, and name
   assert.equal(r.killed, true);
   assert.equal(r.logged, false);
   assert.ok(!/[/\\]/.test(JSON.stringify(r)), JSON.stringify(r));
+});
+
+// ---------------------------------------------------------------------------
+// soma_clear_trip — one more allowance of the lead's class, through the one guarded function
+// (`wd/budget.clearTrip`) the CLI's `soma clear-trip` calls too
+// ---------------------------------------------------------------------------
+
+test('soma_clear_trip clears through the injected clearTrip with the bus\'s own store, then logs TRIP_CLEARED', async () => {
+  const bt = await load();
+  const seen = [];
+  const order = [];
+  const c = orch({
+    tasks: [{ id: 'cr-1', status: 'spawned' }],
+    deps: { clearTrip: (id, opts) => { order.push('clear'); seen.push({ id, opts }); return { lead: id, grants: 2 }; } },
+  });
+  const append = c.deps.appendEvent;
+  c.deps.appendEvent = (stream, e) => { order.push(`log:${e.type}`); return append(stream, e); };
+  const r = await bt.orchTools(c).get('soma_clear_trip')({ lead: 'cr-1' });
+  assert.deepEqual(r, { cleared: true, lead: 'cr-1', grants: 2, logged: true });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].id, 'cr-1');
+  assert.equal(seen[0].opts.updateFleet, c.deps.updateFleet, 'the transaction every other writer here uses, and the meter\'s trip write takes');
+  // After the transaction: logged first, a clear that was then refused would leave a TRIP_CLEARED
+  // in the history for a trip that still stands.
+  assert.deepEqual(order, ['clear', 'log:TRIP_CLEARED']);
+  assert.deepEqual(c.s.appended, [{ stream: 'orch', type: 'TRIP_CLEARED', lead: 'cr-1', payload: { grants: 2, by: 'orchestrator' } }]);
+});
+
+test('soma_clear_trip relays clearTrip\'s refusal, logs nothing, and never lets a path out', async () => {
+  const bt = await load();
+  const clearing = (fn) => orch({ tasks: [{ id: 'cr-1', status: 'spawned' }], deps: { clearTrip: fn } });
+  // Its own refusals name no path and are the reason the orchestrator needs, so they are relayed.
+  const refused = clearing((id) => { throw new Error(`clearTrip: ${id} is not tripped (no BUDGET_TRIPPED), so there is nothing to clear`); });
+  const r = await bt.orchTools(refused).get('soma_clear_trip')({ lead: 'cr-1' });
+  assert.equal(r.ok, false);
+  assert.equal(r.cleared, false);
+  assert.match(r.error, /cr-1 is not tripped \(no BUDGET_TRIPPED\), so there is nothing to clear/);
+  assert.deepEqual(refused.s.appended, [], 'no TRIP_CLEARED for a clear that did not happen');
+  // An unlink or a lock that failed carries a path in its message; only the errno crosses.
+  const io = clearing(() => { throw Object.assign(new Error("EACCES: permission denied, unlink '/state/leads/cr-1/BUDGET_TRIPPED'"), { code: 'EACCES' }); });
+  const failed = await bt.orchTools(io).get('soma_clear_trip')({ lead: 'cr-1' });
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /\(EACCES\)/);
+  assert.match(failed.error, /nothing was granted/);
+  // A refusal quoting a hand-edited value that looks like a path is not relayed either.
+  const quoted = clearing(() => { throw new Error('clearTrip: cr-1\'s budget_grants is "/tmp/notes", not a non-negative safe integer; fix the row before clearing'); });
+  const q = await bt.orchTools(quoted).get('soma_clear_trip')({ lead: 'cr-1' });
+  assert.equal(q.ok, false);
+  for (const reply of [r, failed, q]) assert.ok(!/[/\\]/.test(JSON.stringify(reply)), JSON.stringify(reply));
+  assert.deepEqual([...io.s.appended, ...quoted.s.appended], []);
+
+  // A log that will not take the event does not undo the clear, and says so.
+  const unlogged = orch({
+    tasks: [{ id: 'cr-1', status: 'spawned' }],
+    deps: { clearTrip: (id) => ({ lead: id, grants: 1 }), appendEvent: () => { throw new Error("ENOSPC: write '/state/events/orch.ndjson'"); } },
+  });
+  const u = await bt.orchTools(unlogged).get('soma_clear_trip')({ lead: 'cr-1' });
+  assert.deepEqual(u, { cleared: true, lead: 'cr-1', grants: 1, logged: false });
+
+  // A bad id, or a bus with no clearTrip or no store wired, refuses before anything is asked.
+  let asked = 0;
+  const counting = (over = {}) => orch({ tasks: [{ id: 'cr-1', status: 'spawned' }], deps: { clearTrip: (id) => { asked += 1; return { lead: id, grants: 1 }; }, ...over } });
+  for (const lead of [undefined, '', '../cr-1', 'CR-1', 'orch']) {
+    const bad = await bt.orchTools(counting()).get('soma_clear_trip')({ lead });
+    assert.equal(bad.ok, false, String(lead));
+  }
+  for (const unwired of ['clearTrip', 'updateFleet']) {
+    const none = await bt.orchTools(counting({ [unwired]: undefined })).get('soma_clear_trip')({ lead: 'cr-1' });
+    assert.equal(none.ok, false, unwired);
+    assert.match(none.error, /cannot clear/, unwired);
+  }
+  assert.equal(asked, 0);
+});
+
+test('soma_clear_trip through the real clearTrip: the flag goes and budget_grants climbs in the bus\'s store, once', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'soma-bus-clear-'));
+  const saved = process.env.SOMA_HOME;
+  t.after(() => {
+    rmSync(home, { recursive: true, force: true });
+    if (saved === undefined) delete process.env.SOMA_HOME;
+    else process.env.SOMA_HOME = saved;
+  });
+  process.env.SOMA_HOME = home;
+  const { clearTrip, tripPath, warnPath } = await import('../bin/lib/wd/budget.mjs?bus-clear-' + Date.now());
+  mkdirSync(join(home, 'leads', 'cr-1'), { recursive: true });
+  writeFileSync(tripPath('cr-1'), '1\n');
+  writeFileSync(warnPath('cr-1'), '1\n');
+  const bt = await load();
+  const c = orch({ tasks: [{ id: 'cr-1', status: 'spawned' }, { id: 'cr-2', status: 'done' }], deps: { clearTrip } });
+  const tools = bt.orchTools(c);
+  assert.deepEqual(await tools.get('soma_clear_trip')({ lead: 'cr-1' }), { cleared: true, lead: 'cr-1', grants: 1, logged: true });
+  assert.equal(existsSync(tripPath('cr-1')), false, 'the lead can act on its next tool call');
+  assert.equal(existsSync(warnPath('cr-1')), false, 'and the old allowance\'s 80% note is gone with the trip');
+  assert.equal(c.s.fleet.tasks[0].budget_grants, 1, 'on the row the meter reads');
+  assert.deepEqual(c.s.appended, [{ stream: 'orch', type: 'TRIP_CLEARED', lead: 'cr-1', payload: { grants: 1, by: 'orchestrator' } }]);
+  // Cleared, it is not tripped: a second clear grants nothing.
+  const again = await tools.get('soma_clear_trip')({ lead: 'cr-1' });
+  assert.equal(again.ok, false);
+  assert.match(again.error, /not tripped/);
+  // A finished row is not metered, so there is no allowance to grant it.
+  mkdirSync(join(home, 'leads', 'cr-2'), { recursive: true });
+  writeFileSync(tripPath('cr-2'), '1\n');
+  const done = await tools.get('soma_clear_trip')({ lead: 'cr-2' });
+  assert.equal(done.ok, false);
+  assert.match(done.error, /metered/);
+  assert.equal(existsSync(tripPath('cr-2')), true);
+  assert.equal(c.s.fleet.tasks[0].budget_grants, 1);
+  assert.equal(Object.hasOwn(c.s.fleet.tasks[1], 'budget_grants'), false);
+  assert.equal(c.s.appended.length, 1, 'refusals log nothing');
 });
 
 // ---------------------------------------------------------------------------

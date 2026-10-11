@@ -614,6 +614,20 @@ const PROMPT_RULES = {
           ["that 80% is the lead's to absorb", /wind\s+down/i],
           ['the trip', /100%/],
           ['and the two ways out of it', /(smaller\s+scope|let\s+it\s+end)/i],
+          // The clear has a mechanism now, and the row names it with what it costs: one more
+          // allowance of the class per clear, a TRIP_CLEARED per clear, and a fresh 80% note.
+          ['the tool that clears it', /soma_clear_trip/],
+          ['what a clear grants', /one\s+more\s+allowance/i],
+          ['that each clear is logged', /TRIP_CLEARED/],
+          ['that the lead is told again at 80% of the new allowance', /told\s+again\s+at\s+80%/i],
+          // A second BUDGET 80 for one lead has two causes, and the payload says which.
+          ['that a fresh session or a new allowance brings another BUDGET 80', /fresh\s+session\s+or\s+granted\s+a\s+new\s+allowance/i],
+          ['and the two payload fields that tell them apart', /`session_uuid`\s+and\s+`grants`/],
+          // The one limit, stated plainly: a wall-clock trip can outlast its clear.
+          ['the wall-clock limit', /wall-clock\s+trip[\s\S]{0,120}?wall_ms/i],
+        ], no: [
+          // Removing the flag by hand is undone by the next tick, with a second BUDGET 100 and toast.
+          ['removing the flag by hand', /\brm\b|BUDGET_TRIPPED/],
         ] },
         // Account rotation (design §3.8): BACKPRESSURE is now URGENT and carries two reasons with two
         // different remedies, neither of them the orchestrator's — the storm lifts itself, the org
@@ -866,6 +880,7 @@ const PROMPT_RULES = {
           ['redirecting a lead', /soma_send/],
           ['killing one that is doing the wrong thing', /soma_kill/],
           ['reviving one', /soma_resume/],
+          ['granting a tripped one one more allowance', /soma_clear_trip/],
           ['reading evidence rather than a summary', /soma_transcript/],
           ['and the digest', /soma_digest/],
         ] },

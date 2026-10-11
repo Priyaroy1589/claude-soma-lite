@@ -57,7 +57,7 @@ A wake means `soma_inbox`. Read it, mark it read, and act by type:
 | `MILESTONE` / `STARTED` | Read, do nothing. |
 | `COMPLETED` | Writeback (below), then let the lead go. Never merge, never mark ready. |
 | `ERROR` / `GAVE_UP` | Decide: `soma_resume(lead)`, re-queue with a sharper brief, or escalate. Say which in a `soma_send` or a digest line. |
-| `BUDGET` at 80% | Usually nothing — soma tells the lead to wind down, in a note on its next tool call. At 100% decide: clear the trip with a smaller scope, or let it end. |
+| `BUDGET` at 80% | Usually nothing — soma tells the lead to wind down, in a note on its next tool call. At 100% decide: `soma_clear_trip(lead)` grants the lead one more allowance of its budget class, so every cap becomes (1 + grants) times the class's; each clear is logged as `TRIP_CLEARED`, and the lead is told again at 80% of the new allowance. Or let it end. A tripped lead that needs more asks with a `NEEDS_INPUT` that says how much and why, so weigh that before you grant it. A lead gets another `BUDGET` at 80% when it is revived onto a fresh session or granted a new allowance; the payload's `session_uuid` and `grants` tell the two apart. A wall-clock trip cleared long after it fired can still be past (1 + grants) times `wall_ms`: the next tick trips it again, and another clear adds another allowance. |
 | `BACKPRESSURE` | Admission is frozen fleet-wide; `reason` says by what. `storm`: the watchdog corroborated a rate-limit storm across the fleet and lifts the freeze itself when the storm ends — wait for the watchdog. `org_level_disabled_until`: the organisation's spend cap is reached, every seat is closed at once, and the freeze holds in `state/backpressure.json` until a human clears it; nothing inside the fleet lifts it, so tell the operator (`soma thaw`, once the organisation raises the cap). Read it, and spawn nothing while it stands. |
 | `MODEL_DEVIATION` | Note it in the digest. It is detected, not prevented. |
 | `LEAD_DEAD` / `REVIVED` | The watchdog captured the death screen and relaunched the lead itself. Read them. Three attempts and then `GAVE_UP`: the first relaunch is immediate, the second comes no sooner than 15 minutes after the first, and the third no sooner than an hour after the second. While a lead waits, nothing is logged: its row stays `spawned` and keeps its slot, and `soma peek <lead>` shows the death screen. |
@@ -105,8 +105,9 @@ re-authenticating is theirs — and post it once they have.
 
 `soma_spawn(task_id)` to admit out of turn · `soma_queue(pause|resume|status)` when the operator asks
 for quiet · `soma_send(lead, msg)` to answer or redirect · `soma_kill(lead, reason)` for a lead that
-is doing the wrong thing · `soma_resume(lead)` after a death · `soma_transcript(lead, lines)` when
-you need evidence rather than a summary · `soma_status(lead?)` · `soma_digest()` on demand.
+is doing the wrong thing · `soma_resume(lead)` after a death · `soma_clear_trip(lead)` to grant a
+tripped lead one more allowance of its class · `soma_transcript(lead, lines)` when you need evidence
+rather than a summary · `soma_status(lead?)` · `soma_digest()` on demand.
 
 Redirecting a lead mid-flight is normal: `soma_send` it the correction and expect a `MILESTONE`, plus
 a superseding `HARNESS` if the scope actually changed shape.

@@ -1,9 +1,9 @@
 import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { DEFAULTS } from '../bin/lib/config.mjs';
 
 /**
@@ -473,6 +473,205 @@ test('warnPath names <SOMA_HOME>/leads/<id>/BUDGET_WARNED, beside the trip flag,
   for (const id of ['../../etc', 'a/b', 'a.b', '', 'CR-1', null, undefined, 42]) {
     assert.throws(() => warnPath(id), refused, `${JSON.stringify(id)} must never name a path`);
   }
+});
+
+// ─────────────────────────── clearing a trip ───────────────────────────
+//
+// `rm leads/<id>/BUDGET_TRIPPED` alone does not clear a trip: the lead is still over its cap, so
+// the next tick trips it again, with a second BUDGET 100 and a second toast. A clear therefore
+// grants one more allowance of the lead's class. `budget_grants` on the row counts them, and every
+// cap becomes (1 + grants) times the class's.
+
+/** A throwaway SOMA_HOME for one test, restored afterwards. */
+const tripHome = (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'soma-wd-trip-'));
+  const saved = process.env.SOMA_HOME;
+  t.after(() => {
+    rmSync(home, { recursive: true, force: true });
+    if (saved === undefined) delete process.env.SOMA_HOME;
+    else process.env.SOMA_HOME = saved;
+  });
+  process.env.SOMA_HOME = home;
+  return home;
+};
+
+/**
+ * An in-memory checkpoint with `fleet.updateFleet`'s contract: `mutate` works on a copy, and only
+ * a `mutate` that returns publishes it. `writes()` counts the publications.
+ */
+const fleetStore = (tasks) => {
+  let fleet = { tasks: structuredClone(tasks) };
+  let writes = 0;
+  return {
+    updateFleet: (mutate) => {
+      const live = structuredClone(fleet);
+      const out = mutate(live);
+      fleet = live;
+      writes += 1;
+      return out;
+    },
+    row: (id) => fleet.tasks.find((r) => r.id === id),
+    writes: () => writes,
+  };
+};
+
+/** One of a lead's flag files, written the way the watchdog writes it. */
+const flag = (fp) => {
+  mkdirSync(dirname(fp), { recursive: true });
+  writeFileSync(fp, '1\n');
+};
+
+test('grantsOf reads budget_grants strictly: absent or garbage is 0, never a throw', async () => {
+  const { grantsOf } = await import('../bin/lib/wd/budget.mjs?grants-' + Date.now());
+  assert.equal(grantsOf({}), 0);
+  assert.equal(grantsOf({ budget_grants: 0 }), 0);
+  assert.equal(grantsOf({ budget_grants: 1 }), 1);
+  assert.equal(grantsOf({ budget_grants: 7 }), 7);
+  // Garbage is 0, the strict direction: the meter asks this on every tick, and a throw there is a
+  // WATCHDOG_ERROR and no verdict, which is a lead with no breaker at all.
+  for (const bad of [null, '2', -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53, {}, [], true]) {
+    assert.equal(grantsOf({ budget_grants: bad }), 0, String(bad));
+  }
+  assert.equal(grantsOf(null), 0);
+  assert.equal(grantsOf(undefined), 0);
+  // An own field only: a grant inherited from a prototype is one nobody gave.
+  assert.equal(grantsOf(Object.create({ budget_grants: 3 })), 0);
+});
+
+test('grantedClass scales every cap the class itself carries by 1 + grants, and nothing else', async () => {
+  const { grantedClass, checkBudget } = await import('../bin/lib/wd/budget.mjs?granted-' + Date.now());
+  const cls = { tokens_cap: 1000, turn_cap: 600, wall_ms: 3_600_000, note: 'kept' };
+  assert.equal(grantedClass(cls, 0), cls, 'no grant: the class itself, untouched');
+  assert.deepEqual(grantedClass(cls, 1), { tokens_cap: 2000, turn_cap: 1200, wall_ms: 7_200_000, note: 'kept' });
+  assert.deepEqual(grantedClass(cls, 2), { tokens_cap: 3000, turn_cap: 1800, wall_ms: 10_800_000, note: 'kept' });
+  assert.deepEqual(cls, { tokens_cap: 1000, turn_cap: 600, wall_ms: 3_600_000, note: 'kept' }, 'the class it was handed is never written');
+  // A 0 cap means "not enforced" and stays 0; an absent cap is not invented.
+  assert.deepEqual(grantedClass({ tokens_cap: 500, turn_cap: 0 }, 1), { tokens_cap: 1000, turn_cap: 0 });
+  // A hand-edited numeric string is a cap checkBudget honours, so it is scaled too. Left as it was,
+  // the lead would be judged at its old allowance and tripped again on the next tick.
+  assert.deepEqual(grantedClass({ tokens_cap: '1000' }, 2), { tokens_cap: 3000 });
+  // What a grant does to a verdict: with one grant, 1.5x the class's tokens is 75% of the
+  // allowance, 1.7x is past 80%, and 2x trips.
+  const granted = grantedClass({ tokens_cap: 1000, turn_cap: 0, wall_ms: 0 }, 1);
+  assert.equal(checkBudget({ est_tokens: 1500, turns: 0 }, granted), null);
+  assert.equal(checkBudget({ est_tokens: 1700, turns: 0 }, granted), 'warn');
+  assert.equal(checkBudget({ est_tokens: 2000, turns: 0 }, granted), 'trip');
+});
+
+test('grantedClass hands a class it cannot price through untouched, so checkBudget still refuses it by name', async () => {
+  const { grantedClass, checkBudget } = await import('../bin/lib/wd/budget.mjs?granted-bad-' + Date.now());
+  const usage = { est_tokens: 0, turns: 0 };
+  assert.equal(grantedClass(null, 1), null);
+  assert.throws(() => checkBudget(usage, grantedClass(null, 1)), /budget class must be an object/);
+  // A cap that is not a number is kept as it was, and refused naming the value the class carries.
+  assert.deepEqual(grantedClass({ tokens_cap: 'lots', turn_cap: 10 }, 1), { tokens_cap: 'lots', turn_cap: 20 });
+  assert.throws(() => checkBudget(usage, grantedClass({ tokens_cap: 'lots' }, 1)), /cls\.tokens_cap must be a non-negative finite number, got "lots"/);
+  // A cap on a prototype is not the class's own, so it is not scaled into one.
+  assert.throws(() => checkBudget(usage, grantedClass(Object.create({ tokens_cap: 5 }), 1)), /no enforceable cap/);
+  for (const bad of [-1, 1.5, '1', null, undefined, Number.NaN]) {
+    assert.throws(() => grantedClass({ tokens_cap: 1 }, bad), /grantedClass: grants must be a non-negative safe integer/, String(bad));
+  }
+});
+
+test('clearTrip grants one more allowance: the trip flag goes and budget_grants climbs, in one transaction', async (t) => {
+  tripHome(t);
+  const { clearTrip, tripPath } = await import('../bin/lib/wd/budget.mjs?clear-' + Date.now());
+  const s = fleetStore([{ id: 'cr-1', status: 'spawned' }, { id: 'cr-2', status: 'blocked', budget_grants: 1 }, { id: 'cr-3', status: 'spawned', budget_grants: null }]);
+  flag(tripPath('cr-1'));
+  assert.deepEqual(clearTrip('cr-1', { updateFleet: s.updateFleet }), { lead: 'cr-1', grants: 1 });
+  assert.equal(existsSync(tripPath('cr-1')), false, 'the gate stops denying the moment the flag is gone');
+  assert.equal(s.row('cr-1').budget_grants, 1);
+  assert.equal(s.writes(), 1);
+  // A blocked lead is metered too, and a second clear adds a second allowance.
+  flag(tripPath('cr-2'));
+  assert.deepEqual(clearTrip('cr-2', { updateFleet: s.updateFleet }), { lead: 'cr-2', grants: 2 });
+  assert.equal(s.row('cr-2').budget_grants, 2);
+  // A null count is no count, as a null `attempts` is.
+  flag(tripPath('cr-3'));
+  assert.deepEqual(clearTrip('cr-3', { updateFleet: s.updateFleet }), { lead: 'cr-3', grants: 1 });
+});
+
+test('clearTrip removes an 80% note left from the old allowance, and keeps the delivered record', async (t) => {
+  tripHome(t);
+  const { clearTrip, tripPath, warnPath } = await import('../bin/lib/wd/budget.mjs?clear-warn-' + Date.now());
+  const s = fleetStore([{ id: 'cr-1', status: 'spawned' }]);
+  flag(tripPath('cr-1'));
+  flag(warnPath('cr-1'));                       // it tripped before its next allowed call, so never delivered
+  flag(`${warnPath('cr-1')}.delivered`);        // an earlier note, delivered
+  clearTrip('cr-1', { updateFleet: s.updateFleet });
+  assert.equal(existsSync(warnPath('cr-1')), false, 'a note about the old allowance would reach the lead on its first call under the new one');
+  assert.equal(existsSync(`${warnPath('cr-1')}.delivered`), true);
+  // No note to remove is the ordinary case, not an error.
+  flag(tripPath('cr-1'));
+  assert.deepEqual(clearTrip('cr-1', { updateFleet: s.updateFleet }), { lead: 'cr-1', grants: 2 });
+});
+
+test('clearTrip refuses a lead it cannot clear, saying why, and changes nothing', async (t) => {
+  tripHome(t);
+  const { clearTrip, tripPath } = await import('../bin/lib/wd/budget.mjs?clear-refuse-' + Date.now());
+  const unmetered = ['queued', 'done', 'failed', 'skipped'].map((status, i) => ({ id: `cr-${i + 2}`, status }));
+  const garbage = ['lots', '2', -1, 1.5, {}].map((budget_grants, i) => ({ id: `gr-${i}`, status: 'spawned', budget_grants }));
+  const rows = [{ id: 'cr-1', status: 'spawned' }, ...unmetered, ...garbage];
+  const s = fleetStore(rows);
+  for (const r of [...unmetered, ...garbage]) flag(tripPath(r.id));
+  const clear = (id) => () => clearTrip(id, { updateFleet: s.updateFleet });
+  assert.throws(clear('cr-1'), /cr-1 is not tripped/);
+  assert.throws(clear('nobody'), /no task "nobody"/);
+  for (const r of unmetered) {
+    // Nothing meters these rows, so there is no allowance to grant and nothing to re-judge it.
+    assert.throws(clear(r.id), /metered/, r.status);
+    assert.equal(existsSync(tripPath(r.id)), true, `${r.status}: the flag is left as it was`);
+  }
+  for (const r of garbage) {
+    assert.throws(clear(r.id), /budget_grants/, String(r.budget_grants));
+    assert.equal(existsSync(tripPath(r.id)), true);
+  }
+  assert.equal(s.writes(), 0, 'a refusal publishes nothing');
+  assert.deepEqual(s.row('gr-0'), garbage[0]);
+  // An id that is not a lead id never reaches the store or the disk.
+  for (const bad of ['../x', 'CR-1', '', null]) {
+    assert.throws(() => clearTrip(bad, { updateFleet: s.updateFleet }), /legal task id/, String(bad));
+  }
+  assert.throws(() => clearTrip('cr-2', {}), /clearTrip: updateFleet/);
+  assert.equal(s.writes(), 0);
+});
+
+test('the metered set has one spelling: the meter and clearTrip share budget.mjs\'s, and bus-tools\' copy equals it', async () => {
+  // The watchdog imports `METERED` from budget.mjs, so the rows it meters and the rows `clearTrip`
+  // grants an allowance to cannot drift. `bus-tools` imports nothing, so it keeps a copy for
+  // `soma_status`'s spend column, and this is what holds the copy to the original.
+  const { METERED } = await import('../bin/lib/wd/budget.mjs?metered-' + Date.now());
+  const { METERED_STATES } = await import('../bin/lib/bus-tools.mjs?metered-' + Date.now());
+  assert.ok(METERED instanceof Set && METERED_STATES instanceof Set);
+  assert.deepEqual([...METERED_STATES].sort(), [...METERED].sort());
+  assert.deepEqual([...METERED].sort(), ['blocked', 'spawned'], 'a blocked lead keeps its session and its team keeps spending');
+  const src = readFileSync(new URL('../bin/soma-watchdog.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(src, /const METERED\s*=/, 'the watchdog meters with the imported set, not a copy of its own');
+});
+
+test('a clear whose flag cannot be removed publishes nothing, and neither does a lock that cannot be taken', async (t) => {
+  tripHome(t);
+  const { clearTrip, tripPath, warnPath } = await import('../bin/lib/wd/budget.mjs?clear-fail-' + Date.now());
+  const s = fleetStore([{ id: 'cr-1', status: 'spawned' }]);
+  flag(tripPath('cr-1'));
+  const eacces = (fp) => { throw Object.assign(new Error(`EACCES: permission denied, unlink '${fp}'`), { code: 'EACCES' }); };
+  const failing = (which) => (fp) => (fp === which ? eacces(fp) : unlinkSync(fp));
+  // The trip flag will not go: the clear fails, and no grant is published without it.
+  assert.throws(() => clearTrip('cr-1', { updateFleet: s.updateFleet, unlink: failing(tripPath('cr-1')) }), /EACCES/);
+  assert.equal(s.writes(), 0);
+  assert.equal(s.row('cr-1').budget_grants, undefined);
+  // The old 80% note will not go. It is removed BEFORE the trip, so the lead stays tripped. Freed
+  // with no grant beside it, the next tick would trip it again on its old allowance.
+  flag(warnPath('cr-1'));
+  assert.throws(() => clearTrip('cr-1', { updateFleet: s.updateFleet, unlink: failing(warnPath('cr-1')) }), /EACCES/);
+  assert.equal(existsSync(tripPath('cr-1')), true, 'still tripped');
+  assert.equal(s.writes(), 0);
+  // The unlinks happen INSIDE the transaction: a store whose lock cannot be taken never runs the
+  // mutation, so nothing is removed.
+  const locked = () => { throw new Error('fleet.lock: still held by pid 7 — gave up after 5000ms'); };
+  assert.throws(() => clearTrip('cr-1', { updateFleet: locked }), /fleet\.lock/);
+  assert.equal(existsSync(tripPath('cr-1')), true);
+  assert.equal(existsSync(warnPath('cr-1')), true);
 });
 
 // ─────────────────────────── backpressure ───────────────────────────
