@@ -30,7 +30,8 @@
  * - **An unreadable soma.json throws.** Reading `max_leads: 3` as 10 because the file
  *   lost a brace is the worst outcome on the menu: the operator's cap is gone and the
  *   fleet ramps to ten leads anyway. That is only safe to insist on because soma's own
- *   writes are tmp+rename, so soma can never be the thing that truncates the file.
+ *   writes are tmp+rename, so soma can never be the thing that truncates the file. A
+ *   `seats` that is not an array throws the same way (see `validated`).
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -171,9 +172,11 @@ export const DEFAULTS = deepFreeze({
   // is a symlink into the fleet's shared transcript tree, so any seat can resume any lead. Empty
   // means one account and no rotation, which is every fleet that existed before this key. An
   // ARRAY, so it replaces rather than merges (see `deepMerge`): removing a seat from soma.json must
-  // remove it from the pool. `lib/seats.mjs` resolves `~` and refuses `''`; nothing here validates
-  // the entries, because `loadConfig()` runs on every tick and must not throw for a typo that
-  // `soma doctor` can name.
+  // remove it from the pool. `loadConfig()` checks exactly one thing about it: that it IS an array
+  // (see `validated`), because a non-array was read two ways — as "no seats" by the watchdog's seat
+  // pick, as an error by the spawner. It does not judge the entries: `lib/seats.mjs` does, at every
+  // seat pick and before anything is spent (it resolves `~`, and refuses `''` and an entry that is
+  // not an object), and `soma doctor` names a bad one.
   seats: [],
 });
 
@@ -306,6 +309,24 @@ function dropLegacyKeys(cfg) {
 }
 
 /**
+ * `cfg`, or a throw naming the file, the key and the shape it wants, for a value its readers
+ * would read two ways.
+ *
+ * `seats` must be an array. Read as "no seats", a non-array let the watchdog's seat pick wave a
+ * dead lead through to a relaunch that reads the same value through `seats.loadSeats` and
+ * throws — after the pane was killed and the revival attempt charged. Its entries are not
+ * judged here: that is `loadSeats`' job, and `soma doctor` names a bad one.
+ */
+function validated(cfg) {
+  const pool = cfg.seats;
+  if (!Array.isArray(pool)) {
+    const got = pool === null ? 'null' : typeof pool === 'object' ? 'an object' : JSON.stringify(pool);
+    throw new Error(`${configPath()}: seats must be an array of { "config_dir": …, "label": … } entries, or [] (or no seats key) for no rotation, got ${got}`);
+  }
+  return cfg;
+}
+
+/**
  * The effective config: DEFAULTS with `soma.json` layered over it.
  *
  * Re-read on every call, deliberately. `soma-watchdog` takes its next `tick_ms` from a
@@ -313,7 +334,7 @@ function dropLegacyKeys(cfg) {
  * operator editing soma.json mid-run — the documented way to dial the fleet down when
  * limits bite — takes effect on the next tick rather than after a restart.
  */
-export const loadConfig = () => dropLegacyKeys(deepMerge(DEFAULTS, readOverlay()));
+export const loadConfig = () => validated(dropLegacyKeys(deepMerge(DEFAULTS, readOverlay())));
 
 /**
  * Layer `patch` onto the overlay, publish it, and return the new effective config.

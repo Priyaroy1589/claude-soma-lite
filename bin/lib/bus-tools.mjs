@@ -1181,6 +1181,31 @@ export function orchTools(ctx) {
   };
 
   /**
+   * The config for a tool about to LAUNCH a lead: `{ cfg, error: null }`, or `{ cfg: null, error }`
+   * when `loadConfig` threw.
+   *
+   * `configOf`'s null is right for a reader — `soma_status` and the intake check act on nothing —
+   * and wrong here: a soma.json the loader refuses (it does not parse, or holds a `seats` that is
+   * not an array) read as "no config" skipped `soma_spawn`'s `max_leads` gate, claimed the row and
+   * stamped the stagger clock, and sent `soma_resume` seat-blind, both failing only at the
+   * spawner's own read of the same file. So a throw is a refusal, before anything is picked or
+   * claimed. A fixed sentence, because the loader's names the file's path, which this bus never
+   * echoes. `loadConfig` unwired stays `cfg: null`, as `configOf` has it.
+   */
+  const configToLaunch = async () => {
+    if (!has('loadConfig')) return { cfg: null, error: null };
+    try {
+      const cfg = await deps.loadConfig();
+      return { cfg: isRecord(cfg) ? cfg : null, error: null };
+    } catch {
+      return {
+        cfg: null,
+        error: 'soma.json could not be loaded: it does not parse, or holds a value soma refuses, such as a seats that is not an array; nothing was claimed or launched. Run soma doctor in a shell to see which',
+      };
+    }
+  };
+
+  /**
    * The seat a manual launch goes onto (account rotation, design §4): `{ seat, error: null }`
    * with `seat` a Seat or null, or `{ seat: null, error }`.
    *
@@ -1615,7 +1640,9 @@ export function orchTools(ctx) {
     if (!has('updateFleet')) {
       return refuse('this bus cannot admit a task safely: the transactional fleet writer is not wired, and an unlocked read-modify-write would let this bus and the watchdog both spawn past max_leads');
     }
-    const cfg = await configOf();
+    const loaded = await configToLaunch();
+    if (nonEmpty(loaded.error)) return refuse(loaded.error);
+    const { cfg } = loaded;
     // Onto an open seat, picked BEFORE the claim so a refusal leaves the row queued and creates
     // nothing (see `seatFor`).
     const picked = await seatFor(cfg);
@@ -2361,7 +2388,9 @@ export function orchTools(ctx) {
     // Onto an open seat (see `seatFor`), picked BEFORE anything is done, so a refusal leaves the
     // row and its dead pane exactly as they were. Not necessarily the seat it died on: the pool
     // says which is open now.
-    const cfg = await configOf();
+    const loaded = await configToLaunch();
+    if (nonEmpty(loaded.error)) return refuse(loaded.error);
+    const { cfg } = loaded;
     const picked = await seatFor(cfg);
     if (nonEmpty(picked.error)) return refuse(picked.error);
     const seat = seatLabelOf(picked.seat);

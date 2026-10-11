@@ -172,22 +172,6 @@ not know yet (*the operator's live transcripts carry no usage field this module 
 That failure is about your Claude Code version, not your install. Tests that need tmux or git skip
 themselves when the tool is missing.
 
-On Linux, `npm test` currently has known failures that come from the test fixtures, not from your
-install. Expect up to four more:
-
-- *the leads root is matched with the state root symlinks resolved, not as configured* assumes
-  macOS's symlinked `$TMPDIR`
-  ([issue 31](https://github.com/techfreakworm/claude-soma-lite/issues/31)).
-- *a holder whose lock was taken over does not delete its successor on the way out*, *the
-  checkpoint lock releases the lock it published, not whatever holds that name* and *a takeover
-  unlinks the file it judged, or nothing at all* assume a deleted file's inode number is not
-  reused at once. ext4 reuses it, so they fail there
-  ([issue 30](https://github.com/techfreakworm/claude-soma-lite/issues/30)).
-
-*the write-idiom scan stays linear on the shapes that made it quadratic* is a timing test and can
-also fail on a busy machine
-([issue 33](https://github.com/techfreakworm/claude-soma-lite/issues/33)).
-
 ## 3. Add the `soma` wrapper
 
 Do not run `soma` bare. Two things must be pinned, and both have caused real failures:
@@ -351,10 +335,9 @@ Before you log in, `claude auth` and `gh auth` read `FAIL`, and a seventh row is
 `claude cd-compound read runs` (*no Bash tool_use in the transcript*), because a Claude Code that
 is not logged in never runs the probe's command. It reads `ok` once `claude` is logged in.
 
-**Once a lead exists, expect one `FAIL`.** `lead mcp single-server` requires a lead's MCP config to
-name exactly one server, `soma`. Leads have also been given the stateless sequential-thinking
-server, and this doctor row was not updated to match. It then reads `FAIL`, and doctor exits 3.
-Treat that row as known. Any other `FAIL` is real.
+**Once a lead exists, `lead mcp single-server` reads `ok`.** Despite its name, it checks that a
+lead's MCP config names exactly the two servers soma writes there: `soma` and the stateless
+sequential-thinking server. Any `FAIL` on it, as on every other row, is real.
 
 Rows that need action if they fail:
 

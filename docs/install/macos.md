@@ -259,10 +259,9 @@ expect **no `FAIL` rows** and these `????` rows:
 
 So the best verdict you will see is `INCOMPLETE`, never `PASS`. That is expected.
 
-**Once a lead exists, expect one `FAIL`.** `lead mcp single-server` requires a lead's MCP config to
-name exactly one server, `soma`. Leads have also been given the stateless sequential-thinking
-server, and this doctor row was not updated to match. It then reads `FAIL`, and doctor exits 3.
-Treat that row as known. Any other `FAIL` is real.
+**Once a lead exists, `lead mcp single-server` reads `ok`.** Despite its name, it checks that a
+lead's MCP config names exactly the two servers soma writes there: `soma` and the stateless
+sequential-thinking server. Any `FAIL` on it, as on every other row, is real.
 
 Rows that need action if they fail:
 

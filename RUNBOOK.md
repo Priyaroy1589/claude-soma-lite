@@ -136,8 +136,11 @@ forever.
 ## 4. `soma.json`
 
 Optional. `loadConfig()` is `DEFAULTS` with your file layered over it, key by key, and unknown keys
-are preserved. Minimum useful file — **`repos` is the one you must fill in**, because a task naming
-an unconfigured repo cannot spawn:
+are preserved. A file that does not parse is refused, never read as the defaults, and so is a
+`seats` that is not an array. `soma up` then exits 2 with a message naming the key; a watchdog
+already running logs `WATCHDOG_ERROR` on every tick and acts on nothing until the file is fixed,
+exactly as it does for an unparseable file. Minimum useful file — **`repos` is the one you must fill
+in**, because a task naming an unconfigured repo cannot spawn:
 
 ```json
 {
@@ -161,7 +164,7 @@ an unconfigured repo cannot spawn:
 | `budgets` | see below | Per-lead token/turn/wall caps by class. |
 | `repos` | `{}` | `{ "<key>": { path, base_branch } }`. `base_branch` falls back to `develop`. |
 | `teammate_mcp_allow` | `[]` | Hands specific MCP servers back to teammates. Read `README.md` for its two measured limits before using it. |
-| `seats` | `[]` | The account pool (design 2026-09-15 §2): `[{ "config_dir": "~/.claude-seat-b", "label": "seat-b" }]`, one entry per Claude Code config dir that holds a separate `claude auth login` and whose `projects/` is a symlink to the fleet's shared transcript tree. Empty = one account, no rotation. An array, so an edit **replaces** the pool, and its ORDER is the priority order — every launch takes the first entry that is open and not `unverified`, so the account you watch goes LAST (§7 step 4). `~` expands against your home when the pool loads; a `config_dir` must be **absolute or `~`-prefixed** — a relative one is `resolve()`d against the cwd of whichever process read the pool, so a watchdog started from your home and a `soma` command run inside a repo name two different directories for the same entry, and the one that does not exist simply contributes nothing to the worktree MCP deny list without saying so; an empty `config_dir` is refused with a sentence; a missing `label` defaults to the dir's basename. `lib/seats.mjs` reads it; closures land in `state/seats.json` (`closed_until` is epoch ms, `0` = open) and are never shorter than five minutes nor longer than 32 days. A corrupt `state/seats.json` is never overwritten — fix or delete it by hand. |
+| `seats` | `[]` | The account pool (design 2026-09-15 §2): `[{ "config_dir": "~/.claude-seat-b", "label": "seat-b" }]`, one entry per Claude Code config dir that holds a separate `claude auth login` and whose `projects/` is a symlink to the fleet's shared transcript tree. Empty = one account, no rotation. It must be an array: `{}`, a string, a number or `null` is refused (above). A malformed *entry* inside the array is not refused at load; doctor's `seats readable` row names it. An array, so an edit **replaces** the pool, and its ORDER is the priority order — every launch takes the first entry that is open and not `unverified`, so the account you watch goes LAST (§7 step 4). `~` expands against your home when the pool loads; a `config_dir` must be **absolute or `~`-prefixed** — a relative one is `resolve()`d against the cwd of whichever process read the pool, so a watchdog started from your home and a `soma` command run inside a repo name two different directories for the same entry, and the one that does not exist simply contributes nothing to the worktree MCP deny list without saying so; an empty `config_dir` is refused with a sentence; a missing `label` defaults to the dir's basename. `lib/seats.mjs` reads it; closures land in `state/seats.json` (`closed_until` is epoch ms, `0` = open) and are never shorter than five minutes nor longer than 32 days. A corrupt `state/seats.json` is never overwritten — fix or delete it by hand. |
 | `resume_context_fraction` | `0.7` | Revival guard as a fraction of the context window, not an absolute. |
 | `tested_claude` | `2.1.178`–`2.1.999` | **Enforced, and this row used to say it was not.** The watchdog reads `claude --version` once per process and closes admission fleet-wide while it sits outside this range, emitting `VERSION_GATE`. Measured: `2.1.220` in range; `2.1.177`, `2.2.0` and `3.0.0` all out. It fails **open** only when the version or a bound will not parse. **The first Claude Code minor bump stops your queue** — widen `max` or re-run bring-up. |
 
@@ -371,13 +374,23 @@ to clear it; the FAIL stands until the lead is next resumed, revived or rotated.
 
 | summary | exit | meaning |
 |---|---|---|
-| `doctor: PASS — all 48 checks hold on this machine` | 0 | every check was taken and held |
+| `doctor: PASS — all 48 checks hold on this machine` | 0 | every check was taken and held — **not reachable on this build**: two rows are always unobserved (below, and §10) |
 | `doctor: INCOMPLETE — N of M checks hold, K unobserved` | **0** | nothing failed, but **K assertions did not run** |
 | `doctor: FAIL — N of M checks failed` | 3 | at least one check was taken and did not hold |
 
 > `soma doctor` **exits 0 on `INCOMPLETE`** — `runDoctor` returns `results.every(r => r.ok !== false)`.
 > An unobserved check must not refuse a machine, but it is not a pass either. If you gate a script
 > on `soma doctor`, gate it on the word, not only on `$?`.
+
+**`PASS` is not reachable on this build.** Two rows are always unobserved: `workflows enabled`,
+which doctor hard-wires to unobserved because no local file can answer it, and
+`session id matches hook payload`, which reads `state/last-hook-payload.json`, a file nothing in
+this build writes. So the best verdict is `doctor: INCOMPLETE — N of M checks hold, 2 unobserved`
+from a Claude Code session's Bash tool (the orchestrator's, say), and `…, 3 unobserved` from a plain
+shell, because `CLAUDE_CODE_SESSION_ID` is unobserved there too. Before the first lead and
+worktree exist, `every worktree guard file carries rules`, `guard file matches the generator` and
+`lead mcp single-server` are unobserved as well. Every other row can read `ok`. §10 *The rows
+`soma doctor` cannot take* says how to confirm the three by hand.
 
 ### 5.3 `soma up` — the spend gate
 
@@ -390,11 +403,21 @@ Order of operations, and every step can stop it:
 1. `ensureTree()` and the hard-link probe → **exit 2** on failure.
 2. **Already-live short-circuit.** If tmux reports `soma-watchdog` live, nothing is started, no new
    spend is authorised, and the **pause flag is still read and reported** — a live watchdog is *not*
-   an open queue. Exit 0.
-3. `loadConfig()` → **exit 2** if it throws.
+   an open queue. Exit 0 — **unless you passed `--canary`**: then the canary runs here too (§5.4),
+   with no projection and no prompt, and anything but a pass is **exit 3**. The watchdog that was
+   already running is left exactly as it is, and the refusal says so, then carries the same NOTE as
+   §5.4:
+
+   ```
+   soma up: the canary did not report a pass (its verdict is on stderr above), and the watchdog that
+   was already running is untouched: --canary checks a fleet, it does not stop one; `soma down` does.
+   ```
+3. `loadConfig()` → **exit 2** if it throws: a `soma.json` that does not parse, or a value §4 says
+   is refused. Nothing is projected, asked or started.
 4. **Print the worst-case spend projection.**
 5. **Ask, on the terminal.**
-6. `--canary`, if you passed it (§5.4) → **exit 3** unless it reports a pass.
+6. `--canary`, if you passed it (§5.4) → **exit 3** unless it reports a pass. This is where it runs
+   on a fresh start; with a watchdog already live it runs at step 2 instead.
 7. Start the watchdog in a detached tmux session under `env -i`.
 8. **Read tmux back.** `tmux new-session` exits 0 for a command `env -i` cannot resolve, leaving a
    session whose pane died instantly — which reads as a running watchdog to anything that asks by
@@ -450,15 +473,20 @@ design. If you need it in a wrapper, the wrapper needs a real terminal.
 The flag is answered, and then it refuses. `bin/lib/canary.mjs` ships the **evaluation** only:
 `evaluateCanary(probe)` is a pure predicate over a probe result with full unit coverage, and the
 **live driver** that spawns the synthetic lead and produces that probe is a declared v1.x gap.
-`probeCanary` *requires* the driver to be injected — a canary nobody drove must not look like a
-pass — so `runCanary()` with no driver reports "unproven", and `up` refuses:
+`probeCanary` *requires* a driver — a canary nobody drove must not look like a pass — so `soma up`
+hands it one that says it is not built. The canary reports **ERROR**, nothing proven, on stderr, and
+`up` refuses with **exit 3**. On a fresh start it reads as below; with a watchdog already running,
+the refusal's first sentence is the one §5.3 step 2 quotes:
 
 ```
+canary: ERROR — the canary did not run, so none of the 9 invariants was proven; the queue stays closed
+  reason: the live driver threw before producing a probe: the live driver is not built on this build — canary.mjs ships the evaluation only (a declared v1.x gap)
+  unproven: busMounted, teammateCanEdit, leadCannotWrite, teammateUserMcpDenied, somaPrDraft, slotFreedAfterComplete, rcUrl, oauthUnderEnvI, cdCompoundReadRuns
 soma up: the canary did not report a pass, so the queue was not opened (its verdict is on stderr
-above). NOTE, because it is the likeliest reason on this build: canary.mjs ships the EVALUATION
-only and records the live driver as a declared v1.x gap, so runCanary with no driver injected can
-only report "unproven". Establish the nine invariants by hand (see bin/lib/canary.mjs) and run
-soma up without --canary.
+above). NOTE, because it is the likeliest reason on this build: `canary.mjs` ships the EVALUATION
+only and records the live driver as a declared v1.x gap, so the canary `soma up` runs has no driver
+to observe anything with and can only report "unproven". Establish the nine invariants by hand (see
+bin/lib/canary.mjs) and run `soma up` without --canary.
 ```
 
 **The golden path is `init` → `doctor` → `up`, without `--canary`.** The design spec's first-run
@@ -629,7 +657,7 @@ Confirmed against the `switch` in `bin/soma.mjs`. Nothing below is aspirational.
 | `soma peek <lead> [--lines N]` | read-only pane tail (default 60, max 2000) |
 | `soma send <lead> "<msg>"` | type one line into the lead's composer and submit |
 | `soma kill <lead> ["reason"]` | kill the session, mark the row `failed` |
-| `soma resume <lead> [--force]` | restart a dead lead from its recorded claude session, on the seat `pick()` chooses — written to the row's `seat`; with no pool configured, this process's own `CLAUDE_CONFIG_DIR` and `seat: null`. The seat is picked **before** the kill, and every seat closed or unverified is a refusal (exit 3), not a launch on this shell's own account |
+| `soma resume <lead> [--force]` | restart a dead lead from its recorded claude session, on the seat `pick()` chooses — written to the row's `seat`; with no pool configured, this process's own `CLAUDE_CONFIG_DIR` and `seat: null`. The seat is picked **before** the kill, and every seat closed or unverified is a refusal (exit 3), not a launch on this shell's own account. A `soma.json` that `loadConfig()` refuses (§4) is refused before the kill too, with the loader's reason (exit 2) |
 | `soma retry <lead>` | re-queue a `failed` or `skipped` row |
 | `soma digest [--lines N]` | recent events, oldest first, **consuming nothing** |
 | `soma enqueue --file <f>` | add tasks from a JSON array |
@@ -758,7 +786,7 @@ The org spend cap is the one limit that does not rotate: it freezes admission th
 ```
 0  ok
 1  usage, or you declined
-2  this machine cannot run soma   (relative SOMA_HOME, no hard links, unreadable config)
+2  this machine cannot run soma   (relative SOMA_HOME, no hard links, a soma.json §4 refuses)
 3  soma refused                    (a fleet state, not an environment fault)
 ```
 
@@ -866,7 +894,7 @@ stops on the next tick; running leads continue. The flag lives at `state/QUEUE_P
 | `soma release <lead>` | The other half of `hold`. **Not** `soma_release` — that MCP tool hands back the orchestrator lease. | see above |
 | `soma gc` | No worktree/branch/log/digest sweep exists. | `git worktree remove` by hand. soma never touches `~/.claude/projects`, which `--resume` needs. |
 | `soma thaw` | Refuses a **storm** record (`reason: storm`): a live storm is the watchdog's — it re-writes its record on every tick it corroborates the storm and clears it itself when the panes stop matching, so a clear here would be undone within a tick and would hide the storm from `soma status` meanwhile. Refuses an **unreadable** record: it never overwrites bytes it cannot read. | An org spend-cap freeze (`reason: org_level_disabled_until`) is what `soma thaw` is for: it clears `state/backpressure.json`, prints the record it cleared, and admission resumes on the next tick. Order of operations, because the tick reads transcript tails and not calendars: first move or kill every lead whose transcript still ends on the cap row — `soma send <lead> "continue"` once you believe the cap has lifted (a healthy reply proves it; a second cap row proves it has not) or `soma kill <lead>` — then `soma thaw`. A record that comes back within a tick means a spawned lead's tail still reads the cap. `soma status` / `soma_status` show `backpressure` three-state (none / FROZEN with reason and since / unreadable); the lift has no event of its own — the record is what says it lifted. |
-| `soma up --canary` | The flag is answered; the driver is a v1.x gap, so it can only report "unproven". | §5.4 and §10 |
+| `soma up --canary` | The flag is answered; the driver is a v1.x gap, so the canary can only report "unproven" (`canary: ERROR`) and `up` refuses with exit 3. | §5.4 and §10 |
 | `soma_inbox` from the CLI | No `inbox` subcommand in v1. | `soma digest`, or `tail -n 40 "$SOMA_HOME/events/"*.ndjson` |
 
 `hold`, `release` and `gc` refuse with **exit 3**, not 1 (so do `thaw`'s four refusals: an unreadable record, a storm record, a clear that throws, and `--as` without the lease) — they *are* refusals, and exit 1 made a real-but-unbuilt
@@ -1032,6 +1060,51 @@ never observed that arming happen.** What is measured, and what is not:
   `continuing automatically at <reset>` and the lead resuming with nobody there. Nothing short of
   that. Until then this is **evidenced, not observed** — write it that way in any report, and never
   as a pass.
+
+### The rows `soma doctor` cannot take, and how to confirm them by hand
+
+`soma doctor` cannot print `PASS` on this build (§5.2): two of its rows are always unobserved, and a
+third is unobserved from a plain shell. Each asks a real question that no local file answers, so each
+is a bring-up check like the rest of this section. Confirm them by hand:
+
+- **`workflows enabled`** asks whether dynamic workflows are available to a **spawned** lead (design
+  requirement 5; the lead playbook's Step 4 fans its reads out through them). Doctor hard-wires it
+  to unobserved, because the answer depends on the account's plan and the Claude Code build, not on
+  anything on disk. Check it once per account — each seat, if rotation is configured — and again
+  after a Claude Code upgrade. With a throwaway task at `max_leads: 1`:
+
+  ```bash
+  soma send <lead> "Reply with one word, yes or no: is a tool named Workflow in your tool list?"
+  soma peek <lead>
+  ```
+
+  `yes` means the row would hold.
+
+- **`session id matches hook payload`** compares the `CLAUDE_CODE_SESSION_ID` a session's
+  subprocesses see with the `session_id` Claude Code hands that same session's hooks. It matters
+  because of the inject hook (`bin/hooks/orch-inject.mjs`, which you wire by hand; §5.1 says why
+  `soma init` does not): it treats a prompt as the lease holder's only when the hook payload's
+  `session_id` equals the id the bus recorded in the lease from `CLAUDE_CODE_SESSION_ID`. If the two
+  disagree, a promoted orchestrator silently never gets event headers. Doctor would read the payload
+  from `state/last-hook-payload.json`, which nothing in this build writes. By hand, in a Claude Code
+  session's Bash tool:
+
+  ```bash
+  echo "$CLAUDE_CODE_SESSION_ID"
+  ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$CLAUDE_CODE_SESSION_ID".jsonl
+  ```
+
+  The first prints a uuid. The second must list exactly one file: the transcript of the session you
+  are typing in. Hooks receive the session's `session_id` together with a `transcript_path` named
+  after it, so one file means the two agree. If no file is listed, they do not: `ls` says *No such
+  file or directory*, or, under zsh, the glob itself aborts with *no matches found*. End to end: with
+  the inject hook wired, a promoted session that gets unread event headers on its next prompt has
+  passed this comparison.
+
+- **`CLAUDE_CODE_SESSION_ID`** is unobserved from a plain shell by design: only a Claude Code
+  session's subprocesses carry it. Run `soma doctor` from a Claude Code session's Bash tool (the
+  orchestrator's, say) and it is observed, and should read `ok`; the `echo` above printing a uuid is
+  the same evidence.
 
 ### The measurement run that turns four estimates into numbers
 

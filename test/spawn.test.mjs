@@ -5,8 +5,9 @@
  *
  * Nothing in this file touches the repo working tree, spawns tmux, or runs `claude`. The
  * one test that exercises a real implementation (`withRepoLock`) writes only under the
- * throwaway `$SOMA_HOME` the test script mints.
+ * throwaway `$SOMA_HOME` that `soma-home.mjs` sets.
  */
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -962,9 +963,10 @@ test('the worktree registration is kept as well, so both copies fire', () => {
  * If this test reds, nothing is broken — the two generators drifted and the fleet just got
  * slower. Re-sync them; do not delete the pin.
  */
-test('the external guard is byte-identical to the in-worktree one, so claude runs one hook', () => {
+test('the external guard is byte-identical to the in-worktree one, so claude runs one hook', (t) => {
   mkdirSync(SOMA_HOME(), { recursive: true });
   const dir = mkdtempSync(join(SOMA_HOME(), 'guardpin-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
   // Options passed explicitly so nothing reads soma.json or this machine's real MCP servers.
   const fp = writeWorktreeGuardrails(dir, { mcpDenies: ['probe'], teammateAllow: [], home: join(dir, 'nohome'), env: {} });
   const inWorktree = JSON.parse(readFileSync(fp, 'utf8')).hooks.PreToolUse;
@@ -1465,10 +1467,11 @@ test('preTrust is handed the SEAT\'s environment, so the mark lands in the file 
   }
 });
 
-test('AGAINST THE REAL preTrust: the mark lands in <configDir>/.claude.json and the spawner\'s own file is untouched', async () => {
+test('AGAINST THE REAL preTrust: the mark lands in <configDir>/.claude.json and the spawner\'s own file is untouched', async (t) => {
   const { preTrust } = await import('../bin/lib/pretrust.mjs');
   mkdirSync(SOMA_HOME(), { recursive: true });
   const root = mkdtempSync(join(SOMA_HOME(), 'seats-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
   const own = join(root, 'orch');                      // the spawner's own config dir, seeded so "untouched" is observable
   mkdirSync(own);
   writeFileSync(join(own, '.claude.json'), JSON.stringify({ projects: {} }));

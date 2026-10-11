@@ -1,3 +1,4 @@
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -2751,6 +2752,49 @@ test('soma_spawn with every seat closed refuses before the claim: the row stays 
   assert.deepEqual(c.s.spawns, []);
   assert.equal(c.s.fleet.tasks[0].status, 'queued');
   assert.equal(c.s.updates, 0, 'refused BEFORE the transaction, so no row was claimed and released');
+});
+
+test('soma_spawn and soma_resume refuse a soma.json loadConfig refuses, before the claim or the launch, in a sentence with no path in it', async () => {
+  const bt = await load();
+  // `configOf()` reads a THROW as "no config", which is right for a reader and wrong for a launch:
+  // once loadConfig began refusing a seats that is not an array, soma_spawn skipped its max_leads
+  // gate on such a file, claimed the row, stamped the stagger clock and failed
+  // only at the spawner's own read — and soma_resume went seat-blind into resumeLead's. The loader's
+  // own sentence carries the file's path, which the bus never echoes.
+  const refused = () => { throw new Error('/abs/soma/soma.json: seats must be an array of { "config_dir": …, "label": … } entries, or [] (or no seats key) for no rotation, got an object'); };
+  const fixture = (deps = {}) => orch({ tasks: [{ id: 'cr-1' }, { id: 'cr-2', status: 'failed', lead_session_uuid: 'u2' }], deps });
+  const c = fixture({ loadConfig: refused });
+  const tools = bt.orchTools(c);
+
+  const spawn = await tools.get('soma_spawn')({ task_id: 'cr-1' });
+  assert.equal(spawn.ok, false);
+  assert.match(spawn.error, /soma\.json could not be loaded/);
+  assert.match(spawn.error, /soma doctor/, 'the command that names the fault');
+  assert.ok(!spawn.error.includes('/abs/'), `the refusal echoed a path: ${spawn.error}`);
+  assert.deepEqual(c.s.spawns, []);
+  assert.equal(c.s.updates, 0, 'refused before the transaction: no row was claimed and released');
+  assert.equal(c.s.fleet.tasks[0].status, 'queued');
+  assert.equal(c.s.fleet.last_spawn_at, null, 'and the stagger clock was not stamped');
+
+  const resume = await tools.get('soma_resume')({ lead: 'cr-2' });
+  assert.equal(resume.ok, false);
+  assert.match(resume.error, /soma\.json could not be loaded/);
+  assert.ok(!resume.error.includes('/abs/'), `the refusal echoed a path: ${resume.error}`);
+  assert.deepEqual(c.s.resumes, []);
+  assert.equal(c.s.fleet.tasks[1].status, 'failed');
+
+  // A reader acts on nothing, so it keeps answering on the same file.
+  const status = await tools.get('soma_status')({});
+  assert.notEqual(status.ok, false, `soma_status refused: ${status.error}`);
+  assert.ok(Array.isArray(status.queue), 'soma_status still renders the fleet');
+
+  // The control: a config that loads spawns and resumes exactly as before.
+  const ok = fixture();
+  const okTools = bt.orchTools(ok);
+  assert.equal((await okTools.get('soma_spawn')({ task_id: 'cr-1' })).spawned, true);
+  assert.notEqual((await okTools.get('soma_resume')({ lead: 'cr-2' })).ok, false);
+  assert.deepEqual(ok.s.spawns, ['cr-1']);
+  assert.deepEqual(ok.s.resumes, ['cr-2']);
 });
 
 test('soma_spawn and soma_resume with no seats configured launch as before: {} and seat: null, and the pool is never asked', async () => {

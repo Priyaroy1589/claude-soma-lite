@@ -49,6 +49,7 @@
  * four fences, one of them a `#`-commented shell block, so the hazard is live here rather than
  * hypothetical.
  */
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';

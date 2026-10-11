@@ -1,3 +1,4 @@
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -1380,52 +1381,117 @@ test('the write-idiom scan stays linear on the shapes that made it quadratic', a
   // start position, the class runs to the end of the command, and the engine then
   // backtracks over every space hunting for `-i`. 200 KB of `'sed '` took **12 s** here
   // before the gap was bounded, and a heredoc quoting a shell script that mentions sed
-  // took 2.4 s. Both are now single-digit-to-20 ms.
+  // took 2.4 s. That rule has since left the gate (`WRITE_IDIOMS` stays only for its
+  // measurements), but the shapes stay: the tokenizer, the heredoc mask, the cd tracking and
+  // the live push/merge rule all run over them, and giving that live rule the same unbounded
+  // gap brings the 12 s straight back — "many git tokens" measured 11.6 s, against 0.75 s for
+  // a quarter of it.
   //
-  // The budget is deliberately fifty times the measured cost: this asserts "not
-  // quadratic", not "fast". A regression to the old shape blows a 1 s budget by an
-  // order of magnitude, so the test fails loudly without being a stopwatch.
+  // So this asserts GROWTH, not speed. It used to fail any shape above 3 s, and the slowest
+  // shape measures 0.36 s on macOS and 0.7 s on an idle 8-core ext4 Linux VM — where it still
+  // failed at 4.5 s once, and at 3.8 s on a loaded run, and passed on the rerun: `npm test` runs
+  // the test files in parallel, and the machine may be busy besides, so a stopwatch here
+  // measured the machine as much as the scan. Each shape is timed at today's size and at a
+  // quarter of it, alternately, and the fastest run of each is compared, which drops the runs a
+  // scheduler or a collection stretched: linear reads ~4 and quadratic ~16. The worst any shape
+  // read was 4.5 on macOS idle, 6.0 there with every core busy and 5.1 on the Linux VM, against
+  // a limit of 8; the unbounded gap above reads 15.5 to 16.7.
+  //
+  // Four details are measured, not decoration. Every shape runs once at a quarter size before
+  // anything is timed, and once at full size before its own rounds: in a fresh process the
+  // first shape timed otherwise read 6.8–7.4 on the Linux VM, its code still cold. A cheap
+  // shape gets more than five rounds, up to twenty or a quarter of a second of its own time:
+  // with every core busy, five rounds left one cheap shape reading 6.9.
+  //
+  // The early exit is a property of the SHAPE, never of a measurement. Three shapes are marked
+  // `capped`: the cd shapes whose cost is a fixed budget, because cd tracking gives up past
+  // `CWD_MAX` characters and target resolution past 256 targets. They cost about a second per
+  // call on the Linux VM, and timing them five times like the rest made this test take 32–36 s
+  // there, against 14–18 s. A marked shape stops after its first round only if that round reads
+  // under 2; every other shape always runs its full rounds, so for 19 of the 22 the exit is
+  // unreachable however loaded the machine is. A marked shape's quarter-size run takes 0.08 s
+  // (macOS) to 0.64 s (the Linux VM) idle, so a miss would need that run stretched about eight
+  // times more than its full-size run in one round — a stall of over half a second on macOS and
+  // of seconds on the Linux VM — while a scan regression in a marked shape reads ~16 in its first
+  // round and goes on to the full rounds. The exit used to be open to any shape whose first round
+  // read under 2, on the argument that only a quarter-size run stretched eight times more than
+  // its full-size run could get a quadratic shape there. Load does that to a cheap shape, whose
+  // runs last milliseconds: inside the full parallel suite on the Linux VM, "two hundred thousand
+  // semicolons" stopped at 0.26 (8.2 ms full against 31.4 ms for a quarter, about fifteen times
+  // the quarter's share), and on macOS with every core busy "fifty thousand flags behind a
+  // wrapper" stopped at 1.71 — so a cheap shape regressed to a quadratic costing tens of
+  // milliseconds could have passed a loaded run.
+  //
+  // And one absolute limit stays, at 30 s per call, as a backstop only: it is for a scan gone
+  // pathological outright, and sits over twenty times above the slowest call measured anywhere.
+  //
+  // A shape whose cost is a fixed budget rather than a function of its size; see the early exit.
+  const capped = (shape) => Object.assign(shape, { capped: true });
   const shapes = {
-    'many sed tokens, no separator': 'sed '.repeat(51_200),                       // 200 KB
-    'a heredoc that mentions sed': `cat <<'EOF'\n${'  # normalise with sed and awk\n'.repeat(5000)}EOF\n`,
-    'many git tokens': 'git '.repeat(51_200),
-    'git with 20000 option tokens': `git ${'-C '.repeat(20_000)}`,               // the option run
-    'git with 20000 option+value pairs': `git ${'-C x '.repeat(20_000)}`,
-    'an option run that never reaches a verb': `git ${'-a '.repeat(20_000)}commitX`,
-    'one enormous token': `git ${'a'.repeat(200 * 1024)}`,
-    'a slash storm': '/'.repeat(200 * 1024),
-    'an unterminated quote': `"${'a'.repeat(200 * 1024)}`,
-    'ten thousand redirects': 'x > f '.repeat(10_000),
+    'many sed tokens, no separator': (q) => 'sed '.repeat(51_200 * q),            // 200 KB at q = 1
+    'a heredoc that mentions sed': (q) => `cat <<'EOF'\n${'  # normalise with sed and awk\n'.repeat(5000 * q)}EOF\n`,
+    'many git tokens': (q) => 'git '.repeat(51_200 * q),
+    'git with 20000 option tokens': (q) => `git ${'-C '.repeat(20_000 * q)}`,  // the option run
+    'git with 20000 option+value pairs': (q) => `git ${'-C x '.repeat(20_000 * q)}`,
+    'an option run that never reaches a verb': (q) => `git ${'-a '.repeat(20_000 * q)}commitX`,
+    'one enormous token': (q) => `git ${'a'.repeat(200 * 1024 * q)}`,
+    'a slash storm': (q) => '/'.repeat(200 * 1024 * q),
+    'an unterminated quote': (q) => `"${'a'.repeat(200 * 1024 * q)}`,
+    'ten thousand redirects': (q) => 'x > f '.repeat(10_000 * q),
     // Shapes the newline separator and the `cd` tracking are what make reachable. Without
     // the length bound in `cdDestination`, `cd a` repeated normalizes a path that grows by
     // two characters each iteration — quadratic, and 80 000 of them is a 1 MB command.
-    'fifty thousand newline segments': 'echo x\n'.repeat(50_000),
-    'fifty thousand cds down': 'cd a\n'.repeat(50_000),
-    'fifty thousand cds up': 'cd ..\n'.repeat(50_000),
-    'fifty thousand unfollowable cds': 'cd $X\n'.repeat(50_000),
-    'twenty thousand cd-and-delete pairs': 'cd a && rm b\n'.repeat(20_000),
-    'twenty thousand subshell cds': '(cd a)'.repeat(20_000),
-    'two hundred thousand semicolons': ';'.repeat(200 * 1024),
-    'a hundred thousand newlines': '\n'.repeat(100 * 1024),
-    'a hundred thousand line continuations': `tee ${'\\\n'.repeat(100_000)}f`,
-    'fifty thousand wrapper words': `${'nice '.repeat(50_000)}tee f`,
-    'fifty thousand flags behind a wrapper': `nice ${'-n '.repeat(50_000)}tee f`,
-    'a one-megabyte single cd path': `cd ${'a/'.repeat(500_000)} && rm settings.local.json`,
+    'fifty thousand newline segments': (q) => 'echo x\n'.repeat(50_000 * q),
+    'fifty thousand cds down': capped((q) => 'cd a\n'.repeat(50_000 * q)),
+    'fifty thousand cds up': (q) => 'cd ..\n'.repeat(50_000 * q),
+    'fifty thousand unfollowable cds': (q) => 'cd $X\n'.repeat(50_000 * q),
+    'twenty thousand cd-and-delete pairs': capped((q) => 'cd a && rm b\n'.repeat(20_000 * q)),
+    'twenty thousand subshell cds': capped((q) => '(cd a)'.repeat(20_000 * q)),
+    'two hundred thousand semicolons': (q) => ';'.repeat(200 * 1024 * q),
+    'a hundred thousand newlines': (q) => '\n'.repeat(100 * 1024 * q),
+    'a hundred thousand line continuations': (q) => `tee ${'\\\n'.repeat(100_000 * q)}f`,
+    'fifty thousand wrapper words': (q) => `${'nice '.repeat(50_000 * q)}tee f`,
+    'fifty thousand flags behind a wrapper': (q) => `nice ${'-n '.repeat(50_000 * q)}tee f`,
+    'a one-megabyte single cd path': (q) => `cd ${'a/'.repeat(500_000 * q)} && rm settings.local.json`,
   };
-  for (const [what, cmd] of Object.entries(shapes)) {
+  // The comment above promises exactly these three, so marking another shape is a decision this
+  // line makes someone take on purpose.
+  assert.deepEqual(Object.keys(shapes).filter((what) => shapes[what].capped),
+    ['fifty thousand cds down', 'twenty thousand cd-and-delete pairs', 'twenty thousand subshell cds']);
+  const time = (cmd) => {
     const started = process.hrtime.bigint();
     evaluateGate(bash(cmd), LEAD_ENV, () => false);
-    const ms = Number(process.hrtime.bigint() - started) / 1e6;
-    assert.ok(ms < 3000, `${what} (${(cmd.length / 1024).toFixed(0)} KB) took ${ms.toFixed(0)}ms — the scan went superlinear again`);
+    return Number(process.hrtime.bigint() - started) / 1e6;
+  };
+  for (const shape of Object.values(shapes)) time(shape(1 / 4));   // warms every quarter size
+  for (const [what, shape] of Object.entries(shapes)) {
+    const full = shape(1), quarter = shape(1 / 4);
+    const kb = (full.length / 1024).toFixed(0);
+    time(full);                                                    // and this the full one
+    let fullMs = Infinity, quarterMs = Infinity, spent = 0;
+    for (let round = 1; round <= 5 || (round <= 20 && spent < 250); round++) {
+      const q = time(quarter), ms = time(full);
+      assert.ok(ms < 30_000, `${what} (${kb} KB) took ${ms.toFixed(0)}ms — past the backstop, so the scan is pathological, not merely slow`);
+      quarterMs = Math.min(quarterMs, q);
+      fullMs = Math.min(fullMs, ms);
+      spent += q + ms;
+      if (round === 1 && shape.capped && fullMs / quarterMs < 2) break;   // only a marked shape: see above
+    }
+    const growth = fullMs / quarterMs;
+    assert.ok(growth < 8,
+      `${what}: ${kb} KB took ${fullMs.toFixed(1)}ms and a quarter of it ${quarterMs.toFixed(1)}ms — `
+      + `${growth.toFixed(1)}x the time for 4x the input, so the scan went superlinear again`);
   }
 
   // The syscall ceiling: both target budgets saturated with 64-deep paths that do not exist,
   // so every `resolveTarget` spends its whole ancestor budget failing — 2 × 256 targets ×
   // 64 levels ≈ 32 000 failing `realpath` calls, the most expensive shape there is.
   //
-  // The budget here is deliberately much looser than the loop above, and for a different
-  // reason: this shape is **syscall**-bound rather than CPU-bound, so it is the one assertion
-  // in this file whose cost depends on the machine's filesystem under load. Measured 621 ms;
+  // This one stays a stopwatch, and a deliberately loose one. It is **syscall**-bound rather
+  // than CPU-bound (profiled on macOS: 88% of it is `lstat` and `realpathSync`), so its cost
+  // depends on the machine's filesystem under load. But it measures 0.32 s on macOS and 0.39 s
+  // on the ext4 Linux VM, so 10 s leaves it 25 times its cost, where the old 3 s limit above
+  // left the slowest shape about 4 and flaked.
   // 10 s asserts "still bounded" — which is what would break if the 64-level ancestor cap or
   // the two target caps were removed *and* resolution went superlinear — without becoming the
   // suite's flake. Cap *removal* on its own is pinned by the pair in the per-generator test
@@ -1503,16 +1569,25 @@ test('a redirect onto the state root itself is denied (arm c); the old lead-only
  * A REAL state root with the per-lead control directory really on disk, plus a verdict
  * function for a lead session and for a teammate session over the same root.
  *
- * The root is a `mkdtemp` under `$TMPDIR` **on purpose, and it is the fixture's whole point.**
- * On macOS that is `/var/folders/…` while every path `resolveTarget` hands back comes through
- * `realpath` as `/private/var/folders/…`, so a prefix test against the configured spelling alone
- * matches nothing. A fixture with a tidy unsymlinked root would pass while the rule was a no-op
- * on the machine it ships to — which is the "measured on a no-op" trap, in fixture form.
+ * The root is reached **through a symlink the fixture makes itself, and that is the fixture's
+ * whole point.** `home` (the configured `SOMA_HOME`) is a link to a real directory beside it, so
+ * every path `resolveTarget` hands back comes through `realpath` spelled differently from the
+ * configured root, and a prefix test against the configured spelling alone matches nothing. That
+ * is the machine this ships to: on macOS `$TMPDIR` is `/var/folders/…` and resolves to
+ * `/private/var/folders/…`. The fixture used to borrow that symlink by putting the root under
+ * `$TMPDIR`, which made it exist on macOS only: Linux's `/tmp` is a real directory, so there the
+ * two spellings were one, and the symlink-resolution test could only fail its own precondition. A
+ * fixture with a tidy unsymlinked root passes while the rule is a no-op — which is the "measured
+ * on a no-op" trap, in fixture form.
  */
 function leadsFixture(t) {
-  const home = mkdtempSync(join(tmpdir(), 'soma-leads-'));
+  const base = mkdtempSync(join(tmpdir(), 'soma-leads-'));
+  const real = join(base, 'real');
+  mkdirSync(real);
+  const home = join(base, 'link');
+  symlinkSync(real, home);
   const wt = mkdtempSync(join(tmpdir(), 'soma-leads-wt-'));
-  t.after(() => { rmSync(home, { recursive: true, force: true }); rmSync(wt, { recursive: true, force: true }); });
+  t.after(() => { rmSync(base, { recursive: true, force: true }); rmSync(wt, { recursive: true, force: true }); });
   const L = join(home, 'leads', 'cr-1');
   mkdirSync(L, { recursive: true });
   mkdirSync(join(home, 'heartbeats'), { recursive: true });
@@ -1726,11 +1801,11 @@ test('the leads root is matched with the state root symlinks resolved, not as co
   // `/var/folders/…` and comes back `/private/var/folders/…`. Comparing only the configured
   // spelling would match NOTHING for exactly the paths this rule exists to catch.
   //
-  // The fixture root is real, so this test only means something if the two spellings actually
-  // differ — assert that first, or the test silently becomes a tautology on a platform where
-  // `$TMPDIR` is not symlinked.
+  // This test only means something if the two spellings actually differ. The fixture makes them
+  // differ on every platform by configuring the root as a symlink, and this asserts it first, so
+  // a fixture that stops doing that fails here instead of silently becoming a tautology.
   const real = realpathSync(home);
-  assert.notEqual(real, home, 'this fixture cannot test symlink resolution if $TMPDIR is not symlinked');
+  assert.notEqual(real, home, 'the fixture state root must be reached through a symlink, or this test cannot fail');
   assert.equal(v(`rm ${join(L, 'settings.launch.json')}`), 'leads',
     'the configured spelling of the leads root no longer matches');
   assert.equal(v(`rm ${join(real, 'leads', 'cr-1', 'settings.launch.json')}`), 'leads',

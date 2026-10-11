@@ -24,8 +24,9 @@
  *                    arm) plus the draft-only PR route through soma-pr; the worktree deny
  *                    list binds lead and teammate alike. See `writeLaunchSettings` for why
  *                    no settings file may ever carry the old bare-name ban again.
- *   no personal MCP  `--strict-mcp-config` with a one-server `--mcp-config` for the lead,
- *                    and the worktree guard file's deny list for its teammates.
+ *   no personal MCP  `--strict-mcp-config` with a `--mcp-config` naming only `soma` and the
+ *                    stateless `sequential-thinking` for the lead, and the worktree guard
+ *                    file's deny list for its teammates.
  *   scrubbed env     `env -i` plus ENV_ALLOW (applied by `tmux.newSession`). The operator's
  *                    exported API keys never reach a lead, a teammate, or a workflow agent.
  *   its own cwd      the lead's worktree, which is what keeps ten leads in ten

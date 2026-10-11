@@ -12,6 +12,7 @@
  *   assertion carries the weight instead — see `queue.test.mjs` for the precedent. An
  *   assertion count is a claim about how many measurements were taken.
  */
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -1094,6 +1095,22 @@ test('up refuses a state root that cannot take a hard link, once, before anythin
   assert.ok(e.includes('/vol/state'), 'the volume that refused is named, not just the requirement');
 });
 
+test('up refuses a seats that is not an array before it projects, asks, or starts anything', async (t) => {
+  const home = root(t);
+  // The REAL loader, not the stub `mk` carries: the refusal under test is loadConfig's, and a
+  // stubbed config would measure only the stub. A watchdog started on this file used to read `{}`
+  // as "no seats" and revive dead leads into a spawner that throws on it, after the kill and the
+  // attempt charge.
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ seats: {} }));
+  const h = mk({ loadConfig }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 2);
+  assert.match(h.stderr(), /^soma up: .*\bseats\b/m, 'the refusal must name the key');
+  assert.doesNotMatch(h.stdout(), /worst case/i, 'a spend projection was printed from a config soma refuses');
+  assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend on a refused config');
+  assert.equal(h.calls.newSession.length, 0, 'a watchdog was started on a refused config');
+});
+
 test('up --canary does not open the queue on a verdict that is not a pass', async (t) => {
   root(t);
   const bad = mk({ canary: async () => false }, { answer: true });
@@ -1105,6 +1122,54 @@ test('up --canary does not open the queue on a verdict that is not a pass', asyn
   // The idempotency read sees the watchdog already up, so this measures only that a passing
   // canary is not itself treated as a failure.
   assert.equal(await dispatch(['up', '--canary'], good.deps), 0);
+});
+
+test('up --canary through the REAL canary wiring refuses with exit 3 and the documented message, on both paths', async (t) => {
+  root(t);
+  // Every other --canary test stubs `canary`, which is how the real wiring shipped a crash: the
+  // production dep called `runCanary()` with no driver, `probeCanary` threw its "needs a live
+  // driver" TypeError, nothing in `up` caught it, and the CLI's last-resort handler exited 2 — where
+  // the help text and RUNBOOK §5.3/§5.4 promise "unproven" and a refusal with exit 3. So `canary`
+  // here is `realDeps().canary`, exactly as `soma up --canary` calls it. `runCanary` writes its
+  // verdict straight to process.stderr, which is captured for the run and restored after.
+  const verdict = [];
+  const realWrite = process.stderr.write;
+  t.after(() => { process.stderr.write = realWrite; });
+  const run = async (h) => {
+    process.stderr.write = (chunk) => { verdict.push(String(chunk)); return true; };
+    try {
+      return await dispatch(['up', '--canary'], h.deps);
+    } catch (e) {
+      return assert.fail(`soma up --canary threw instead of refusing (the CLI would exit 2): ${e?.message}`);
+    } finally {
+      process.stderr.write = realWrite;
+    }
+  };
+  for (const [path, over, live] of [
+    ['a fresh start', { liveSessions: startsClean() }, false],
+    ['an already-live watchdog', { liveSessions: () => new Set(['soma-watchdog']) }, true],
+  ]) {
+    verdict.length = 0;
+    const h = mk({ ...over, canary: realDeps().canary }, { answer: true });
+    assert.equal(await run(h), 3, `${path}: --canary must refuse with exit 3`);
+    if (live) {
+      // A watchdog is running and draining the queue — the line above the refusal says so — so
+      // "the queue was not opened" would be false here. Say what --canary did NOT do instead.
+      assert.doesNotMatch(h.stderr(), /the queue was not opened/, `${path}: the queue is open, and the refusal must not say otherwise`);
+      assert.match(h.stderr(), /the canary did not report a pass/, `${path}: the refusal still names the verdict`);
+      assert.match(h.stderr(), /already running is untouched/, `${path}: the running watchdog is left as it is`);
+      assert.match(h.stderr(), /`soma down`/, `${path}: and the verb that does stop a fleet is named`);
+    } else {
+      assert.match(h.stderr(), /the canary did not report a pass, so the queue was not opened/, `${path}: the documented canaryRefusal() message`);
+    }
+    assert.match(h.stderr(), /NOTE, because it is the likeliest reason on this build/, `${path}: the note about the unbuilt driver stays`);
+    const everything = `${h.stderr()}\n${verdict.join('')}`;
+    assert.doesNotMatch(everything, /needs a live driver/, `${path}: a wiring error must not stand in for the verdict`);
+    assert.match(verdict.join(''), /canary: ERROR — the canary did not run/, `${path}: the verdict is on stderr above the refusal`);
+    assert.match(verdict.join(''), /not built/, `${path}: and it says why nothing was proven`);
+    assert.doesNotMatch(h.stdout(), /canary: pass/, path);
+    assert.equal(h.calls.newSession.length, 0, `${path}: no watchdog was started by --canary`);
+  }
 });
 
 test('up wraps ensureTree rather than letting a library throw reach the operator as a stack', async (t) => {
@@ -2110,6 +2175,31 @@ test('resume reports a spawner failure as a failure', async (t) => {
   assert.notEqual(await dispatch(['resume', 'cr-1'], h.deps), 0);
   assert.match(h.stderr(), /worktree is gone/);
   assert.equal(h.calls.setTaskStatus.length, 0, 'a row marked spawned beside no session is worse than a failed one');
+});
+
+test('resume refuses a soma.json loadConfig refuses BEFORE the kill, with the reason and exit 2', async (t) => {
+  const home = root(t);
+  // The arm read soma.json tolerantly — "the spawner's to refuse" — and the spawner does refuse it,
+  // but only after the kill below has destroyed the dead pane `soma peek` shows. With a seats that
+  // is not an array refused at load, that was every resume on such a file.
+  // The REAL loader, on a real bad file: the refusal under test is its sentence.
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ seats: {} }));
+  const fleet = () => ({ tasks: [{ id: 'cr-1', status: 'failed', lead_session_uuid: 'u1' }] });
+  const h = mk({ readFleet: fleet, loadConfig });
+  assert.equal(await dispatch(['resume', 'cr-1'], h.deps), 2, 'the same exit `soma up` gives a config it cannot load');
+  assert.equal(h.calls.killSession.length, 0, 'the dead pane is still standing');
+  assert.equal(h.calls.resumeLead.length, 0);
+  assert.equal(h.calls.setTaskStatus.length, 0);
+  assert.equal(h.calls.updateFleet.length, 0);
+  assert.match(h.stderr(), /^soma resume: .*\bseats\b/m, 'the loader\'s reason, which names the key');
+
+  // The control: the same row on a config that loads is killed first and resumed.
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ seats: [] }));
+  const ok = mk({ readFleet: fleet, loadConfig });
+  assert.equal(await dispatch(['resume', 'cr-1'], ok.deps), 0, ok.stderr());
+  assert.equal(ok.calls.killSession.length, 1);
+  assert.equal(ok.calls.resumeLead.length, 1);
 });
 
 test('resume launches onto an open seat picked BEFORE the kill, records it through the store, refuses with every seat closed, and stays seat-blind with no seats configured', async (t) => {
