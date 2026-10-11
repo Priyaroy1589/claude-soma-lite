@@ -72,15 +72,21 @@ const mk = (over = {}, { answer = false } = {}) => {
     // The seat a resume picked, the options the spawner got, and every fleet the store was asked
     // to mutate — so a test can read the row a `resume` wrote without a real checkpoint.
     resumeOpts: [], pickSeat: [], updateFleet: [],
+    // One entry per process-table scan `up` made, so a test can tell "found nothing" from "never looked".
+    serverProcesses: [],
   };
   const deps = {
     print: (s) => out.push(String(s)),
     warn: (s) => err.push(String(s)),
     liveSessions: () => new Set(),
-    // Asked only about a `null` listing, by `status` and `down`. `false` is the inert answer: it
-    // claims nothing about the server, so a `null` keeps its `unverified` reading and `down` keeps
-    // its exit 3 — the arms that read "no server" hand over `() => true` themselves.
+    // Asked only about a `null` listing, by `status`, `down` and `up`. `false` is the inert answer: it
+    // claims nothing about the server, so a `null` keeps its `unverified` reading, `down` keeps its
+    // exit 3 and `up` refuses — the arms that read "no server" hand over `() => true` themselves.
     serverAbsent: () => false,
+    // No tmux process for soma's socket. Never the real scan, on purpose: on a machine running a
+    // fleet it finds that fleet's server, and every `up` test would then refuse for a reason that is
+    // the machine's, not the test's. Asked only by `up`, after a "no server" from `serverAbsent`.
+    serverProcesses: () => { calls.serverProcesses.push(1); return []; },
     // The pane census's listing: `null` is the inert answer ("not measured"), so `status` prints
     // `?` in the PANE column and `send` refuses to type blind — the arms about panes hand over
     // an explicit listing (`panesFor`).
@@ -1217,6 +1223,96 @@ test('up, from a shell with no UTF-8 locale, reads a live watchdog as live and a
   assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend for a fleet that is already running');
   assert.equal(h.calls.newSession.length, 0, 'a second watchdog was started');
   assert.equal(srv.alive('soma-watchdog'), true);
+});
+
+test('up refuses when tmux cannot be read, before it projects, asks or starts anything (#66)', async (t) => {
+  root(t);
+  // `null` is "not measured" — a timeout, a missing binary, a permission error — and the already-
+  // running check counted only a listing that HAD the watchdog, so `null` read as "none running": the
+  // projection, the prompt, and on a yes a watchdog started beside one tmux could not show.
+  const h = mk({ liveSessions: () => null }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 3, h.stderr());
+  assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend with the fleet\'s state unknown');
+  assert.equal(h.calls.newSession.length, 0, 'a watchdog was started beside one tmux could not show');
+  assert.doesNotMatch(h.stdout(), /worst case/i, 'nothing is projected on an unreadable tmux');
+  assert.match(h.stderr(), /^soma up: tmux could not be read/m);
+  assert.match(h.stderr(), /UNKNOWN/);
+  assert.ok(h.stderr().includes(tmux.socketName()), 'the socket that could not be read is named');
+  assert.match(h.stderr(), /`soma status`/, 'and how to check is said');
+  assert.match(h.stderr(), /RUNBOOK §11\.10/);
+  // The scan is for tmux's "no server" only; anything else unreadable refuses without it.
+  assert.equal(h.calls.serverProcesses.length, 0);
+});
+
+test('up over a listing tmux answered but soma cannot parse refuses, through the real readers (#66)', async (t) => {
+  root(t);
+  // #45's mangled listing — exit 0, every tab a `_` — read by the REAL `liveSessions` and
+  // `serverAbsent` over one stub transport. The listing is now `null`, and tmux answered, so it is not
+  // "no server": `up` must refuse, not fall through to a second watchdog.
+  const run = (args) => (args[0] === 'list-panes'
+    ? { stdout: 'soma-watchdog_0\n', stderr: '', code: 0 }
+    : { stdout: 'soma-watchdog\n', stderr: '', code: 0 });
+  const h = mk({ liveSessions: () => tmux.liveSessions(run), serverAbsent: () => tmux.serverAbsent(run) }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 3, h.stderr());
+  assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend over a listing soma could not read');
+  assert.equal(h.calls.newSession.length, 0, 'a second watchdog was started');
+  assert.match(h.stderr(), /UNKNOWN/);
+});
+
+test('up on tmux\'s "no server" refuses while a tmux process for its socket is still alive, and names it (#66)', async (t) => {
+  root(t);
+  // RUNBOOK §11.10 measured two LIVE servers that say "no server answers": one whose socket file was
+  // deleted while it ran, one wedged until its accept queue overflowed. A `new-session` in either
+  // starts a SECOND server on the same path, beside the first and its running leads.
+  const h = mk({ liveSessions: () => null, serverAbsent: () => true, serverProcesses: () => [4242, 4343] }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 3, h.stderr());
+  assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend beside a live server');
+  assert.equal(h.calls.newSession.length, 0, 'a second server was started beside a live one');
+  const e = h.stderr();
+  assert.match(e, /pid 4242, 4343/, 'every process found is named, by pid');
+  assert.ok(e.includes(`socket ${tmux.socketName()}`), 'and the socket it was found for');
+  assert.match(e, /socket file was deleted/, 'the first of the two states');
+  assert.match(e, /accept queue overflowed/, 'the second');
+  assert.match(e, /kill -USR1 <pid>/, 'the recovery for a deleted socket file');
+  assert.match(e, /kill -CONT <pid>/, 'and for a stopped server');
+  assert.match(e, /`soma status`/);
+});
+
+test('up on tmux\'s "no server" refuses on ONE live tmux process for its socket, and names it (#66)', async (t) => {
+  root(t);
+  // One process is the ordinary case: the fleet's own server, its socket file deleted or its accept
+  // queue overflowed. Every other refusal here passes two pids or none, so a check that wanted more
+  // than one would pass them all and start a second server beside this one.
+  const h = mk({ liveSessions: () => null, serverAbsent: () => true, serverProcesses: () => [4242] }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 3, h.stderr());
+  assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend beside a live server');
+  assert.equal(h.calls.newSession.length, 0, 'a second server was started beside a live one');
+  assert.match(h.stderr(), /\(pid 4242\)/, 'the one process found is named, by pid');
+});
+
+test('up on tmux\'s "no server" refuses when the process table cannot be read (#66)', async (t) => {
+  root(t);
+  // "Cannot tell" is not "none found": the second is the answer that starts a server.
+  const h = mk({ liveSessions: () => null, serverAbsent: () => true, serverProcesses: () => null }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 3, h.stderr());
+  assert.equal(h.calls.confirm.length, 0);
+  assert.equal(h.calls.newSession.length, 0);
+  assert.match(h.stderr(), /process table could not be read/);
+  assert.match(h.stderr(), /RUNBOOK §11\.10/);
+});
+
+test('up on tmux\'s "no server" with no tmux process for its socket is a fresh machine: projection, prompt, start (#66)', async (t) => {
+  root(t);
+  // The control for the three refusals above, and where every machine stands before its first `soma
+  // up`: no server answers, and no tmux for the socket is alive. That one goes on exactly as before.
+  let n = 0;
+  const h = mk({ liveSessions: () => (++n === 1 ? null : new Set(['soma-watchdog'])), serverAbsent: () => true }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 0, h.stderr());
+  assert.equal(h.calls.serverProcesses.length, 1, 'the process table was looked at, once, before starting a server');
+  assert.match(h.stdout(), /Fleet worst case/);
+  assert.equal(h.calls.confirm.length, 1);
+  assert.equal(h.calls.newSession.length, 1);
+  assert.match(h.stdout(), /watchdog: live \(tmux session soma-watchdog/);
 });
 
 test('up refuses a state root that cannot take a hard link, once, before anything starts', async (t) => {
@@ -2636,7 +2732,7 @@ test('release names the lease verb it is not', async (t) => {
 
 /** One arm per guarded dep — the arm that actually calls it. */
 const ARM_FOR = {
-  liveSessions: ['status'], serverAbsent: ['status'], paneStates: ['status'], newSession: ['up'], killSession: ['down'], sendKeys: ['send', 'cr-1', 'x'],
+  liveSessions: ['status'], serverAbsent: ['status'], serverProcesses: ['up'], paneStates: ['status'], newSession: ['up'], killSession: ['down'], sendKeys: ['send', 'cr-1', 'x'],
   capturePane: ['peek', 'cr-1'], resumeLead: ['resume', 'cr-1'], exec: ['attach', 'cr-1'],
   capture: ['init'], doctor: ['doctor'], canary: ['up', '--canary'], confirm: ['up'],
   linkProbe: ['up'], installSkill: ['init'],

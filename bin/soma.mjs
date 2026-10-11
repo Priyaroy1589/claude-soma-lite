@@ -170,11 +170,13 @@ const ENV = 2;
 const REFUSED = 3;
 
 /**
- * Deps with real side effects outside `$SOMA_HOME`: they start processes, talk to tmux, write
- * the operator's Claude Code config, or block on a terminal. See the module header.
+ * Deps with real side effects outside `$SOMA_HOME`: they start processes, talk to tmux, read the
+ * machine's process table, write the operator's Claude Code config, or block on a terminal. See
+ * the module header. (`serverProcesses` is here although it writes nothing: run for real by a test,
+ * it reports the operator's own live fleet, and `up` would read that as a refusal.)
  */
 export const GUARDED_DEPS = Object.freeze([
-  'liveSessions', 'serverAbsent', 'paneStates', 'newSession', 'killSession', 'sendKeys', 'capturePane', 'resumeLead',
+  'liveSessions', 'serverAbsent', 'serverProcesses', 'paneStates', 'newSession', 'killSession', 'sendKeys', 'capturePane', 'resumeLead',
   'exec', 'capture', 'doctor', 'canary', 'confirm', 'linkProbe', 'installSkill',
 ]);
 
@@ -534,8 +536,12 @@ const liveDriverNotBuilt = async () => {
  */
 export const realDeps = () => ({
   liveSessions: () => tmux.liveSessions(),
-  // Asked only about a `null` from `liveSessions`, and only by `status` and `down` — see `stopper`.
+  // Asked only about a `null` from `liveSessions`, by `status`, `down` and `up` — see `stopper`, and
+  // `up`'s refusal for why it never acts on the answer alone.
   serverAbsent: () => tmux.serverAbsent(),
+  // Asked only by `up`, and only when `serverAbsent` said "no server": is a tmux for soma's socket
+  // still alive anyway? The socket is the module's own, so it is the one every other call talks to.
+  serverProcesses: () => tmux.serverProcesses(),
   paneStates: () => tmux.paneStates(),
   newSession: (spec) => tmux.newSession(spec),
   killSession: (name) => tmux.killSession(name),
@@ -847,14 +853,16 @@ export async function dispatch(argv, deps = {}) {
       // and a listing with no row soma can parse names no session (#45) — and rendering that as
       // "dead" would report ten working leads as gone.
       //
-      // ONE kind of `null` is asked about again, here and in `down` only: tmux's own words for "no
-      // server answers on this socket" (`tmux.serverAbsent`), which is what a machine that has
-      // never run `soma up` answers. No server answering, no sessions to list — so that reading is
-      // an EMPTY server, not an unmeasured one: the watchdog absent, a spawned row `dead`, every
-      // pane `gone`. Every other `null` (a timeout, a missing binary, a permission error, a
-      // listing with no row soma can parse) stays `?`. This report writes nothing on the answer,
-      // and reconcile never asks: `tmux.serverAbsent` says why, and RUNBOOK §11.10 declares the
-      // two states in which a live server gives the same answer.
+      // ONE kind of `null` is asked about again, here, in `down` and in `up`: tmux's own words
+      // for "no server answers on this socket" (`tmux.serverAbsent`), which is what a machine
+      // that has never run `soma up` answers. `up` asks only to decide whether to look for a live
+      // tmux process for the socket, and never starts a server on that answer alone. Here, no
+      // server answering, no sessions to list — so that reading is an EMPTY server, not an
+      // unmeasured one: the watchdog absent, a spawned row `dead`, every pane `gone`. Every other
+      // `null` (a timeout, a missing binary, a permission error, a listing with no row soma can
+      // parse) stays `?`. This report writes nothing on the answer, and reconcile never asks:
+      // `tmux.serverAbsent` says why, and RUNBOOK §11.10 declares the two states in which a live
+      // server gives the same answer.
       const noServer = listed === null && serverAbsent() === true;
       const live = noServer ? new Set() : listed;
       const liveOf = (name) => (live === null ? '?' : live.has(name) ? 'yes' : 'dead');
@@ -1079,6 +1087,10 @@ export async function dispatch(argv, deps = {}) {
       const l = links();
       if (l) return l;
 
+      // Resolved before anything is read or printed, as in every arm: both are asked only about a
+      // `null` listing below, and a missing one is a wiring bug, never a fleet state.
+      const serverAbsent = N('serverAbsent');
+      const serverProcesses = N('serverProcesses');
       const live0 = N('liveSessions')();
       if (live0 !== null && live0.has(WATCHDOG)) {
         d.print(`watchdog: live already (tmux session ${WATCHDOG}) — nothing was started and no new`
@@ -1123,6 +1135,53 @@ export async function dispatch(argv, deps = {}) {
           d.print('canary: pass');
         }
         return OK;
+      }
+
+      // NOT MEASURED IS NOT "NOT RUNNING" (#66). The check above counts only a listing that HAS the
+      // watchdog, so a `null` — tmux could not be read — used to fall through to here as if none ran:
+      // the projection, the prompt, and on a yes a watchdog started beside one tmux could not show.
+      // So a `null` refuses, before anything is projected or asked, with ONE exception: tmux's own
+      // words for "no server answers on this socket" (`tmux.serverAbsent`), which is where every
+      // machine stands before its first `up`.
+      if (live0 === null) {
+        const sock = tmux.socketName();
+        if (serverAbsent() !== true) {
+          d.warn(`soma up: tmux could not be read on socket ${sock}, so whether a watchdog is already`
+            + ' running is UNKNOWN — and soma will not start one on that: a watchdog started beside one'
+            + ' it cannot see supervises the same fleet twice. Nothing was projected, asked or started.'
+            + ' `soma status` shows what tmux does answer (`?` where it could not be read), `soma doctor`'
+            + ' checks that tmux is reachable at all, and RUNBOOK §11.10 covers a live server tmux cannot'
+            + ' reach.');
+          return REFUSED;
+        }
+        // Even that sentence is not proof. RUNBOOK §11.10 measured two LIVE servers that say it — one
+        // whose socket file was deleted while it ran, one wedged until its accept queue overflowed —
+        // and a `new-session` in either starts a SECOND server on the same path, beside the first and
+        // its running leads. A process is what tells those from a server that is really gone, so look
+        // for a live tmux for this socket before starting one: the check §11.10 used to leave to the
+        // operator. Three answers, and only "none" goes on to the fresh start below.
+        const pids = serverProcesses();
+        if (pids === null) {
+          d.warn(`soma up: no tmux server answers on socket ${sock}, and the process table could not be`
+            + ' read, so soma cannot tell a server that is really gone from a live one that answers the'
+            + ' same way — its socket file deleted, or wedged (RUNBOOK §11.10) — and it will not start'
+            + ' a watchdog on that. Nothing was projected, asked or started. Look yourself for a live'
+            + ` \`tmux -L ${sock}\` process run by your own user (\`ps -axo pid,user,command\`; another`
+            + ' user\'s is another socket); `soma up` refuses this way until it can read the process table.');
+          return REFUSED;
+        }
+        if (pids.length > 0) {
+          d.warn(`soma up: no tmux server answers on socket ${sock}, but a tmux process for that socket is`
+            + ` still alive (pid ${pids.join(', ')}), so this is not a machine with no server, and soma`
+            + ' will not start one. RUNBOOK §11.10 measured two LIVE servers that answer exactly so: one'
+            + ' whose socket file was deleted while it ran (a /tmp cleaner), and one wedged until its'
+            + ' accept queue overflowed. A new server would sit beside the first, and its watchdog would'
+            + ' find none of the first one\'s leads and respawn them onto the same worktrees. Recover the'
+            + ' first: `kill -USR1 <pid>` makes a server whose socket file was deleted recreate it, and'
+            + ' `kill -CONT <pid>` resumes a stopped one; then `soma status`, and `soma up` only if it'
+            + ' reads no watchdog. Nothing was projected, asked or started.');
+          return REFUSED;
+        }
       }
 
       let cfg;

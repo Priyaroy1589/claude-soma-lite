@@ -15,6 +15,7 @@
  * reads "no server", which is its safe answer.
  */
 import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 
 /**
  * Private server: soma's sessions never mix with the operator's own tmux.
@@ -340,7 +341,9 @@ const NO_SERVER = [/^no server running on .+$/, /^error connecting to .+ \(No su
  * Neither writes anything on the answer, and in either state above both are simply wrong — a
  * declared residual, RUNBOOK §11.10. `soma kill` does not ask: its answer to an absence is a
  * `failed` row, and over a live lead in either state that is the destructive case `stopper` in
- * soma.mjs exists to refuse.
+ * soma.mjs exists to refuse. `soma up` asks, and never takes the answer alone: it STARTS a server on
+ * it, so it first looks for a live tmux process for the socket (`serverProcesses`, below) and
+ * refuses when it finds one or cannot look (#66).
  *
  * Matching tmux's wording is what `liveSessions`' header refuses to do, and the refusal stands
  * there. Here a tmux release that rewords either sentence only turns this answer false, and the
@@ -351,6 +354,132 @@ export function serverAbsent(run = defaultRun) {
   if (r.code === 0) return false;
   const said = String(r.stderr ?? '').trim();
   return NO_SERVER.some((re) => re.test(said));
+}
+
+/** tmux's own options that take a value (`getopt` string `2c:CDdf:lL:NqS:T:uUvV`, tmux 3.x). */
+const TMUX_VALUED = new Set(['c', 'f', 'L', 'S', 'T']);
+
+/**
+ * The socket NAME tmux's own `-L` gives this argv, or `null` — `null` too when argv[0] is not tmux.
+ *
+ * Read the way tmux's `getopt` reads it, which is why it is not a substring search: options end at
+ * the first word that is not one (`--` included), because from there on the words are the COMMAND's
+ * — `new-session`'s flags, or the shell command a pane runs, which may well say `-L soma`. A value
+ * rides in the same word (`-Lsoma`) or the next (`-L soma`), flags group (`-uL soma`), and the last
+ * `-L` wins. The name is compared whole by the caller: `soma` is not `soma_pers`.
+ */
+const socketOfArgv = (argv) => {
+  if (!Array.isArray(argv) || typeof argv[0] !== 'string' || argv[0].split('/').pop() !== 'tmux') return null;
+  let socket = null;
+  for (let i = 1; i < argv.length; i++) {
+    const word = argv[i];
+    if (typeof word !== 'string' || word === '--' || word.length < 2 || word[0] !== '-') break;
+    for (let j = 1; j < word.length; j++) {
+      if (!TMUX_VALUED.has(word[j])) continue;
+      const value = j + 1 < word.length ? word.slice(j + 1) : argv[++i];
+      if (word[j] === 'L') socket = typeof value === 'string' ? value : null;
+      break;
+    }
+  }
+  return socket;
+};
+
+/**
+ * PURE: the pids, among `procs` (`[{pid, argv}]`), of tmux processes whose own options name
+ * `socket` with `-L`. Server and client alike: both are a tmux for that socket, and the caller's
+ * answer to either is to refuse, which is the safe direction.
+ */
+export const tmuxProcessesOn = (procs, socket) =>
+  (Array.isArray(procs) ? procs : []).filter((p) => socketOfArgv(p?.argv) === socket).map((p) => p.pid);
+
+/**
+ * PURE: `/bin/ps -axo pid=,uid=,command=` output as `[{pid, uid, argv}]`. `ps` keeps argv only as
+ * one string joined by spaces, so it is split on whitespace — exact for every flag `socketOfArgv`
+ * reads, though an argv[0] with a space in its path no longer reads as tmux. A line that is not a
+ * pid, a uid and a command is skipped.
+ */
+export function parsePs(stdout) {
+  const out = [];
+  for (const line of String(stdout ?? '').split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(\S.*)$/.exec(line);
+    if (m) out.push({ pid: Number(m[1]), uid: Number(m[2]), argv: m[3].trim().split(/\s+/) });
+  }
+  return out;
+}
+
+/** `ps` output is the whole process table; the default 1 MiB is a busy machine away from an error. */
+const PS_MAX_BUFFER = 64 * 1024 * 1024;
+
+/**
+ * Every process on the machine as `[{pid, uid, argv}]`, or `null` when the table could not be read.
+ * No dependency and no new binary: `/proc/<pid>/cmdline` where there is a /proc (Linux, WSL2; the
+ * argv exactly, NUL-separated), and `/bin/ps` from the base system where there is not (macOS, whose
+ * output to a pipe is never truncated to a terminal's width). The uid is the process's effective
+ * one: the owner procfs gives `/proc/<pid>`, and `ps`'s `uid` column. A process whose owner cannot
+ * be read is left out, because `serverProcesses` counts only its own user's.
+ *
+ * Measured on tmux 3.6a (macOS) and 3.4 (Linux, WSL2): a tmux SERVER shows the argv of the client
+ * that started it — `tmux -L soma -u new-session -d -s soma-watchdog …` for the one `soma up`
+ * starts — because it is forked from that client and keeps its memory; on Linux tmux renames only
+ * the thread (`comm` reads `tmux: server`) and leaves `cmdline` alone. Both still read so after the
+ * server's socket file is deleted.
+ */
+export function listProcesses() {
+  try {
+    if (existsSync('/proc/self/cmdline')) {
+      const procs = [];
+      for (const name of readdirSync('/proc')) {
+        if (!/^\d+$/.test(name)) continue;
+        let uid;
+        let argv;
+        try {
+          uid = statSync(`/proc/${name}`).uid;
+          argv = readFileSync(`/proc/${name}/cmdline`, 'utf8').split('\0');
+        } catch {
+          continue;                                    // gone since the readdir, or not ours to read
+        }
+        if (argv.at(-1) === '') argv.pop();            // the NUL that ends the last word
+        if (argv.length > 0) procs.push({ pid: Number(name), uid, argv });   // kernel threads have none
+      }
+      return procs;
+    }
+    return parsePs(execFileSync('/bin/ps', ['-axo', 'pid=,uid=,command='], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: PS_MAX_BUFFER,
+    }));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The pids of live tmux processes for soma's socket — `[]` when there are none, `null` when the
+ * process table could not be read. The check RUNBOOK §11.10 used to leave to the operator, and the
+ * one `soma up` makes before it starts a server on tmux's "no server answers" (`serverAbsent`):
+ * that sentence is also what a LIVE server says once its socket file is deleted, or once it is
+ * wedged and its accept queue has overflowed, and a `new-session` in either state starts a SECOND
+ * server on the same path, beside a first one whose leads are still running.
+ *
+ * Only `uid`'s processes count: this user's, unless a test says otherwise. A `-L` socket lives at
+ * `<TMUX_TMPDIR>/tmux-<uid>/<name>`, so another user's `tmux -L soma` is always another socket.
+ * Counted, it would make this user's `up` refuse for as long as that one runs, naming a pid whose
+ * `kill -USR1` this user is not allowed to send (EPERM).
+ *
+ * Three answers, never two. A table that does not hold THIS process as this user is not a listing
+ * of this user's processes — an empty `ps`, a /proc that is not procfs, a uid that did not read — so
+ * it is `null` (cannot tell), never `[]` (none found), which is the answer that starts a server. So
+ * is a `uid` that is not an integer (a platform with no `process.getuid`).
+ *
+ * What it cannot see: a server started with `-S <path>` instead of `-L`, or by a tmux build that
+ * rewrites its own argv (neither was measured). What it over-sees: this user's tmux for the same
+ * NAME under another TMUX_TMPDIR, which is a different socket; that only refuses. `list` is the
+ * seam the module's `run` is: a test hands over a table instead of reading the machine's.
+ */
+export function serverProcesses(socket = SOCKET, list = listProcesses, uid = process.getuid?.()) {
+  if (!Number.isInteger(uid)) return null;
+  const procs = list();
+  const mine = (p) => p?.uid === uid;
+  if (!Array.isArray(procs) || !procs.some((p) => p?.pid === process.pid && mine(p))) return null;
+  return tmuxProcessesOn(procs.filter(mine), socket);
 }
 
 /**
