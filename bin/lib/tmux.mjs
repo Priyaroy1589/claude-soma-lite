@@ -7,7 +7,7 @@
  * the argument shapes and the two-call send-keys dance are decided once.
  *
  * Every function takes an optional `run` — `(args) => ({ stdout, code })`,
- * where `args` follows `tmux -L soma` — so tests record argument vectors
+ * where `args` follows `tmux -L soma -u` — so tests record argument vectors
  * without a tmux server, and a future transport (ssh, a remote host) can be
  * dropped in without touching the callers. The default `run` adds a `stderr`
  * field. Two readers look at it — `newSession`'s refusal and `serverAbsent` —
@@ -41,14 +41,27 @@ const SOCKET = process.env.SOMA_TMUX_SOCKET || 'soma';
  */
 export const socketName = () => SOCKET;
 
-/** The full argv tmux is invoked with — exported so the socket is assertable. */
-export const tmuxArgs = (args) => ['-L', SOCKET, ...args];
+/**
+ * The full argv tmux is invoked with — exported so the socket is assertable. The socket is at
+ * index 1, and tests read it there.
+ *
+ * **`-u` on every call.** tmux decides whether a CLIENT is UTF-8 from the first of LC_ALL, LC_CTYPE
+ * and LANG that is set, and a client that is not prints every character of a format's output that
+ * is not printable ASCII as `_` — the tab between the fields of `liveSessions`' and `paneStates`'
+ * listings included — and still exits 0 (measured, tmux 3.6a; `capture-pane -p` is not affected).
+ * The watchdog and every lead run under `env -i` with LANG and no LC_*, so an operator whose UTF-8
+ * locale came from LC_ALL or LC_CTYPE alone, or whose LANG is `C`, ran a watchdog that read every
+ * live lead as dead, and a `soma resume` that killed a live one (#45). `-u` makes the client UTF-8
+ * whatever its environment says. It rides on `soma attach` too, which builds its argv here: there
+ * it makes tmux draw UTF-8 to the operator's terminal, which is what a lead's pane holds anyway.
+ */
+export const tmuxArgs = (args) => ['-L', SOCKET, '-u', ...args];
 
 /** A wedged tmux must not block the synchronous watchdog loop forever. */
 const TIMEOUT_MS = 5000;
 
 /**
- * Run `tmux -L soma <args>`, reporting the exit code instead of throwing.
+ * Run `tmux -L soma -u <args>`, reporting the exit code instead of throwing.
  *
  * A nonzero exit is ordinary control flow here — `has-session` on a lead that
  * died is the fleet's main liveness probe — so execFileSync's throw is mapped
@@ -142,7 +155,7 @@ export const listSessions = (run = defaultRun) =>
 
 /**
  * Sessions with at least one **live pane** — the watchdog's `aliveSessions` — or `null` when
- * tmux could not be read at all.
+ * tmux could not be read: the listing failed, or came back with no row this can parse.
  *
  * **A session name is not liveness in soma, and that is by design.** `setRemainOnExit` keeps a
  * dead lead's pane and its session alive on purpose: that pane *is* the death scene the
@@ -170,6 +183,15 @@ export const listSessions = (run = defaultRun) =>
  * sessions", one hiccup makes all ten spawned rows look dead in the same tick. `null` means
  * "not measured", and the tick's answer to that is to skip reconcile and revival for one tick.
  *
+ * **So is a listing tmux answered with lines of which not one parses** — never the empty Set that
+ * skipping every row would leave. Measured on tmux 3.6a: a client that is not UTF-8 prints the tab
+ * as `_` and exits 0, every row lost its separator, and a live fleet read as an empty server — the
+ * destructive direction above, for every lead in one tick (#45). `-u` in `tmuxArgs` stops that
+ * mangling; this is the backstop for whatever else makes a whole listing unattributable. An empty
+ * stdout is still an empty Set (a server with no panes is a reading), and a listing with at least
+ * one row that parses keeps the per-row skip: the listing was read, and its odd rows corroborate
+ * nothing. Rows that PARSED are counted, not rows that are live: all-dead is a reading too.
+ *
  * A live tick that genuinely sees no tmux server is close to a contradiction — the watchdog
  * itself runs in a tmux session, so it would have died with the server — which is why "no
  * server running" is folded into the same `null` rather than sniffed out of stderr. There is no
@@ -191,16 +213,21 @@ export function liveSessions(run = defaultRun) {
   const r = run(['list-panes', '-a', '-F', '#{session_name}\t#{pane_dead}']);
   if (r.code !== 0) return null;
   const live = new Set();
+  let rows = 0;
+  let parsed = 0;
   for (const line of String(r.stdout ?? '').split('\n')) {
     if (line === '') continue;
+    rows++;
     // The LAST tab separates the fields: a session name may contain one, and truncating at
     // the first would name a session nobody has *and* drop the real one from the live set —
     // which reads as a dead lead. Same rejoin-rather-than-truncate rule as `listPanes`.
     const cut = line.lastIndexOf('\t');
     if (cut === -1) continue;   // unattributable to any session, so it corroborates nothing
+    parsed++;
     if (line.slice(cut + 1) !== '1') live.add(line.slice(0, cut));
   }
-  return live;
+  // Lines, and not one of them attributable: a listing soma could not read, not an empty server.
+  return rows > 0 && parsed === 0 ? null : live;
 }
 
 /** The listing `paneStates` reads. Title LAST, because it may contain tabs and is rejoined. */
@@ -208,7 +235,8 @@ export const PANE_STATES_FORMAT = '#{session_name}\t#{pane_id}\t#{pane_active}\t
 
 /**
  * What every session's pane is RUNNING — the pane census's read — or `null` when tmux could not
- * be read at all. `Map<sessionName, {dead, cmd, pid, title, pane_id, active, panes}>`.
+ * be read (the listing failed, or came back with no row this can parse).
+ * `Map<sessionName, {dead, cmd, pid, title, pane_id, active, panes}>`.
  *
  * Beside `liveSessions`, never instead of it: that one answers "is any pane in this session
  * live?" for reconcile, and its Set-of-names contract is read at six call sites. This one answers
@@ -225,6 +253,9 @@ export const PANE_STATES_FORMAT = '#{session_name}\t#{pane_id}\t#{pane_active}\t
  * for the same reason: a non-zero exit answers `null`, never an empty Map, because a wedged
  * server's 5 s timeout is byte-identical to an idle one and an empty Map read as "every lead
  * absent" would let one hiccup mark ten live leads dead in a tick. Only the literal `1` is dead.
+ * And, as there, a listing with lines of which not one carries its seven fields is `null` too —
+ * the tab printed as `_` by a client that is not UTF-8 (#45) — while an empty stdout is an empty
+ * Map and a listing with one good row keeps the per-row skip.
  *
  * A session with several panes (a teammate split into the lead's window) is collapsed to its
  * ACTIVE pane for the top-level fields, because `capturePane('=name:')` reads the active pane —
@@ -238,10 +269,14 @@ export function paneStates(run = defaultRun) {
   const r = run(['list-panes', '-a', '-F', PANE_STATES_FORMAT]);
   if (r.code !== 0) return null;
   const out = new Map();
+  let rows = 0;
+  let parsed = 0;
   for (const line of String(r.stdout ?? '').split('\n')) {
     if (line === '') continue;
+    rows++;
     const parts = line.split('\t');
     if (parts.length < 7) continue;                // unattributable: corroborates nothing
+    parsed++;
     const [session, pane_id, active, dead, pid, cmd, ...title] = parts;
     const pane = {
       pane_id,
@@ -262,7 +297,8 @@ export function paneStates(run = defaultRun) {
       }
     }
   }
-  return out;
+  // Lines, and not one of them attributable: a listing soma could not read, not an empty server.
+  return rows > 0 && parsed === 0 ? null : out;
 }
 
 /**
@@ -387,7 +423,13 @@ export const killSession = (name, run = defaultRun) => run(['kill-session', '-t'
 export const setRemainOnExit = (name, run = defaultRun) =>
   run(['set-option', '-t', windowTarget(name), 'remain-on-exit', 'on']).code === 0;
 
-/** Every pane in a session: `{index, dead, title}`. */
+/**
+ * Every pane in a session: `{index, dead, title}`.
+ *
+ * Display only — the team rows of `soma_status` — so its parse is left as it was, with no
+ * unparseable-listing backstop: a listing a non-UTF-8 client mangled (#45) renders as odd rows,
+ * never as a liveness verdict, and `-u` in `tmuxArgs` is what keeps its tabs and titles whole.
+ */
 export function listPanes(session, run = defaultRun) {
   const out = run(['list-panes', '-s', '-t', sessionTarget(session), '-F', '#{pane_index}\t#{pane_dead}\t#{pane_title}']).stdout;
   return out.split('\n').filter(Boolean).map((l) => {

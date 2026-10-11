@@ -423,6 +423,35 @@ test('paneStates keeps tabs inside a title, collapses a session to its ACTIVE pa
   assert.equal(proto.has('toString'), false, 'membership is Map membership, not property lookup');
 });
 
+test('a listing tmux answered but not one row of which parses is "not measured", never an empty fleet (#45)', async () => {
+  const t = await load('unparseable');
+  // What tmux 3.6a printed, byte for byte, for a live lead to a client in `LANG=C` (no `-u`): the
+  // tabs as `_`, and in the pane listing the title's `✳` too. Exit 0. Every row lacks its
+  // separator, every row was skipped, and the answer was an EMPTY Set — "no lead has a live pane" —
+  // which reconcile turns into LEAD_DEAD, a kill and a respawn for every spawned lead in one tick.
+  const live = () => ({ stdout: 'soma-watchdog_0\nlead-cr-1_0\n', stderr: '', code: 0 });
+  const panes = () => ({ stdout: 'lead-cr-1_%0_1_0_71101_sleep__ Claude Code\n', stderr: '', code: 0 });
+  assert.equal(t.liveSessions(live), null, 'liveSessions read a listing it could not parse as an empty server');
+  assert.equal(t.paneStates(panes), null, 'paneStates read a listing it could not parse as an empty server');
+
+  // The controls, which are what make the two nulls above a rule rather than a new blanket answer.
+  // An EMPTY listing on exit 0 is still a readable answer: a server with nothing on it.
+  const empty = () => ({ stdout: '', stderr: '', code: 0 });
+  assert.ok(t.liveSessions(empty) instanceof Set);
+  assert.equal(t.liveSessions(empty).size, 0);
+  assert.ok(t.paneStates(empty) instanceof Map);
+  assert.equal(t.paneStates(empty).size, 0);
+  // One row that parses keeps today's per-row skip: the listing WAS read, and the rows beside it
+  // that do not parse corroborate nothing.
+  assert.deepEqual([...t.liveSessions(() => ({ stdout: 'lead-cr-1_0\nlead-cr-2\t0\n', code: 0 }))], ['lead-cr-2']);
+  assert.deepEqual([...t.paneStates(() => ({ stdout: 'lead-cr-1_%0_1_0_7_zsh_\nlead-cr-2\t%1\t1\t0\t8\tzsh\t\n', code: 0 })).keys()], ['lead-cr-2']);
+  // And the backstop counts rows that PARSED, not rows that are live: a listing whose only row is a
+  // dead pane is a measured server with no live session on it, never "not measured".
+  const dead = t.liveSessions(() => ({ stdout: 'lead-cr-1\t1\n', code: 0 }));
+  assert.ok(dead instanceof Set, 'a parsed dead pane is a reading, not an unreadable listing');
+  assert.equal(dead.size, 0);
+});
+
 test('serverAbsent is true only for tmux\'s own two "no server answers on this socket" sentences', async () => {
   const t = await load('server-absent');
   // A machine that has never started soma's server: no socket FILE, so the connect is ENOENT.
@@ -485,14 +514,29 @@ test('production still talks to the soma socket; tests can point elsewhere', asy
   const prod = await load('socket-default');
   // The single shared server is a design commitment (one inventory, one
   // failure domain) — nothing may quietly move soma off it.
-  assert.deepEqual(prod.tmuxArgs(['has-session', '-t', '=lead-cr-1']), ['-L', 'soma', 'has-session', '-t', '=lead-cr-1']);
+  assert.deepEqual(prod.tmuxArgs(['has-session', '-t', '=lead-cr-1']), ['-L', 'soma', '-u', 'has-session', '-t', '=lead-cr-1']);
 
   process.env.SOMA_TMUX_SOCKET = 'soma-throwaway';
   const isolated = await load('socket-override');
-  assert.deepEqual(isolated.tmuxArgs(['kill-session']), ['-L', 'soma-throwaway', 'kill-session']);
+  assert.deepEqual(isolated.tmuxArgs(['kill-session']), ['-L', 'soma-throwaway', '-u', 'kill-session']);
 
   process.env.SOMA_TMUX_SOCKET = '';             // an empty override is not an override
   assert.equal((await load('socket-empty')).tmuxArgs([])[1], 'soma');
+});
+
+test('every tmux call carries -u, so a listing parses the same whatever the caller\'s locale (#45)', async () => {
+  const t = await load('utf8-flag');
+  // Measured, tmux 3.6a: a client that does not believe it is in a UTF-8 locale (it reads the first
+  // of LC_ALL, LC_CTYPE and LANG that is set) prints every non-printable byte of a format's output
+  // as `_` — the TAB that separates `liveSessions`' and `paneStates`' fields included — and still
+  // exits 0. The watchdog runs under `env -i` with LANG and no LC_*, so `LANG=C`, or a locale that
+  // came from LC_ALL alone, was enough to read every live lead as dead. `-u` makes the client UTF-8
+  // whatever the environment says. On EVERY call, `soma attach` included: there it makes tmux draw
+  // UTF-8 to the operator's terminal, which is what a lead's pane holds in any case.
+  const argv = t.tmuxArgs(['list-panes', '-a']);
+  assert.deepEqual(argv, ['-L', t.socketName(), '-u', 'list-panes', '-a']);
+  // The socket stays at index 1: this file, spawn.test.mjs and the bus smoke test read it there.
+  assert.equal(t.tmuxArgs([])[1], t.socketName());
 });
 
 // The default run() is the only code path that touches the OS; exercise it with
@@ -635,4 +679,48 @@ test('against a real tmux: serverAbsent reads a never-started and a killed serve
   assert.equal(t.defaultRun(['kill-server']).code, 0);
   assert.equal(t.serverAbsent(), true, `after kill-server — tmux said: ${said()}`);
   if (existsSync(socketPath)) assert.match(said(), /^no server running on /, 'a stale socket file must be the path this exercised');
+});
+
+test('against a real tmux, from a shell with no UTF-8 locale: both listings still see a live session (#45)', { skip: !tmuxInstalled && 'tmux not installed' }, async (t_) => {
+  // Issue #45's shell, reproduced rather than described, in a CHILD process: `tmux.mjs` reads its
+  // socket once at load, and the locale that matters is the tmux client's, which inherits the
+  // child's environment. That environment is this one minus LC_ALL and LC_CTYPE, with LANG=C — the
+  // watchdog's own shape, which forwards LANG and no LC_* — and minus TMUX: measured, a client that
+  // sees $TMUX treats itself as UTF-8 whatever LANG says, so a suite run from inside a tmux pane
+  // would not reproduce the bug with it. (The watchdog has no $TMUX: `env -i` drops it.)
+  //
+  // The sandbox is under /tmp rather than `tmpdir()`: a Unix socket path is limited to about 104
+  // bytes on macOS, and a long TMPDIR pushes `<dir>/tmux-<uid>/<socket>` past it (issue #46).
+  const dir = mkdtempSync('/tmp/st-');
+  const sock = `sl-${process.pid}`;
+  const env = { ...process.env, LANG: 'C', TMUX_TMPDIR: dir, SOMA_TMUX_SOCKET: sock };
+  for (const k of ['LC_ALL', 'LC_CTYPE', 'TMUX', 'TMUX_PANE']) delete env[k];
+  // The sandbox's own spelling, for setup, the control and teardown — never the module under test,
+  // so the cleanup cannot reach another server whatever the module does.
+  const sandbox = (args) => spawnSync('tmux', ['-L', sock, ...args], { encoding: 'utf8', env });
+  t_.after(() => {
+    sandbox(['kill-server']);
+    rmSync(dir, { recursive: true, force: true });
+  });
+  // `-f /dev/null` on the call that starts the server, for the reason the integration test gives.
+  const up = sandbox(['-f', '/dev/null', 'new-session', '-d', '-s', 'lead-cr-1', 'sleep 600']);
+  assert.equal(up.status, 0, `the sandbox server must start: ${up.stderr}`);
+  assert.equal(env.TMUX_TMPDIR, dir, 'the child must reach the sandbox, not the default socket directory');
+  assert.equal(env.SOMA_TMUX_SOCKET, sock, 'the child must talk to the sandbox socket, never a live fleet\'s');
+
+  // THE CONTROL: this environment reproduces the defect. Without it, a tmux that stopped mangling
+  // the tab would leave the assertions below green for a reason that has nothing to do with soma.
+  const raw = sandbox(['list-panes', '-a', '-F', '#{session_name}\t#{pane_dead}']);
+  assert.equal(raw.stdout, 'lead-cr-1_0\n', 'a C-locale client must print the tab as `_` here, or this test measures nothing');
+
+  const url = new URL('../bin/lib/tmux.mjs', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['-e',
+    `import(${JSON.stringify(url)}).then((m) => { const l = m.liveSessions(); const p = m.paneStates();`
+    + ' process.stdout.write(JSON.stringify({ socket: m.socketName(), live: l && [...l], panes: p && [...p.keys()] })); })',
+  ], { encoding: 'utf8', env });
+  assert.equal(child.status, 0, child.stderr);
+  const got = JSON.parse(child.stdout);
+  assert.equal(got.socket, sock);
+  assert.deepEqual(got.live, ['lead-cr-1'], 'liveSessions read a live session as absent (or as unmeasured)');
+  assert.deepEqual(got.panes, ['lead-cr-1'], 'paneStates read a live session as absent (or as unmeasured)');
 });

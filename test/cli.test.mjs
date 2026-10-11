@@ -15,7 +15,7 @@
 import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
@@ -164,6 +164,50 @@ const panesFor = (...names) => ({ paneStates: () => new Map(names.map((n) => [n,
 const startsClean = () => {
   let n = 0;
   return () => (++n === 1 ? new Set() : new Set(['soma-watchdog']));
+};
+
+/** The real-tmux tests below run wherever tmux is installed, and skip only where it is not. */
+const tmuxInstalled = spawnSync('tmux', ['-V']).status === 0;
+
+/**
+ * A REAL tmux server in a sandbox of its own, read the way a shell with no UTF-8 locale reads it:
+ * issue #45's operator, whose `soma resume` from such a shell killed a live lead and resumed it.
+ *
+ * `run` is the transport `tmux.mjs`' readers take, and it executes `tmux` with `tmux.tmuxArgs`, so
+ * whatever the module puts on every call rides along exactly as in production. Its environment is
+ * this process's minus LC_ALL, LC_CTYPE and TMUX, with LANG=C: tmux decides UTF-8 from the first of
+ * the three locale variables that is set, and (measured) treats any client that sees $TMUX as UTF-8,
+ * so a suite run from inside a tmux pane would not reproduce the bug without dropping it.
+ *
+ * The socket is `tmux.socketName()`, because this file pins SOMA_TMUX_SOCKET before `tmux.mjs`
+ * loads and `tmuxArgs` names nothing else. It is unique all the same: TMUX_TMPDIR is a fresh
+ * directory, under /tmp because a Unix socket path is limited to about 104 bytes on macOS (#46),
+ * and no other server lives in it. Setup, the control and teardown use the sandbox's own `-L`.
+ */
+const cLocaleTmux = (t, ...sessions) => {
+  const dir = mkdtempSync('/tmp/st-');
+  const env = { ...process.env, LANG: 'C', TMUX_TMPDIR: dir };
+  for (const k of ['LC_ALL', 'LC_CTYPE', 'TMUX', 'TMUX_PANE']) delete env[k];
+  const sandbox = (args) => spawnSync('tmux', ['-L', tmux.socketName(), ...args], { encoding: 'utf8', env });
+  t.after(() => {
+    sandbox(['kill-server']);
+    rmSync(dir, { recursive: true, force: true });
+  });
+  sessions.forEach((name, i) => {
+    // `-f /dev/null` on the call that starts the server: an operator's ~/.tmux.conf may load
+    // plugins that save and restore sessions, and a throwaway server must run none of them.
+    const r = sandbox([...(i === 0 ? ['-f', '/dev/null'] : []), 'new-session', '-d', '-s', name, 'sleep 600']);
+    assert.equal(r.status, 0, `the sandbox server must start ${name}: ${r.stderr}`);
+  });
+  // The control: this shell really does mangle the listing, or a test built on it measures nothing.
+  const raw = sandbox(['list-panes', '-a', '-F', '#{session_name}\t#{pane_dead}']).stdout;
+  assert.ok(raw.includes(`${sessions[0]}_0`), `a C-locale client must print the tab as "_" here; it printed ${JSON.stringify(raw)}`);
+  const run = (args) => {
+    const r = spawnSync('tmux', tmux.tmuxArgs(args), { encoding: 'utf8', env, timeout: 5000 });
+    return { stdout: r.stdout ?? '', stderr: r.stderr ?? '', code: r.status ?? 1 };
+  };
+  const alive = (name) => sandbox(['has-session', '-t', `=${name}`]).status === 0;
+  return { run, alive };
 };
 
 // --------------------------------------------------------------------------- status
@@ -1159,6 +1203,20 @@ test('up is idempotent: a live watchdog is reported, not duplicated, and costs n
   assert.equal(h.calls.newSession.length, 0);
   assert.equal(h.calls.confirm.length, 0, 'the queue is already open; nothing new is being spent');
   assert.match(h.stdout(), /already/i);
+});
+
+test('up, from a shell with no UTF-8 locale, reads a live watchdog as live and asks for no spend (#45)', { skip: !tmuxInstalled && 'tmux not installed' }, async (t) => {
+  root(t);
+  // `up`'s idempotency read through the REAL reader, over a real server with a live watchdog on it.
+  // Without `-u` tmux printed the listing's tab as `_`, the watchdog read as absent, and `up` went on
+  // to the worst-case spend prompt — and on a yes, to a second `new-session` for a name that exists.
+  const srv = cLocaleTmux(t, 'soma-watchdog');
+  const h = mk({ liveSessions: () => tmux.liveSessions(srv.run) }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 0, h.stderr());
+  assert.match(h.stdout(), /watchdog: live already/);
+  assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend for a fleet that is already running');
+  assert.equal(h.calls.newSession.length, 0, 'a second watchdog was started');
+  assert.equal(srv.alive('soma-watchdog'), true);
 });
 
 test('up refuses a state root that cannot take a hard link, once, before anything starts', async (t) => {
@@ -2237,6 +2295,42 @@ test('resume refuses a lead that is still live unless forced', async (t) => {
   assert.equal(await dispatch(['resume', 'cr-1', '--force'], forced.deps), 0);
   assert.equal(forced.calls.resumeLead.length, 1);
   assert.equal(forced.calls.killSession.length, 1, 'forced still kills first — that ordering is not the guard');
+});
+
+test('resume, from a shell with no UTF-8 locale, reads a live lead as live and neither kills nor resumes it (#45)', { skip: !tmuxInstalled && 'tmux not installed' }, async (t) => {
+  root(t);
+  // The operator's report on #45, end to end through soma's REAL readers: `liveSessions` and
+  // `killSession` are tmux.mjs's own, over a real server holding a live `lead-cr-1`. Only the spawner
+  // stays a recorder, so nothing real is launched. Without `-u` tmux printed the listing's tab as
+  // `_`, the lead read as not live, and resume KILLED its session and put a second claude on its
+  // worktree — the one outcome the liveness guard exists to prevent.
+  const srv = cLocaleTmux(t, 'lead-cr-1');
+  const kills = [];
+  const h = mk({
+    readFleet: () => ({ tasks: [{ id: 'cr-1', status: 'spawned', lead_session_uuid: 'u1' }] }),
+    liveSessions: () => tmux.liveSessions(srv.run),
+    killSession: (name) => { kills.push(name); return tmux.killSession(name, srv.run); },
+  });
+  assert.equal(await dispatch(['resume', 'cr-1'], h.deps), 3, h.stderr());
+  assert.deepEqual(kills, [], 'a live lead\'s session was killed');
+  assert.equal(h.calls.resumeLead.length, 0, 'a second claude session was put on a live lead\'s worktree');
+  assert.equal(srv.alive('lead-cr-1'), true, 'the live session must still be there');
+  assert.match(h.stderr(), /cr-1 is still live/);
+});
+
+test('resume refuses a listing tmux answered but soma cannot parse as unmeasured, never as a dead lead (#45)', async (t) => {
+  root(t);
+  // The backstop beside `-u`, through the real reader over a stub transport: exit 0, every tab a `_`.
+  // Read as an empty server, that listing is "cr-1 is not live", and resume kills and resumes it.
+  const mangled = () => ({ stdout: 'lead-cr-1_0\n', stderr: '', code: 0 });
+  const h = mk({
+    readFleet: () => ({ tasks: [{ id: 'cr-1', status: 'spawned', lead_session_uuid: 'u1' }] }),
+    liveSessions: () => tmux.liveSessions(mangled),
+  });
+  assert.equal(await dispatch(['resume', 'cr-1'], h.deps), 3, h.stderr());
+  assert.equal(h.calls.killSession.length, 0, 'a session was killed on a listing soma could not read');
+  assert.equal(h.calls.resumeLead.length, 0);
+  assert.match(h.stderr(), /could not be measured/);
 });
 
 test('resume refuses a row with no recorded claude session', async (t) => {

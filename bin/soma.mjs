@@ -778,8 +778,9 @@ export async function dispatch(argv, deps = {}) {
    *                 caller that opts in (below), also: tmux could list nothing because, in its
    *                 own words, no server answers on the socket at all (`noServer: true`).
    *   `live`        the kill did not take: tmux answered and the session is STILL there.
-   *   `unmeasured`  tmux would not answer, so NEITHER claim can be made. Without the opt-in,
-   *                 that includes "no server answers on the socket".
+   *   `unmeasured`  tmux would not answer, or answered a listing soma could not parse, so
+   *                 NEITHER claim can be made. Without the opt-in, that includes "no server
+   *                 answers on the socket".
    *
    * The opt-in is `serverAbsent`, and only `down` passes it. A machine that has never run `soma up`
    * has no tmux server, so no watchdog session, and `down` writes nothing on that reading: it
@@ -841,18 +842,19 @@ export async function dispatch(argv, deps = {}) {
       const { fleet } = got;
       const serverAbsent = N('serverAbsent');
       const listed = N('liveSessions')();
-      // Three states, never two. `liveSessions` answers `null` when tmux could not be read at
-      // all — a 5 s timeout on a wedged server is byte-identical to a healthy server with
-      // nothing on it — and rendering that as "dead" would report ten working leads as gone.
+      // Three states, never two. `liveSessions` answers `null` when tmux could not be read — a
+      // 5 s timeout on a wedged server is byte-identical to a healthy server with nothing on it,
+      // and a listing with no row soma can parse names no session (#45) — and rendering that as
+      // "dead" would report ten working leads as gone.
       //
       // ONE kind of `null` is asked about again, here and in `down` only: tmux's own words for "no
       // server answers on this socket" (`tmux.serverAbsent`), which is what a machine that has
       // never run `soma up` answers. No server answering, no sessions to list — so that reading is
       // an EMPTY server, not an unmeasured one: the watchdog absent, a spawned row `dead`, every
-      // pane `gone`. Every other `null` (a timeout, a missing binary, a permission error) stays
-      // `?`. This report writes nothing on the answer, and reconcile never asks:
-      // `tmux.serverAbsent` says why, and RUNBOOK §11.10 declares the two states in which a live
-      // server gives the same answer.
+      // pane `gone`. Every other `null` (a timeout, a missing binary, a permission error, a
+      // listing with no row soma can parse) stays `?`. This report writes nothing on the answer,
+      // and reconcile never asks: `tmux.serverAbsent` says why, and RUNBOOK §11.10 declares the
+      // two states in which a live server gives the same answer.
       const noServer = listed === null && serverAbsent() === true;
       const live = noServer ? new Set() : listed;
       const liveOf = (name) => (live === null ? '?' : live.has(name) ? 'yes' : 'dead');
@@ -1692,7 +1694,7 @@ export async function dispatch(argv, deps = {}) {
           + (r.state === 'live'
             ? ` tmux answered and still reports ${session} as live${r.why ? ` (${r.why})` : ''},`
               + ` so the kill did not take and ${id} is still running.`
-            : ` tmux would not answer (${r.why}), so soma cannot tell whether ${session} is gone`
+            : ` tmux could not be read (${r.why}), so soma cannot tell whether ${session} is gone`
               + ' or still running, and it will not mark a possibly-live lead failed on that.')
           + ` Check \`soma status\`, then \`soma kill ${id}\` again.`
           + ` (event ${logged ? 'logged' : 'NOT logged'})`);

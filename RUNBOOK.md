@@ -617,9 +617,10 @@ The watchdog tick (default 30 s) does seven things:
    A `spawned` row whose pane the census read as a bare shell is dead here too (its `LEAD_DEAD`
    carries `pane_state: dead_shell`); a shell on any other row is surfaced and left standing —
    killing a finished lead's pane is the unbuilt `linger_minutes` reaper's job.
-   If tmux cannot be read at all it emits `TMUX_UNREADABLE` and **skips** reconcile and revival —
-   one hiccup read as a dead fleet would kill and respawn ten live leads. When only the pane
-   listing failed, `skipped` names `pane_census` alone and no `pane_state` is written that tick.
+   If tmux cannot be read (the listing failed, or came back with no row soma can parse) it emits
+   `TMUX_UNREADABLE` and **skips** reconcile and revival — one hiccup read as a dead fleet would
+   kill and respawn ten live leads. When only the pane listing could not be read, `skipped` names
+   `pane_census` alone and no `pane_state` is written that tick.
 2. **Budget breakers and model deviation**, over every `spawned` *and* `blocked` row.
 3. **`NEEDS_INPUT` → `blocked`**, after `blocked_slot_minutes` of grace, which frees the slot.
 4. **Backpressure.** A rate-limit storm corroborated across two *distinct* leads freezes admission.
@@ -813,7 +814,7 @@ read-back through `liveSessions`, which answers `null` for "not measured", givin
 | `killed` — tmux exited 0 | row → `failed`, `KILLED` event, **exit 0** | `watchdog: stopped`, **exit 0** |
 | `absent` — tmux read back, nothing by that name | row → `failed`, **exit 0** (`not found (tmux read back)`) | `no session named soma-watchdog was running`, **exit 0** — also when no tmux server answers on soma's socket, and the line then names the socket (below, and §11.10) |
 | `live` — tmux answered, session still there | **row left untouched**, `KILL_REFUSED` event, **exit 3** | `the watchdog was NOT stopped`, **exit 3** |
-| `unmeasured` — tmux would not answer | **row left untouched**, `KILL_REFUSED` event, **exit 3** | `UNVERIFIED`, **exit 3** |
+| `unmeasured` — tmux would not answer, or answered a listing soma could not parse | **row left untouched**, `KILL_REFUSED` event, **exit 3** | `UNVERIFIED`, **exit 3** |
 
 **When no tmux server answers on soma's socket** (every machine before its first `soma up`, and
 after the fleet's last session has exited), tmux says so in one of two sentences: `error connecting

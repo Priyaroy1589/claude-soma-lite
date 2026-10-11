@@ -272,13 +272,14 @@ const HARNESS_EVENTS = new Set(['HARNESS']);
  *    freed slot admits another lead and the fleet runs N metered beside M unmetered sessions.
  *
  * **Scoped on the status enum and NOT on tmux liveness, which was the other candidate.**
- * `aliveSessions()` may answer `null`: a wedged tmux server and a healthy idle one produce the
- * same empty output, and phase 2 already declines to read that as a dead fleet. A meter gated on
- * the same predicate would switch the whole fleet's breaker off on exactly the ticks when
- * something else is already wrong — trading a status-shaped hole for a liveness-shaped one of
- * the same class, and a wider one. Metering reads transcripts, not tmux; it needs no liveness
- * answer, and a spend cap must not acquire a dependence on one. (A trip on a row whose lead has
- * since died costs nothing: the flag only bites through that lead's own hook.)
+ * `aliveSessions()` may answer `null` — a wedged tmux server and a healthy idle one produce the
+ * same empty output, and a listing in which no row parses names no session at all — and phase 2
+ * already declines to read either as a dead fleet. A meter gated on the same predicate would
+ * switch the whole fleet's breaker off on exactly the ticks when something else is already
+ * wrong — trading a status-shaped hole for a liveness-shaped one of the same class, and a wider
+ * one. Metering reads transcripts, not tmux; it needs no liveness answer, and a spend cap must
+ * not acquire a dependence on one. (A trip on a row whose lead has since died costs nothing: the
+ * flag only bites through that lead's own hook.)
  *
  * **Terminal rows are out, deliberately.** A `done`/`failed`/`skipped` lead has reported that it
  * stopped; its transcript is not growing, and `BUDGET_TRIPPED` written against it is a flag only
@@ -620,9 +621,10 @@ export async function tick(deps) {
   // read here that looks at what a pane is RUNNING.
   //
   // `null` from `paneStates` is the same answer as `null` from `aliveSessions` — tmux could not
-  // be listed — and gets the same treatment: nothing is written about any pane this tick, and it
-  // is announced. Phase 2 consumes the census (a `spawned` row on a shell is dead to reconcile),
-  // and phase 1 kills only a pane the census read as alive, which is why this runs first.
+  // be listed, or listed nothing soma could parse — and gets the same treatment: nothing is
+  // written about any pane this tick, and it is announced. Phase 2 consumes the census (a
+  // `spawned` row on a shell is dead to reconcile), and phase 1 kills only a pane the census read
+  // as alive, which is why this runs first.
   const panes = deps.paneStates();
   const census = panes === null || panes === undefined
     ? null
@@ -666,11 +668,12 @@ export async function tick(deps) {
   // dead lead's session alive on purpose (that pane IS the death scene), so `hasSession` is
   // true for a dead lead and a reconciler built on it finds no dead leads ever.
   //
-  // `null` means tmux could not be read at all, which is NOT the same answer as "nothing is
-  // alive". A wedged tmux reports the same empty output a healthy idle server does; read as
-  // liveness, one hiccup makes every spawned row look dead in the same tick and this branch
-  // then kills and respawns ten LIVE leads. One tick of revival latency is the cheap side of
-  // that trade, and it is announced so the pause is not silent.
+  // `null` means tmux could not be read — the listing failed, or came back with no row soma can
+  // parse (#45) — which is NOT the same answer as "nothing is alive". A wedged tmux reports the
+  // same empty output a healthy idle server does; read as liveness, one hiccup makes every
+  // spawned row look dead in the same tick and this branch then kills and respawns ten LIVE
+  // leads. One tick of revival latency is the cheap side of that trade, and it is announced so
+  // the pause is not silent.
   const alive = deps.aliveSessions();
   const skipped = [];
   if (alive === null || alive === undefined) skipped.push('reconcile', 'revival');
@@ -679,8 +682,8 @@ export async function tick(deps) {
     say('TMUX_UNREADABLE', {
       skipped,
       why: alive === null || alive === undefined
-        ? 'tmux list-panes exited non-zero; a wedged server and an idle one are indistinguishable by output, and treating that as a dead fleet would respawn over live work'
-        : 'the pane listing exited non-zero while the liveness listing did not; no pane_state is written this tick, because an unlisted pane is not an absent one',
+        ? 'tmux list-panes failed, or answered a listing soma could not parse; a wedged server and an idle one are indistinguishable by output, a listing with no parsable row names no session, and treating either as a dead fleet would respawn over live work'
+        : 'the pane listing failed, or answered one soma could not parse, while the liveness listing was read; no pane_state is written this tick, because an unlisted pane is not an absent one',
     });
   }
   if (alive !== null && alive !== undefined) {
