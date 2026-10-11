@@ -117,11 +117,14 @@ $SOMA_HOME/
   state/                 fleet.json, fleet.lock, orch.lease, QUEUE_PAUSED, seats.json, backpressure.json (written on an org spend cap)
   events/                <stream>.ndjson — one per lead, plus orch.ndjson
   heartbeats/            <lead> — touched by the lead's PostToolUse hook
-  leads/<id>/            brief.md, mcp.json, settings.json, settings.launch.json,
+  leads/<id>/            meta.json, brief.md, mcp.json, settings.json, settings.launch.json,
                          BUDGET_TRIPPED, BUDGET_WARNED (BUDGET_WARNED.delivered once
-                         the gate has handed the lead its 80% note)
-                         (meta.json is in the design and in
-                         docs/ROADMAP.md, and NOTHING WRITES IT — see §9)
+                         the gate has handed the lead its 80% note).
+                         meta.json is written by each spawn, before the launch: id, repo,
+                         base_branch, base_sha (the commit the worktree was cut from;
+                         null if a reused one's cut was never recorded), branch, worktree,
+                         reused, session_uuid, tmux_target, spawned_at. A resume leaves it
+                         alone. It has no RC URL (§9)
   logs/                  watchdog.log, <lead>.log (tmux pipe-pane transcripts)
   worktrees/<repo>/<id>/ the lead's checkout, on branch soma/<id>
   digests/               (v1.x composer not built — directory exists, stays empty)
@@ -921,9 +924,9 @@ skill all say exists.
 
 Also declared and not built: the **digest composer** (`digests/` stays empty; `soma digest` is the
 raw log), the **H5 babysitter teardown handoff**, the **Jira/GitHub writeback ledger** (writeback is
-prompt discipline, not a tracked ledger), **RC URL capture on spawn** — and with it
-**`leads/<id>/meta.json`, which nothing writes at all**, so the per-lead forensic record and the
-`base_sha` of every task row are permanently absent — and **watchdog episode semantics /
+prompt discipline, not a tracked ledger), **RC URL capture on spawn** (each spawn does write
+`leads/<id>/meta.json`, with the commit the worktree was cut from, and puts that `base_sha` on the
+task row; the RC URL is the one field it lacks), and **watchdog episode semantics /
 notification coalescing** (notifications are per-event and chatty at ten leads). The **Claude Code
 version gate** is no longer on this list: it is wired and enforced, see §4.
 

@@ -1779,12 +1779,21 @@ export function orchTools(ctx) {
      */
     const uuid = cut(spawn?.session_uuid, MAX_ECHO);
     const target = cut(spawn?.tmux_target, MAX_ECHO) ?? `lead-${task_id}`;
+    // The commit the worktree was cut from, which `fleet.enqueue` leaves null. NOT guarded like the
+    // uuid: a spawn always answers for the checkout it launched in, and its null means it no longer
+    // vouches for the base an earlier cut put on the row (a reused checkout whose meta.json names
+    // another branch, or no base). The row is never newer than that meta.json, so the null
+    // replaces the sha. Only a result that reports no base leaves the row's alone: no `base_sha`,
+    // as `resumeLead` returns because a resume cuts nothing, or an undefined one.
+    const reportsBase = isRecord(spawn) && Object.hasOwn(spawn, 'base_sha') && spawn.base_sha !== undefined;
+    const baseSha = cut(spawn?.base_sha, MAX_ECHO);
     let recorded = false;
     try {
       recorded = (await deps.updateFleet((fleet) => {
         const task = (Array.isArray(fleet?.tasks) ? fleet.tasks : []).find((t) => t?.id === task_id);
         if (!task) return false;
         if (uuid) task.lead_session_uuid = uuid;
+        if (reportsBase) task.base_sha = baseSha;
         task.tmux_session = target;
         // The seat this launch went onto (its soma.json label, or null for the spawner's own
         // env): what the watchdog's limits phase closes on this lead's next limit hit. Same write

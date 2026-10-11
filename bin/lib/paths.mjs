@@ -156,7 +156,11 @@ export const ensureTree = () => {
   for (const d of SUBDIRS) mkdirSync(join(root, d), { recursive: true });
 };
 
-/** Per-lead control dir: meta.json, mcp.json, settings.json, brief.md, HOLD, BUDGET_TRIPPED. */
+/**
+ * Per-lead control dir: meta.json, mcp.json, settings.json, brief.md, HOLD, BUDGET_TRIPPED.
+ * `meta.json` is the spawner's record of a launch (the commit the worktree was cut from, its
+ * branch and path, the session uuid), written by each spawn and never by a resume.
+ */
 export const leadDir = (id) => p('leads', id);
 
 /** Worktree checkout for one task: `worktrees/<repo>/<id>`. */

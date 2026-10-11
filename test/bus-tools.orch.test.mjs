@@ -1173,6 +1173,37 @@ test('the spawn records the session uuid and tmux session — nothing else in v1
   assert.equal(st.leads[0].model, 'claude-fable-5');
 });
 
+test('the spawn puts the base the spawner reports on the row, a null one included, and leaves the row alone only when no base is reported', async () => {
+  const bt = await load();
+  /** The fixture's spawner, reporting `base_sha` as the real one does: the commit the worktree was cut from, or null. */
+  const reporting = (base_sha) => (t) => ({ lead: t.id, session_uuid: `u-${t.id}`, tmux_target: `lead-${t.id}`, cwd: `/w/${t.id}`, base_sha });
+  const c = orch({ tasks: [{ id: 'cr-1' }], deps: { spawnLead: reporting('abc123') } });
+  const r = await bt.orchTools(c).get('soma_spawn')({ task_id: 'cr-1' });
+  assert.equal(r.recorded, true);
+  // `fleet.enqueue` writes `base_sha: null` and, before this, nothing ever replaced it.
+  assert.equal(c.s.fleet.tasks[0].base_sha, 'abc123');
+
+  // A null, or an empty base, is the spawner's ANSWER: `spawnLead` always reports the base of the
+  // checkout it launched in, and says null when it cannot vouch for one (a reused checkout whose
+  // meta.json names another branch). The row's sha is then an older cut's, and keeping it would
+  // name a commit this checkout was not cut from, while meta.json says null.
+  for (const reported of [null, '']) {
+    const cleared = orch({ tasks: [{ id: 'cr-2', base_sha: 'older-cut' }], deps: { spawnLead: reporting(reported) } });
+    await bt.orchTools(cleared).get('soma_spawn')({ task_id: 'cr-2' });
+    assert.equal(cleared.s.fleet.tasks[0].status, 'spawned');
+    assert.equal(cleared.s.fleet.tasks[0].base_sha, null, `a spawner reporting ${JSON.stringify(reported)}`);
+  }
+
+  // No `base_sha` at all, or an undefined one, says nothing about the base: the row keeps its own.
+  const silent = (t) => ({ lead: t.id, session_uuid: `u-${t.id}`, tmux_target: `lead-${t.id}`, cwd: `/w/${t.id}` });
+  for (const [what, spawnLead] of [['no base_sha', silent], ['base_sha: undefined', reporting(undefined)]]) {
+    const kept = orch({ tasks: [{ id: 'cr-3', base_sha: 'orig' }], deps: { spawnLead } });
+    await bt.orchTools(kept).get('soma_spawn')({ task_id: 'cr-3' });
+    assert.equal(kept.s.fleet.tasks[0].status, 'spawned');
+    assert.equal(kept.s.fleet.tasks[0].base_sha, 'orig', `a spawner reporting ${what}`);
+  }
+});
+
 test('spawn will not admit a task without a transactional fleet, or without a spawner', async () => {
   const bt = await load();
   for (const dep of ['updateFleet', 'spawnLead']) {

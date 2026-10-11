@@ -310,6 +310,69 @@ test('a spawner that reports no uuid leaves the field alone rather than clobberi
   assert.equal(c.task().status, 'spawned');
 });
 
+test('admission writes the base commit the spawner reports onto the ROW, in the uuid\'s own write', async () => {
+  const { tick } = await load('base-adm-' + Date.now());
+  const c = ctx({
+    fleet: { tasks: [row({ id: 'a', status: 'queued', base_sha: null })] },
+    spawnLead: (t) => ({ lead: t.id, session_uuid: `u-${t.id}`, tmux_target: `lead-${t.id}`, cwd: `/w/${t.id}`, base_sha: 'abc123' }),
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.spawnLead, ['a']);
+  // Off the store, which only `updateFleet` reaches: `fleet.enqueue` wrote null, and before this
+  // nothing replaced it, so no task row ever said which commit its worktree was cut from.
+  assert.equal(c.task().base_sha, 'abc123');
+  assert.equal(c.task().lead_session_uuid, 'u-a');
+  assert.equal(c.calls.updateFleet, 1, 'the base lands in the same transaction as the uuid and the target');
+});
+
+test('admission puts a null base from the spawner over a recorded one, on the row and the snapshot; a launch reporting no base leaves both', async () => {
+  const { tick } = await load('base-null-' + Date.now());
+  // A row `soma retry` re-queued still holds the base its earlier spawn recorded. `spawnLead`
+  // always answers for the checkout it launches in, and answers null when it cannot vouch for one
+  // (a reused checkout whose meta.json names another branch): that sha is then an older cut's.
+  const launched = (base) => (t) => ({ lead: t.id, session_uuid: `u-${t.id}`, tmux_target: `lead-${t.id}`, cwd: `/w/${t.id}`, ...base });
+  for (const [what, base, want] of [
+    ['base_sha: null', { base_sha: null }, null],
+    ["base_sha: ''", { base_sha: '' }, null],
+    ['no base_sha', {}, 'older-cut'],
+    ['base_sha: undefined', { base_sha: undefined }, 'older-cut'],
+  ]) {
+    let snapshot = null;
+    const c = ctx({
+      fleet: { tasks: [row({ id: 'a', status: 'queued', base_sha: 'older-cut' })] },
+      spawnLead: (t) => { snapshot = t; return launched(base)(t); },
+    });
+    await tick(c.deps);
+    assert.deepEqual(c.calls.spawnLead, ['a'], what);
+    assert.equal(c.task().base_sha, want, `the row, after a spawner reporting ${what}`);
+    // The tick's own copy of the row, which `spawnLead` was handed and the later phases read.
+    assert.equal(snapshot?.base_sha, want, `the snapshot, after a spawner reporting ${what}`);
+  }
+});
+
+test('a resume revival leaves the recorded base alone; a fresh revival records what its spawn reports', async () => {
+  const { tick } = await load('base-rev-' + Date.now());
+  // Unsaturated, so the plan is resume: the same checkout, and `resumeLead` reports no base.
+  const resumed = ctx({
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u', attempts: 0, base_sha: 'orig' })] },
+    alive: new Set(),
+  });
+  await tick(resumed.deps);
+  assert.deepEqual(resumed.calls.resumeLead, ['a']);
+  assert.equal(resumed.task().base_sha, 'orig');
+
+  // Saturated, so the plan is a fresh session through `spawnLead`, which reports the base.
+  const fresh = ctx({
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'old', attempts: 0, base_sha: null })] },
+    alive: new Set(),
+    readUsage: () => usage({ uuid: 'old', live_context: 900_000 }),
+    spawnLead: () => ({ lead: 'a', session_uuid: 'brand-new', tmux_target: 'lead-a', cwd: '/w/a', base_sha: 'cut-sha' }),
+  });
+  await tick(fresh.deps);
+  assert.deepEqual(fresh.calls.spawnLead, ['a']);
+  assert.equal(fresh.task().base_sha, 'cut-sha');
+});
+
 test('recording a session does NOT stamp `updated`, so a terminal event is never stranded', async () => {
   const { tick } = await load('c20c-' + Date.now());
   const c = ctx({ fleet: { tasks: [row({ id: 'a', status: 'queued', lead_session_uuid: null })] } });

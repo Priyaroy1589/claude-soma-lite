@@ -907,8 +907,7 @@ build. Re-prove the RUNBOOK §10 invariants after every upgrade.
 - **Finishing the operator experience (v1.x):** the digest composer; `hold`/`release` and `gc`; a way
   to clear a tripped budget; installers for the inject and `PostCompact` hooks; `soma up` running
   doctor; a revival cooldown; the live canary driver; a writeback ledger; case- and
-  quote-insensitive credential matching in the gate; notification coalescing; `meta.json` and the
-  per-task `base_sha`.
+  quote-insensitive credential matching in the gate; notification coalescing.
 - **Account rotation, declared out of scope for now:** detecting the orchestrator's own usage
   limit; two fleets sharing a seat; seats from different organisations; and a doctor check that
   each seat has the bus registered. Proving `crossSeatResume` on a real rotation is a bring-up step

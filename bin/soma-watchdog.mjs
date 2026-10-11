@@ -1062,6 +1062,14 @@ function recordPane(deps, task, read, now) {
  */
 function recordSession(deps, task, res, extra = {}) {
   const uuid = typeof res?.session_uuid === 'string' && res.session_uuid !== '' ? res.session_uuid : null;
+  // The commit a spawn's worktree was cut from. NOT guarded like the uuid: a spawn always answers
+  // for the checkout it launched in, and its null means it no longer vouches for the base an
+  // earlier cut put on the row (a reused checkout whose meta.json names another branch, or no
+  // base). The row is never newer than that meta.json, so the null replaces the sha, on the row
+  // and the snapshot. A resume cuts nothing and reports no `base_sha`, and leaves the spawn's base
+  // where it is; an undefined one counts as none.
+  const reportsBase = res !== null && typeof res === 'object' && Object.hasOwn(res, 'base_sha') && res.base_sha !== undefined;
+  const baseSha = typeof res?.base_sha === 'string' && res.base_sha !== '' ? res.base_sha : null;
   const target = typeof res?.tmux_target === 'string' && res.tmux_target !== '' ? res.tmux_target : sessionName(task.id);
   // `seat` is written when the caller SAYS where the launch went — a label, or null for the
   // default env — and left alone otherwise; `rotations` likewise. `hasOwn`, so a caller passing
@@ -1073,6 +1081,7 @@ function recordSession(deps, task, res, extra = {}) {
     const r = (Array.isArray(live?.tasks) ? live.tasks : []).find((x) => x?.id === task.id);
     if (!r) return false;
     if (uuid) r.lead_session_uuid = uuid;
+    if (reportsBase) r.base_sha = baseSha;
     r.tmux_session = target;
     if (writeSeat) r.seat = seat;
     if (rotations !== null) r.rotations = rotations;
@@ -1081,6 +1090,7 @@ function recordSession(deps, task, res, extra = {}) {
   // Mirrored onto the snapshot so the phases after this one read the row that was published,
   // not the one that was read at the top of the tick.
   if (uuid) task.lead_session_uuid = uuid;
+  if (reportsBase) task.base_sha = baseSha;
   task.tmux_session = target;
   if (writeSeat) task.seat = seat;
   if (rotations !== null) task.rotations = rotations;
