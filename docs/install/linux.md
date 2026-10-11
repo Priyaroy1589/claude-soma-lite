@@ -172,15 +172,6 @@ not know yet (*the operator's live transcripts carry no usage field this module 
 That failure is about your Claude Code version, not your install. Tests that need tmux or git skip
 themselves when the tool is missing.
 
-On Linux, `npm test` currently has known failures that come from the test fixtures, not from your
-install. Expect up to three more:
-
-- *a holder whose lock was taken over does not delete its successor on the way out*, *the
-  checkpoint lock releases the lock it published, not whatever holds that name* and *a takeover
-  unlinks the file it judged, or nothing at all* assume a deleted file's inode number is not
-  reused at once. ext4 reuses it, so they fail there
-  ([issue 30](https://github.com/techfreakworm/claude-soma-lite/issues/30)).
-
 *the write-idiom scan stays linear on the shapes that made it quadratic* is a timing test and can
 also fail on a busy machine
 ([issue 33](https://github.com/techfreakworm/claude-soma-lite/issues/33)).
