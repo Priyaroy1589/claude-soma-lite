@@ -607,9 +607,9 @@ The watchdog tick (default 30 s) does seven things:
    `LEAD_PANE_RECOVERED`. `unobservable` (the screen could not be read) is **not a verdict**: it
    never alarms, never revives, and never overwrites a verdict already held. `soma status` shows
    the same reading in its `PANE` column (`working` / `idle` / `draft` / `prompt` / `shell` /
-   `exited` / `gone` / `other`, `?` when tmux could not be read, `-` for a row with no session;
-   when no tmux server answers on soma's socket at all there are no panes to list, so a row with a
-   session reads `gone`).
+   `exited` / `gone` / `other`, `?` when tmux could not be read, `-` for a row with no session yet:
+   a queued row, or a lead still starting (step 1); when no tmux server answers on soma's socket at
+   all there are no panes to list, so a row with a session reads `gone`).
    `draft` is text sitting unsent in the composer (a long `soma send` can land there without its
    Enter firing, and the delivery is not fixed yet); the composer is located under
    the `──── lead-<id> ─` rule a `--name`d session draws, so it fires on this fleet's leads.
@@ -633,6 +633,22 @@ The watchdog tick (default 30 s) does seven things:
    `TMUX_UNREADABLE` and **skips** reconcile and revival — one hiccup read as a dead fleet would
    kill and respawn ten live leads. When only the pane listing could not be read, `skipped` names
    `pane_census` alone and no `pane_state` is written that tick.
+   A `spawned` row with no session is not always dead: it may be **starting**. Both spawn paths
+   (admission here, and `soma_spawn`) flip the row to `spawned` and stamp `launching_at` on it in
+   one write, then fetch, cut the worktree and write the lead's settings, and create the tmux
+   session last. `soma_spawn` does all that outside the fleet lock, so a tick can land in the
+   window. Reconcile leaves such a row alone until its mark is three and a half minutes old
+   (`LAUNCH_GRACE_MS`: the 30 s repo-lock wait, one full two-minute git call for the fetch, and a
+   minute for everything else). That is not the longest launch possible, because every git call in a
+   launch gets its own two minutes. Past it the row is treated as dead, as every starting row was
+   before the mark: usually a spawner that died, revived like any dead lead. A launch that is only
+   slower than the bound is revived under its spawner: a `LEAD_DEAD` and a charged revival attempt
+   every tick until its session appears (`GAVE_UP` after three), and if its session appears between
+   a tick's read and the revival's kill, that new session is killed and replaced. Two sessions never
+   run at once: the spawner holds the repo lock across the launch and checks for the session again
+   under it. Recording the session clears the mark, and so does a failed spawn's rollback.
+   Meanwhile `soma status` shows the lead as LIVE `starting`, PANE `-`, and `soma_status` as
+   `liveness: starting`.
 2. **Budget breakers and model deviation**, over every `spawned` *and* `blocked` row.
 3. **`NEEDS_INPUT` → `blocked`**, after `blocked_slot_minutes` of grace, which frees the slot.
 4. **Backpressure.** A rate-limit storm corroborated across two *distinct* leads freezes admission.
@@ -884,7 +900,7 @@ soma resume task-42              # after a kill, or after a reboot
 soma retry task-42               # put a failed/skipped row back on the queue
 ```
 
-Three things worth knowing before you use them:
+Four things worth knowing before you use them:
 
 - **`status` reports `?`, not `dead`, when tmux cannot be read.** A 5 s timeout on a wedged server
   is byte-identical to a healthy server with nothing on it. No tmux server answering on soma's
@@ -896,6 +912,11 @@ Three things worth knowing before you use them:
   beside a live watchdog, and otherwise reads
   ``open (no watchdog is running, so nothing is admitted until `soma up`)``, or says that whether
   anything is admitting work is unknown.
+- **`starting` is not `dead`.** A lead whose spawn has claimed its row and not yet created its
+  tmux session reads LIVE `starting`, PANE `-`: the session comes last, after a fetch that may take
+  two minutes. Do not kill or resume it. If it still has no session three and a half minutes after
+  the claim, it reads `dead` / `gone` and the watchdog treats it as dead, even when its launch is
+  only slow (§6.3, step 1).
 - **`attach`: press `Esc` before typing** if the lead is mid-turn, or your keystrokes interleave
   with its own output. Detach with `C-b d`. Attaching always works, even when the checkpoint is
   the thing that is broken.

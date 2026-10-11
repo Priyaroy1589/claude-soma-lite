@@ -62,7 +62,7 @@ import { runCanary } from './lib/canary.mjs';
 import { loadConfig } from './lib/config.mjs';
 import { runDoctor } from './lib/doctor.mjs';
 import { appendEvent, readEvents } from './lib/events.mjs';
-import { enqueue as fleetEnqueue, readFleet, setTaskStatus, updateFleet } from './lib/fleet.mjs';
+import { enqueue as fleetEnqueue, launching, readFleet, setTaskStatus, updateFleet } from './lib/fleet.mjs';
 import { heartbeat, readLease } from './lib/lease.mjs';
 import { SOMA_HOME, claudeConfigRoot, ensureTree, p } from './lib/paths.mjs';
 import { queuePaused } from './lib/queue.mjs';
@@ -184,7 +184,8 @@ export const GUARDED_DEPS = Object.freeze([
  * The PANE column's words, one per fine pane state (`wd/pane-state.mjs`). Never `dead` and never
  * `yes`: those are the LIVE column's, and a `done` row reading `dead` in any column is a fault an
  * operator goes looking for. `?` is the listing that could not be read — the same third state the
- * LIVE column has — and `-` is a row that never had a session.
+ * LIVE column has — and `-` is a row with no session yet: one that never had one, or a lead still
+ * starting (LIVE `starting`), whose missing pane is not `gone`.
  */
 const PANE_TOKEN = new Map([
   ['working', 'working'], ['idle', 'idle'], ['idle_draft', 'draft'], ['blocked_on_prompt', 'prompt'],
@@ -866,6 +867,17 @@ export async function dispatch(argv, deps = {}) {
       const noServer = listed === null && serverAbsent() === true;
       const live = noServer ? new Set() : listed;
       const liveOf = (name) => (live === null ? '?' : live.has(name) ? 'yes' : 'dead');
+      // A lead's LIVE cell, which has a fourth word: `starting`, for a row a spawn has claimed and
+      // not yet given its session. The claim comes first and the session last, after a fetch allowed
+      // two minutes, and for that whole window the row read `spawned  dead  gone` — a dead lead, to an
+      // operator deciding what to kill. `launching` is the predicate the watchdog's reconcile and
+      // `soma_status` read too, so this cell judges a row by the rule that decides its revival. The
+      // session beats the mark, and `?` beats both: an unread tmux is never a launch.
+      const now = Date.now();
+      const leadLiveOf = (t) => {
+        const cell = liveOf(sessionOf(t));
+        return cell === 'dead' && launching(t, now) ? 'starting' : cell;
+      };
 
       // The pane census (added after leads were found stalled on prompts nobody saw), for every
       // row that has a session — `done` and `blocked` rows included, because that is where a
@@ -882,10 +894,15 @@ export async function dispatch(argv, deps = {}) {
         ? null
         : takeCensus(withSession.map((t) => ({ id: t.id, name: sessionOf(t) })),
           { panes, capture: (name, n) => capturePane(name, n), now: () => Date.now(), lines: CENSUS_LINES });
-      const paneOf = (t) => {
+      const paneOf = (t, starting = false) => {
         if (t?.status === 'queued') return '-';
         if (census === null) return '?';
-        return PANE_TOKEN.get(census.get(t?.id)?.fine) ?? '?';
+        const fine = census.get(t?.id)?.fine;
+        // A lead still starting has no pane YET, which is `-` (a row that never had a session), not
+        // `gone`. Only while the census agrees: a pane it already sees is shown as itself, because the
+        // session can appear between the liveness read and this one.
+        if (starting && fine === 'absent') return '-';
+        return PANE_TOKEN.get(fine) ?? '?';
       };
 
       d.print(`state root: ${SOMA_HOME()}`);
@@ -983,15 +1000,16 @@ export async function dispatch(argv, deps = {}) {
       d.print(seatsLine(seats));
 
       d.print('');
-      d.print(`${'LEAD'.padEnd(20)} ${'STATUS'.padEnd(8)} ${'LIVE'.padEnd(5)} ${'PANE'.padEnd(8)} ${'SEAT'.padEnd(10)} ${'TURNS'.padEnd(6)} ${'TOKENS'.padEnd(12)} MODEL`);
+      // LIVE is as wide as its longest word, `starting`, so every column after it stays under its header.
+      d.print(`${'LEAD'.padEnd(20)} ${'STATUS'.padEnd(8)} ${'LIVE'.padEnd(8)} ${'PANE'.padEnd(8)} ${'SEAT'.padEnd(10)} ${'TURNS'.padEnd(6)} ${'TOKENS'.padEnd(12)} MODEL`);
       const counts = Object.create(null);
       let onPrompt = 0;
       let onShell = 0;
       for (const t of fleet.tasks) {
         const status = String(t?.status ?? '?');
         counts[status] = (counts[status] ?? 0) + 1;
-        const liveCol = ANSWERABLE.has(status) ? liveOf(sessionOf(t)) : '-';
-        const paneCol = paneOf(t);
+        const liveCol = ANSWERABLE.has(status) ? leadLiveOf(t) : '-';
+        const paneCol = paneOf(t, liveCol === 'starting');
         if (paneCol === 'prompt') onPrompt += 1;
         if (paneCol === 'shell') onShell += 1;
         let u = {};
@@ -1003,7 +1021,7 @@ export async function dispatch(argv, deps = {}) {
         // The seat the lead runs under (its `soma.json` label); `-` for a row spawned before
         // seats existed, with none configured, or hand-edited to something that is not a string.
         const seatCol = nonEmpty(t?.seat) ? t.seat : '-';
-        d.print(`${String(t?.id ?? '?').padEnd(20)} ${status.padEnd(8)} ${liveCol.padEnd(5)} ${paneCol.padEnd(8)} ${seatCol.padEnd(10)}`
+        d.print(`${String(t?.id ?? '?').padEnd(20)} ${status.padEnd(8)} ${liveCol.padEnd(8)} ${paneCol.padEnd(8)} ${seatCol.padEnd(10)}`
           + ` ${String(u.turns ?? '-').padEnd(6)} ${String(u.est_tokens ?? '-').padEnd(12)} ${u.last_model ?? '-'}`);
       }
       if (fleet.tasks.length === 0) d.print('(no tasks — `soma enqueue --file <tasks.json>`)');

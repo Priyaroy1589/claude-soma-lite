@@ -38,6 +38,9 @@ const { ENV_ALLOW } = await import('../bin/lib/spawn.mjs');
 // The clock the `seats:` line renders with — imported so a test can use the already-pinned
 // formatter as its oracle instead of re-deriving a local-time string.
 const { clock } = await import('../bin/lib/seats-summary.mjs');
+// The launch bound `status` reads a starting lead by — the same one the watchdog's reconcile and
+// `soma_status` read — so the tests below sit on either side of it rather than of a copy.
+const { LAUNCH_GRACE_MS } = await import('../bin/lib/fleet.mjs');
 
 const CLI = fileURLToPath(new URL('../bin/soma.mjs', import.meta.url));
 
@@ -322,6 +325,76 @@ test('the PANE column names what each pane is doing, for every row with a sessio
   assert.match(rowOf(unknown, 'cr-1'), /^cr-1\s+spawned\s+\?\s+\?\s/);
   assert.doesNotMatch(rowOf(unknown, 'cr-2'), /\b(shell|gone|exited)\b/);
   assert.equal(unknown.calls.capturePane.length, 0);
+});
+
+test('a lead whose spawn has not made its session yet reads LIVE starting and PANE -, not dead and gone, until the bound', async (t) => {
+  root(t);
+  // `launching_at` is the claim's mark: the spawn flips the row to `spawned` first and creates the
+  // session last, after a fetch that may take two minutes, and for that whole window this row read
+  // `spawned  dead  gone`, exactly like a lead that had died.
+  const fleet = (age) => () => ({ tasks: [{ id: 'cr-1', status: 'spawned', tmux_session: null, launching_at: Date.now() - age }] });
+  const rowOf = (h) => h.stdout().split('\n').find((l) => l.startsWith('cr-1 '));
+
+  // Thirty seconds into the fetch: tmux answers, and the lead's session is not on it yet.
+  const starting = mk({ readFleet: fleet(30_000), liveSessions: () => new Set(), paneStates: () => new Map() });
+  assert.equal(await dispatch(['status'], starting.deps), 0);
+  assert.match(rowOf(starting), /^cr-1\s+spawned\s+starting\s+-\s/);
+  assert.doesNotMatch(rowOf(starting), /\b(dead|gone)\b/);
+  // No tmux server answering at all reads as an empty server, and a launch may be what starts one.
+  const noServer = mk({ readFleet: fleet(30_000), liveSessions: () => null, serverAbsent: () => true });
+  await dispatch(['status'], noServer.deps);
+  assert.match(rowOf(noServer), /^cr-1\s+spawned\s+starting\s+-\s/);
+
+  // Past the bound the row reads as it did before the mark, `dead  gone`, and revival deals with it.
+  const expired = mk({ readFleet: fleet(LAUNCH_GRACE_MS), liveSessions: () => new Set(), paneStates: () => new Map() });
+  await dispatch(['status'], expired.deps);
+  assert.match(rowOf(expired), /^cr-1\s+spawned\s+dead\s+gone\s/);
+  // The session beats the mark (a record write that failed leaves one behind on a lead that is up).
+  const up = mk({ readFleet: fleet(30_000), liveSessions: () => new Set(['lead-cr-1']), paneStates: () => new Map([['lead-cr-1', pane()]]) });
+  await dispatch(['status'], up.deps);
+  assert.match(rowOf(up), /^cr-1\s+spawned\s+yes\s+idle\s/);
+  // tmux unreadable is `?` in both columns: a hiccup is never a launch.
+  const unread = mk({ readFleet: fleet(30_000), liveSessions: () => null, paneStates: () => null });
+  await dispatch(['status'], unread.deps);
+  assert.match(rowOf(unread), /^cr-1\s+spawned\s+\?\s+\?\s/);
+  // A pane the census already sees is shown as itself: the session can appear between the two reads.
+  const between = mk({ readFleet: fleet(30_000), liveSessions: () => new Set(), paneStates: () => new Map([['lead-cr-1', pane()]]) });
+  await dispatch(['status'], between.deps);
+  assert.match(rowOf(between), /^cr-1\s+spawned\s+starting\s+idle\s/);
+  // Only a claimed `spawned` row is ever starting.
+  const blocked = mk({ readFleet: () => ({ tasks: [{ id: 'cr-1', status: 'blocked', launching_at: Date.now() - 30_000 }] }), paneStates: () => new Map() });
+  await dispatch(['status'], blocked.deps);
+  assert.match(rowOf(blocked), /^cr-1\s+blocked\s+dead\s+gone\s/);
+});
+
+test('the status table stays aligned now that LIVE can read starting: every cell starts under its header', async (t) => {
+  root(t);
+  const h = mk({
+    readFleet: () => ({ tasks: [
+      { id: 'cr-1', status: 'spawned', launching_at: Date.now() - 30_000 },   // starting
+      { id: 'cr-2', status: 'spawned', lead_session_uuid: 'u2' },            // yes, with a usage reading
+      { id: 'cr-3', status: 'spawned' },                                     // dead
+      { id: 'cr-4', status: 'queued' },                                      // -
+    ] }),
+    liveSessions: () => new Set(['lead-cr-2']),
+    paneStates: () => new Map([['lead-cr-2', pane()]]),
+    readUsage: () => ({ turns: 12, est_tokens: 3456, last_model: 'claude-fable-5' }),
+  });
+  await dispatch(['status'], h.deps);
+  const lines = h.stdout().split('\n');
+  const header = lines.find((l) => l.startsWith('LEAD '));
+  assert.ok(header, 'the table header is printed');
+  const cols = ['STATUS', 'LIVE', 'PANE', 'SEAT', 'TURNS', 'TOKENS', 'MODEL'].map((name) => [name, header.indexOf(name)]);
+  const row = (id) => lines.find((l) => l.startsWith(`${id} `));
+  assert.equal(row('cr-1').slice(cols[1][1], cols[2][1]).trim(), 'starting', 'the widest LIVE word is in the table under test');
+  for (const id of ['cr-1', 'cr-2', 'cr-3', 'cr-4']) {
+    const line = row(id);
+    for (const [name, at] of cols) {
+      assert.ok(at > 0, `${name} is in the header`);
+      assert.notEqual(line[at], ' ', `${id}: the ${name} cell starts at column ${at}: ${JSON.stringify(line)}`);
+      assert.equal(line[at - 1], ' ', `${id}: the cell before ${name} ends before column ${at}: ${JSON.stringify(line)}`);
+    }
+  }
 });
 
 test('status prints what it resolved: state root, queue, lease holder, watchdog', async (t) => {
