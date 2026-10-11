@@ -78,14 +78,11 @@ function hammerWriter(home, rounds) {
 }
 
 // ---------------------------------------------------------------------------
-// The original test, verbatim.
+// The original test, verbatim but for a `fresh()` that cleans up after itself.
 // ---------------------------------------------------------------------------
 
-test('defaults expose max_leads 10 and stagger 90; writeConfig merges', async () => {
-  process.env.SOMA_HOME = mkdtempSync(join(tmpdir(), 'soma-'));
-  const { ensureTree } = await import('../bin/lib/paths.mjs?' + Date.now());
-  ensureTree();
-  const c = await import('../bin/lib/config.mjs?' + Date.now());
+test('defaults expose max_leads 10 and stagger 90; writeConfig merges', async (t) => {
+  const { c } = await fresh(t, 'merge');
   assert.equal(c.DEFAULTS.max_leads, 10);
   assert.equal(c.DEFAULTS.stagger_s, 90);
   const merged = c.writeConfig({ max_leads: 4 });
