@@ -1201,7 +1201,9 @@ function admitNext(deps, cfg, fleet, tasks, history, now, frozen) {
           version,
           tested_min: gate?.min ?? null,
           tested_max: gate?.max ?? null,
-          why: 'the canary proves its nine runtime invariants for ONE Claude Code version; admission stays closed until soma up --canary re-proves them',
+          // What the operator can DO, not `soma up --canary`: that cannot pass on this build (its
+          // live driver is not built), so naming it sent the operator to a dead end.
+          why: 'the nine runtime invariants rest on undocumented Claude Code behaviour and are only established for versions inside tested_claude; admission stays closed until this one is inside it — re-establish the invariants on it by hand (RUNBOOK §10) and widen tested_claude in soma.json, or run a Claude Code inside the range and restart the watchdog (soma down, then soma up)',
         },
         lead: null,
       });
@@ -1934,8 +1936,9 @@ function claudeVersion() {
  * oversight.** A closed gate stops the whole queue; making that the answer to "we could not run
  * `claude --version`" would stall a fleet over a PATH problem, silently, since the only signal
  * is an absence of spawns. A version soma could not read is `soma doctor`'s finding, and the
- * gate's real backstop is the manual `soma up --canary` at bring-up. When the gate DOES close it
- * says so, once per version, which is the half the sketch left out entirely.
+ * gate's real backstop is establishing the invariants by hand at bring-up (RUNBOOK §10; `soma up
+ * --canary` would be it, but its live driver is not built). When the gate DOES close it says so,
+ * once per version, which is the half the sketch left out entirely.
  */
 function versionGate() {
   const version = claudeVersion();

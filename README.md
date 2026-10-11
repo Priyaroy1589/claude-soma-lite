@@ -762,7 +762,8 @@ Named so that you meet them here rather than in a running fleet. RUNBOOK §9 and
 details.
 
 - `hold`, `release` and `gc` refuse with a reason. `soma up --canary` cannot pass: its live driver is
-  not built, so it exits 2 with *the canary needs a live driver*.
+  not built, so the canary reports `ERROR` (nothing proven) and `up` refuses with exit 3: *the canary
+  did not report a pass*.
 - **Two hooks ship but nothing installs them**: the orchestrator inject hook (add it by hand, above)
   and the lead's `PostCompact` re-orientation hook. After a compaction, a lead can lose its harness
   contract. `soma_send` it a pointer to `soma_task()`.
@@ -810,7 +811,7 @@ details.
 | `soma status` shows `LIVE ?` everywhere | tmux could not be read, which is not a dead fleet | `tmux -L soma ls` |
 | `soma kill` or `soma down` exits 3 | soma could not confirm the session stopped, so it changed nothing | `soma status`, then try again |
 | `soma up` refuses with *no terminal here to confirm* | stdin is not a TTY. There is no `--yes` | run it from an interactive shell |
-| `soma up --canary` exits 2: *the canary needs a live driver* | expected: the driver is not built | run `soma up` without `--canary` |
+| `soma up --canary` exits 3: *the canary did not report a pass* | expected: the live driver is not built, so the canary reports `ERROR` and proves nothing | run `soma up` without `--canary` |
 | `SOMA_HOME must be an absolute path` | a relative value, or a quoted `~` | spell the path out |
 | `does not support hard links` | `SOMA_HOME` is on exFAT, FAT, or a FUSE or cloud-sync mount | move `SOMA_HOME` to a local volume |
 | `npm test` prints no `pass` or `fail` lines | Node 20 or older: the test glob matched nothing | use Node 24 |

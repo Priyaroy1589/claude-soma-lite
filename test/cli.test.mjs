@@ -1047,6 +1047,54 @@ test('up --canary does not open the queue on a verdict that is not a pass', asyn
   assert.equal(await dispatch(['up', '--canary'], good.deps), 0);
 });
 
+test('up --canary through the REAL canary wiring refuses with exit 3 and the documented message, on both paths', async (t) => {
+  root(t);
+  // Every other --canary test stubs `canary`, which is how the real wiring shipped a crash: the
+  // production dep called `runCanary()` with no driver, `probeCanary` threw its "needs a live
+  // driver" TypeError, nothing in `up` caught it, and the CLI's last-resort handler exited 2 — where
+  // the help text and RUNBOOK §5.3/§5.4 promise "unproven" and a refusal with exit 3. So `canary`
+  // here is `realDeps().canary`, exactly as `soma up --canary` calls it. `runCanary` writes its
+  // verdict straight to process.stderr, which is captured for the run and restored after.
+  const verdict = [];
+  const realWrite = process.stderr.write;
+  t.after(() => { process.stderr.write = realWrite; });
+  const run = async (h) => {
+    process.stderr.write = (chunk) => { verdict.push(String(chunk)); return true; };
+    try {
+      return await dispatch(['up', '--canary'], h.deps);
+    } catch (e) {
+      return assert.fail(`soma up --canary threw instead of refusing (the CLI would exit 2): ${e?.message}`);
+    } finally {
+      process.stderr.write = realWrite;
+    }
+  };
+  for (const [path, over, live] of [
+    ['a fresh start', { liveSessions: startsClean() }, false],
+    ['an already-live watchdog', { liveSessions: () => new Set(['soma-watchdog']) }, true],
+  ]) {
+    verdict.length = 0;
+    const h = mk({ ...over, canary: realDeps().canary }, { answer: true });
+    assert.equal(await run(h), 3, `${path}: --canary must refuse with exit 3`);
+    if (live) {
+      // A watchdog is running and draining the queue — the line above the refusal says so — so
+      // "the queue was not opened" would be false here. Say what --canary did NOT do instead.
+      assert.doesNotMatch(h.stderr(), /the queue was not opened/, `${path}: the queue is open, and the refusal must not say otherwise`);
+      assert.match(h.stderr(), /the canary did not report a pass/, `${path}: the refusal still names the verdict`);
+      assert.match(h.stderr(), /already running is untouched/, `${path}: the running watchdog is left as it is`);
+      assert.match(h.stderr(), /`soma down`/, `${path}: and the verb that does stop a fleet is named`);
+    } else {
+      assert.match(h.stderr(), /the canary did not report a pass, so the queue was not opened/, `${path}: the documented canaryRefusal() message`);
+    }
+    assert.match(h.stderr(), /NOTE, because it is the likeliest reason on this build/, `${path}: the note about the unbuilt driver stays`);
+    const everything = `${h.stderr()}\n${verdict.join('')}`;
+    assert.doesNotMatch(everything, /needs a live driver/, `${path}: a wiring error must not stand in for the verdict`);
+    assert.match(verdict.join(''), /canary: ERROR — the canary did not run/, `${path}: the verdict is on stderr above the refusal`);
+    assert.match(verdict.join(''), /not built/, `${path}: and it says why nothing was proven`);
+    assert.doesNotMatch(h.stdout(), /canary: pass/, path);
+    assert.equal(h.calls.newSession.length, 0, `${path}: no watchdog was started by --canary`);
+  }
+});
+
 test('up wraps ensureTree rather than letting a library throw reach the operator as a stack', async (t) => {
   root(t);
   process.env.SOMA_HOME = 'not/absolute';

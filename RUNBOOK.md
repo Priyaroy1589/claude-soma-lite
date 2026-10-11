@@ -393,12 +393,21 @@ Order of operations, and every step can stop it:
 1. `ensureTree()` and the hard-link probe → **exit 2** on failure.
 2. **Already-live short-circuit.** If tmux reports `soma-watchdog` live, nothing is started, no new
    spend is authorised, and the **pause flag is still read and reported** — a live watchdog is *not*
-   an open queue. Exit 0.
+   an open queue. Exit 0 — **unless you passed `--canary`**: then the canary runs here too (§5.4),
+   with no projection and no prompt, and anything but a pass is **exit 3**. The watchdog that was
+   already running is left exactly as it is, and the refusal says so, then carries the same NOTE as
+   §5.4:
+
+   ```
+   soma up: the canary did not report a pass (its verdict is on stderr above), and the watchdog that
+   was already running is untouched: --canary checks a fleet, it does not stop one; `soma down` does.
+   ```
 3. `loadConfig()` → **exit 2** if it throws: a `soma.json` that does not parse, or a value §4 says
    is refused. Nothing is projected, asked or started.
 4. **Print the worst-case spend projection.**
 5. **Ask, on the terminal.**
-6. `--canary`, if you passed it (§5.4) → **exit 3** unless it reports a pass.
+6. `--canary`, if you passed it (§5.4) → **exit 3** unless it reports a pass. This is where it runs
+   on a fresh start; with a watchdog already live it runs at step 2 instead.
 7. Start the watchdog in a detached tmux session under `env -i`.
 8. **Read tmux back.** `tmux new-session` exits 0 for a command `env -i` cannot resolve, leaving a
    session whose pane died instantly — which reads as a running watchdog to anything that asks by
@@ -454,15 +463,20 @@ design. If you need it in a wrapper, the wrapper needs a real terminal.
 The flag is answered, and then it refuses. `bin/lib/canary.mjs` ships the **evaluation** only:
 `evaluateCanary(probe)` is a pure predicate over a probe result with full unit coverage, and the
 **live driver** that spawns the synthetic lead and produces that probe is a declared v1.x gap.
-`probeCanary` *requires* the driver to be injected — a canary nobody drove must not look like a
-pass — so `runCanary()` with no driver reports "unproven", and `up` refuses:
+`probeCanary` *requires* a driver — a canary nobody drove must not look like a pass — so `soma up`
+hands it one that says it is not built. The canary reports **ERROR**, nothing proven, on stderr, and
+`up` refuses with **exit 3**. On a fresh start it reads as below; with a watchdog already running,
+the refusal's first sentence is the one §5.3 step 2 quotes:
 
 ```
+canary: ERROR — the canary did not run, so none of the 9 invariants was proven; the queue stays closed
+  reason: the live driver threw before producing a probe: the live driver is not built on this build — canary.mjs ships the evaluation only (a declared v1.x gap)
+  unproven: busMounted, teammateCanEdit, leadCannotWrite, teammateUserMcpDenied, somaPrDraft, slotFreedAfterComplete, rcUrl, oauthUnderEnvI, cdCompoundReadRuns
 soma up: the canary did not report a pass, so the queue was not opened (its verdict is on stderr
-above). NOTE, because it is the likeliest reason on this build: canary.mjs ships the EVALUATION
-only and records the live driver as a declared v1.x gap, so runCanary with no driver injected can
-only report "unproven". Establish the nine invariants by hand (see bin/lib/canary.mjs) and run
-soma up without --canary.
+above). NOTE, because it is the likeliest reason on this build: `canary.mjs` ships the EVALUATION
+only and records the live driver as a declared v1.x gap, so the canary `soma up` runs has no driver
+to observe anything with and can only report "unproven". Establish the nine invariants by hand (see
+bin/lib/canary.mjs) and run `soma up` without --canary.
 ```
 
 **The golden path is `init` → `doctor` → `up`, without `--canary`.** The design spec's first-run
@@ -851,7 +865,7 @@ stops on the next tick; running leads continue. The flag lives at `state/QUEUE_P
 | `soma release <lead>` | The other half of `hold`. **Not** `soma_release` — that MCP tool hands back the orchestrator lease. | see above |
 | `soma gc` | No worktree/branch/log/digest sweep exists. | `git worktree remove` by hand. soma never touches `~/.claude/projects`, which `--resume` needs. |
 | `soma thaw` | Refuses a **storm** record (`reason: storm`): a live storm is the watchdog's — it re-writes its record on every tick it corroborates the storm and clears it itself when the panes stop matching, so a clear here would be undone within a tick and would hide the storm from `soma status` meanwhile. Refuses an **unreadable** record: it never overwrites bytes it cannot read. | An org spend-cap freeze (`reason: org_level_disabled_until`) is what `soma thaw` is for: it clears `state/backpressure.json`, prints the record it cleared, and admission resumes on the next tick. Order of operations, because the tick reads transcript tails and not calendars: first move or kill every lead whose transcript still ends on the cap row — `soma send <lead> "continue"` once you believe the cap has lifted (a healthy reply proves it; a second cap row proves it has not) or `soma kill <lead>` — then `soma thaw`. A record that comes back within a tick means a spawned lead's tail still reads the cap. `soma status` / `soma_status` show `backpressure` three-state (none / FROZEN with reason and since / unreadable); the lift has no event of its own — the record is what says it lifted. |
-| `soma up --canary` | The flag is answered; the driver is a v1.x gap, so it can only report "unproven". | §5.4 and §10 |
+| `soma up --canary` | The flag is answered; the driver is a v1.x gap, so the canary can only report "unproven" (`canary: ERROR`) and `up` refuses with exit 3. | §5.4 and §10 |
 | `soma_inbox` from the CLI | No `inbox` subcommand in v1. | `soma digest`, or `tail -n 40 "$SOMA_HOME/events/"*.ndjson` |
 
 `hold`, `release` and `gc` refuse with **exit 3**, not 1 (so do `thaw`'s four refusals: an unreadable record, a storm record, a clear that throws, and `--as` without the lease) — they *are* refusals, and exit 1 made a real-but-unbuilt

@@ -519,6 +519,11 @@ const confirm = (question) => {
   return a === 'y' || a === 'yes';
 };
 
+/** The canary's live driver on this build: not built, and it says so rather than probing anything. */
+const liveDriverNotBuilt = async () => {
+  throw new Error('the live driver is not built on this build — canary.mjs ships the evaluation only (a declared v1.x gap)');
+};
+
 /**
  * The real wiring for every guarded dep.
  *
@@ -542,10 +547,12 @@ export const realDeps = () => ({
   exec: (cmd, args) => execFileSync(cmd, args, { stdio: 'inherit' }),
   capture,
   doctor: () => runDoctor(),
-  // No driver, and that is not an omission: `canary.mjs` ships the EVALUATION only and its
-  // header records the live driver as a declared v1.x gap. `runCanary` with no driver reports
-  // a verdict that is not a pass — which is the honest answer, and `up` refuses on it.
-  canary: () => runCanary(),
+  // The live driver is not built: `canary.mjs` ships the EVALUATION only and its header records
+  // the driver as a declared v1.x gap. So `up` hands `runCanary` a driver that says exactly that,
+  // the canary reports what is true — ERROR, nothing proven — on stderr, and `up` refuses on it
+  // with exit 3. Not `runCanary()` with no driver at all: that is `probeCanary`'s TypeError for a
+  // caller that forgot one, which is a wiring bug, and it reached the operator as a crash, exit 2.
+  canary: () => runCanary(liveDriverNotBuilt),
   confirm,
   linkProbe: probeHardLinks,
   installSkill,
@@ -1033,7 +1040,7 @@ export async function dispatch(argv, deps = {}) {
               + ' UNKNOWN here rather than open. `soma doctor` diagnoses the state root.');
         if (rest.includes('--canary')) {
           if ((await N('canary')()) !== true) {
-            d.warn(canaryRefusal());
+            d.warn(canaryRefusal({ live: true }));
             return REFUSED;
           }
           d.print('canary: pass');
@@ -1951,13 +1958,27 @@ export async function dispatch(argv, deps = {}) {
   }
 }
 
-/** Why `--canary` cannot open the queue, stated as what is known rather than as a guess. */
-const canaryRefusal = () =>
-  'soma up: the canary did not report a pass, so the queue was not opened (its verdict is on'
-  + ' stderr above). NOTE, because it is the likeliest reason on this build: `canary.mjs` ships'
-  + ' the EVALUATION only and records the live driver as a declared v1.x gap, so `runCanary`'
-  + ' with no driver injected can only report "unproven". Establish the nine invariants by'
-  + ' hand (see bin/lib/canary.mjs) and run `soma up` without --canary.';
+/**
+ * Why `--canary` cannot open the queue, stated as what is known rather than as a guess.
+ *
+ * Two first clauses, because the arm refuses on two paths. On a fresh start nothing was opened.
+ * With a watchdog ALREADY running, `--canary` checked that fleet without stopping it, and the
+ * queue is whatever the watchdog and the pause flag (reported on the line above) make it — so
+ * "the queue was not opened" would be false there, and that path says what was left alone and
+ * what does stop a fleet.
+ */
+const canaryRefusal = ({ live = false } = {}) =>
+  (live
+    ? 'soma up: the canary did not report a pass (its verdict is on stderr above), and the watchdog'
+      + ' that was already running is untouched: --canary checks a fleet, it does not stop one;'
+      + ' `soma down` does.'
+    : 'soma up: the canary did not report a pass, so the queue was not opened (its verdict is on'
+      + ' stderr above).')
+  + ' NOTE, because it is the likeliest reason on this build: `canary.mjs` ships'
+  + ' the EVALUATION only and records the live driver as a declared v1.x gap, so the canary'
+  + ' `soma up` runs has no driver to observe anything with and can only report "unproven".'
+  + ' Establish the nine invariants by hand (see bin/lib/canary.mjs) and run `soma up` without'
+  + ' --canary.';
 
 /**
  * The watchdog's environment: the allowlist, scrubbed, plus an ABSOLUTE state root.

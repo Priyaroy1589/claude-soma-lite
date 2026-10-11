@@ -1905,6 +1905,10 @@ test('the version gate closes admission and says which version closed it', async
   const gate = oneEvent(c, 'VERSION_GATE');
   assert.equal(gate.payload.version, '2.9.0');
   assert.equal(gate.payload.tested_max, '2.1.999');
+  // And its reason names something the operator can DO. It said admission stays closed "until soma
+  // up --canary re-proves them" — and on this build --canary cannot pass: its live driver is not built.
+  assert.doesNotMatch(gate.payload.why, /--canary/, 'the gate must not send the operator to a check that cannot pass on this build');
+  assert.match(gate.payload.why, /tested_claude/, 'the dial that re-opens it');
   // Announced once per version, not once per tick.
   const again = ctx({
     fleet: { tasks: [row({ id: 'a', status: 'queued' })] },

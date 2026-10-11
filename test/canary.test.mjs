@@ -298,8 +298,9 @@ test('an object carrying none of the eight observations is a shape fault, not ei
 /**
  * `probeCanary` is the composition callers are pointed at, and it exists because the
  * hand-rolled version of it has a trap that the most obvious code walks straight into.
- * `soma up --canary` needs the result object (exit 2 on ERROR, 1 on FAIL), so it would
- * write `try { evaluateCanary(await drive()) } catch (e) { reason: e.message }` — and
+ * A caller that wants an exit code per outcome (ERROR apart from FAIL) needs the result object
+ * — `soma up --canary` does not: it exits 3 on any non-pass, through `runCanary`'s boolean — so
+ * it would write `try { evaluateCanary(await drive()) } catch (e) { reason: e.message }` — and
  * `e.message` on a `Promise.reject(null)` is a TypeError inside the guard. The guarded
  * path must be the one that ships, not one every caller re-derives.
  */
@@ -367,9 +368,10 @@ test('an observation that throws on read fails that invariant, not the process',
  *
  * The driver that produces this is plausible rather than hostile: eight lazy getters that
  * shell out into the synthetic lead's tmux session, and the session died. Measured before
- * the fix: `reason: null` and `canary: FAIL — 8 of 8 invariants did not hold`, i.e. `soma
- * up --canary` exits 1 — stop the fleet, this machine breaks every safety invariant it has
- * — where it must exit 2, fix the harness.
+ * the fix: `reason: null` and `canary: FAIL — 8 of 8 invariants did not hold`, i.e. the
+ * verdict said stop the fleet, this machine breaks every safety invariant it has — where it
+ * must say ERROR, fix the harness. (`soma up --canary` exits 3 on both; the verdict's word is
+ * what tells the operator which.)
  */
 test('a probe nothing could be read from is unproven, not eight violations', () => {
   // `howMany` keys whose read throws; the rest are simply absent.
