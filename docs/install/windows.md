@@ -33,7 +33,6 @@ what its guardrails do not cover.
 - **soma has no Windows code path.** Nothing in `bin/` branches for native Windows. The only
   Windows-specific code is the WSL notification path, which calls `powershell.exe` from inside
   Linux to show a Windows toast.
-- **The test script needs a POSIX shell.** `npm test` uses shell syntax that `cmd.exe` cannot run.
 
 Claude Code itself does run natively on Windows
 ([Claude Code setup](https://code.claude.com/docs/en/setup#set-up-on-windows)), but soma cannot use
@@ -200,22 +199,6 @@ Node 20 or older, which finds no test files and prints no totals. On Node 22 the
 Code transcripts and can fail on a machine whose Claude Code writes a token-usage field soma does
 not know yet (*the operator's live transcripts carry no usage field this module does not know*).
 That failure is about your Claude Code version, not your install.
-
-On Linux, including WSL2, `npm test` currently has known failures that come from the test
-fixtures, not from your install. Expect up to four more:
-
-- *the leads root is matched with the state root symlinks resolved, not as configured* assumes
-  macOS's symlinked `$TMPDIR`
-  ([issue 31](https://github.com/techfreakworm/claude-soma-lite/issues/31)).
-- *a holder whose lock was taken over does not delete its successor on the way out*, *the
-  checkpoint lock releases the lock it published, not whatever holds that name* and *a takeover
-  unlinks the file it judged, or nothing at all* assume a deleted file's inode number is not
-  reused at once, and ext4 reuses it
-  ([issue 30](https://github.com/techfreakworm/claude-soma-lite/issues/30)).
-
-*the write-idiom scan stays linear on the shapes that made it quadratic* is a timing test and can
-also fail on a busy machine
-([issue 33](https://github.com/techfreakworm/claude-soma-lite/issues/33)).
 
 ## 4. Add the `soma` wrapper
 

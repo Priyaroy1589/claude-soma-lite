@@ -1,3 +1,4 @@
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ROTATION_EVENT_TYPES } from '../bin/lib/wd/rotation-events.mjs';

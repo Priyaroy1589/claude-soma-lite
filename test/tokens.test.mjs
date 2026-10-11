@@ -1,5 +1,7 @@
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
@@ -367,8 +369,9 @@ test('every known usage field is classified as either counted or deliberately ig
     // a breakdown OF `output_tokens`: measured over real assistant rows it NEVER
     // exceeds output_tokens, and in aggregate it is close to half of all output volume — so counting
     // it would inflate the output term by nearly half and invalidate every calibrated cap.
-    'cache_creation', 'inference_geo', 'iterations', 'output_tokens_details', 'server_tool_use',
-    'service_tier', 'speed',
+    // `fallback_credit` arrived the same way, and is `null` on every real row that carries it.
+    'cache_creation', 'fallback_credit', 'inference_geo', 'iterations', 'output_tokens_details',
+    'server_tool_use', 'service_tier', 'speed',
   ];
   const counted = Object.keys(USAGE_FIELDS.counted);
   const ignored = Object.keys(USAGE_FIELDS.ignored);
@@ -458,6 +461,7 @@ test('a fully-known usage row reports no unknown fields', async (t) => {
   usage.cache_creation = { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 };
   usage.server_tool_use = { web_search_requests: 0, web_fetch_requests: 0 };
   usage.service_tier = null; usage.inference_geo = null; usage.iterations = null; usage.speed = null;
+  usage.fallback_credit = null;
   seed(root, 'p', 'uuid-26', asst('claude-fable-5', usage));
   process.env.CLAUDE_CONFIG_DIR = root;
   const { readUsage } = await load('allknown');
@@ -854,7 +858,6 @@ test('a single absurdly long line is dropped without exhausting memory', async (
 // ---------------------------------------------------------------------------
 
 test('readUsage does not hold the whole transcript in memory', async (t) => {
-  holdConfigDir(t);
   const root = scratch(t, 'mem-');
   const row = JSON.stringify({
     pad: 'p'.repeat(4000),
@@ -863,17 +866,59 @@ test('readUsage does not hold the whole transcript in memory', async (t) => {
   const rows = [];
   for (let i = 0; i < 2000; i++) rows.push(row);   // ~8 MB
   seed(root, 'p', 'uuid-23', rows.join('\n'));
-  process.env.CLAUDE_CONFIG_DIR = root;
-  const { readUsage } = await load('mem');
 
-  readUsage('uuid-23');                            // warm, then measure the second pass
-  global.gc?.();
-  const before = process.memoryUsage().heapUsed;
-  const u = readUsage('uuid-23');
-  const grew = process.memoryUsage().heapUsed - before;
-  assert.equal(u.turns, 2000);
-  // A whole-file read allocates an ~8 MB string plus an ~8 MB array of lines.
-  assert.ok(grew < 6 * 1024 * 1024, `heap grew ${(grew / 1048576).toFixed(1)} MB reading an 8 MB transcript`);
+  // The property is that LIVE memory stays bounded WHILE the transcript is read. This used to
+  // measure `heapUsed` growth across the call, which answers neither half of that. Growth counts
+  // whatever garbage the collector has not got to yet, and `global.gc?.()` is a no-op without
+  // `--expose-gc`, which `npm test` does not pass — so the number followed GC timing, and this
+  // was seen failing at "heap grew 18.5 MB" and passing on the rerun. And memory held AFTER the
+  // call proves nothing: a whole-file read's buffer is garbage by the time the call returns.
+  //
+  // So it is measured during the read, in a child started with `--expose-gc`. The child wraps
+  // `readSync`, the module's chunk read, so that after every chunk it forces a full collection
+  // and samples the live set: `heapUsed` plus `arrayBuffers`, because a Buffer's bytes live
+  // outside the JS heap. The module sees `readSync` through an ESM named import, a snapshot of
+  // `fs` that a later patch does not reach; `syncBuiltinESMExports()` refreshes it, so the wrap
+  // holds whichever module imported `node:fs` first (without it, a module imported before the
+  // patch was sampled zero times). The peak is judged against a forced-collection baseline taken
+  // after a warm-up read.
+  //
+  // Measured on this fixture: a streamed read peaked at most 0.6 MB above the baseline in 100 runs
+  // (macOS idle and with every core busy, and an ext4 Linux VM) — the 256 KB chunk buffer and a
+  // partial line. Mutating the reader into `readFileSync(fp)` plus `split` peaks at 7.8 MB, the
+  // whole file. The bound sits between them with room on both sides. `samples` and `turns` are
+  // asserted too, so a reader that stops calling `readSync` cannot pass by being examined
+  // nowhere: `readFileSync(fp, 'utf8')` reads natively and leaves this assay zero samples.
+  const TOKENS = new URL('../bin/lib/tokens.mjs', import.meta.url).href;
+  const src = `
+    import { createRequire, syncBuiltinESMExports } from 'node:module';
+    const fs = createRequire(import.meta.url)('node:fs');
+    const live = () => { const m = process.memoryUsage(); return m.heapUsed + m.arrayBuffers; };
+    let sampling = false, samples = 0, peak = 0;
+    const realReadSync = fs.readSync;
+    fs.readSync = function (...args) {
+      const n = realReadSync.apply(this, args);
+      if (sampling) { gc(); samples += 1; peak = Math.max(peak, live()); }
+      return n;
+    };
+    syncBuiltinESMExports();
+    const { readUsage } = await import(${JSON.stringify(TOKENS)});
+    const opts = { configRoot: ${JSON.stringify(root)} };
+    readUsage('uuid-23', null, opts);              // warm, then measure the second pass
+    gc();
+    const baseline = live();
+    sampling = true;
+    const u = readUsage('uuid-23', null, opts);
+    sampling = false;
+    process.stdout.write(JSON.stringify({ turns: u.turns, samples, grew: peak - baseline }));
+  `;
+  const r = spawnSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', src], { encoding: 'utf8' });
+  assert.equal(r.status, 0, `the measuring child failed: ${r.stderr}`);
+  const { turns, samples, grew } = JSON.parse(r.stdout);
+  assert.equal(turns, 2000, 'the measured read did not see the whole transcript');
+  assert.ok(samples > 0, 'readUsage never called readSync, so nothing was measured');
+  assert.ok(grew < 2 * 1024 * 1024,
+    `live memory peaked ${(grew / 1048576).toFixed(1)} MB above baseline reading an 8 MB transcript`);
 });
 
 // ---------------------------------------------------------------------------

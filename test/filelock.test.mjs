@@ -1,3 +1,4 @@
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -504,12 +505,26 @@ test('a takeover unlinks the file it judged, or nothing at all', async (t) => {
   assert.equal(existsSync(lp), true, "and must not delete the successor's lock");
   assert.equal(readFileSync(lp, 'utf8'), live, 'which must still be the successor that owns it');
 
-  // A successor with the SAME bytes and a different inode — what a recycled pid re-taking its own
-  // lock looks like, and the case the inode half of the compare exists for. The bytes cannot tell
-  // these apart, so the observable is the attempt count: re-reading declines the first takeover
-  // (inodes differ), pays another backoff, and takes over the file it has now judged — three link
-  // attempts. A bytes-only compare unlinks a file it never read and acquires in two.
-  const same = await stage(() => { rmSync(lp, { force: true }); writeFileSync(lp, 'garbage\n'); return 'garbage\n'; }, { timeoutMs: 8000 });
+  // A successor with the SAME bytes and a different inode — the case the inode half of the compare
+  // exists for. Two acquisitions do not write the same bytes (each carries its own nonce), so this
+  // is the shape it takes: a corrupt lock, whose bytes are whatever an outside edit wrote, replaced
+  // by an identical one. The bytes cannot tell these apart, so the observable is the attempt
+  // count: re-reading declines the first takeover (inodes differ), pays another backoff, and takes
+  // over the file it has now judged — three link attempts. A bytes-only compare unlinks a file it
+  // never read and acquires in two.
+  //
+  // The judged file is pinned under a second name before the swap. Without that, ext4 hands its
+  // freed inode number straight to the replacement, which is then the same (inode, bytes) pair as
+  // the file judged, indistinguishable to `takeOver` and not the case this assay is for: the
+  // sanity check below failed on every run on an ext4 Linux VM.
+  const pinned = join(d, 'judged.pinned');
+  const same = await stage(() => {
+    linkSync(lp, pinned);
+    rmSync(lp, { force: true });
+    writeFileSync(lp, 'garbage\n');
+    return 'garbage\n';
+  }, { timeoutMs: 8000 });
+  rmSync(pinned);
   assert.equal(same.entered, true, 'a corrupt lock must still be reclaimable — this must not wedge');
   assert.equal(same.successor, 'garbage\n', 'sanity: the successor really does carry the same bytes');
   assert.notEqual(same.successorIno, same.judgedIno, 'sanity: and really is a different file');
@@ -521,6 +536,30 @@ test('a takeover unlinks the file it judged, or nothing at all', async (t) => {
 // ---------------------------------------------------------------------------
 // Rule 6: release reads before it unlinks — and is not over-cautious.
 // ---------------------------------------------------------------------------
+
+test('every acquisition writes bytes of its own, and they still read as our pid', async (t) => {
+  const d = dir(t);
+  const lock = makeLock(d);
+  const lp = join(d, 'x.lock');
+
+  // "Is this still my lock?" is answered by the file's inode number plus its bytes, and ext4
+  // hands a freed inode number straight back. While the bytes were only `<pid>\n`, a successor
+  // carrying our pid matched on both halves there, and the successor cases in this file and in
+  // fleet.test.mjs failed on every run on an ext4 Linux VM. A nonce minted per acquisition is the
+  // half no file system can recycle. It is asserted here, directly, because on a file system that
+  // does not reuse inode numbers at once (APFS) those successor cases pass with or without it.
+  //
+  // The bytes must still read as our pid under `Number(raw.trim())`, the parse every `readLock`
+  // soma has shipped uses: an older soma process still running through an upgrade reads anything
+  // else as `corrupt`, and takes a corrupt lock over after one backoff.
+  const seen = [];
+  for (let i = 0; i < 2; i++) lock.withLock(null, () => { seen.push(readFileSync(lp, 'utf8')); });
+  for (const raw of seen) {
+    assert.equal(Number(raw.trim()), process.pid, `the lock must read as our pid to every readLock: ${JSON.stringify(raw)}`);
+  }
+  assert.notEqual(seen[0], seen[1], 'two acquisitions wrote the same bytes, so only the inode number can tell them apart');
+  assert.equal(existsSync(lp), false);
+});
 
 test('a holder whose lock was taken over does not delete its successor on the way out', async (t) => {
   const d = dir(t);
@@ -537,7 +576,7 @@ test('a holder whose lock was taken over does not delete its successor on the wa
   assert.notEqual(successor, `${process.pid}\n`);
   for (let i = 0; i < 5; i++) {
     lock.withLock(null, () => {
-      assert.equal(readFileSync(lp, 'utf8'), `${process.pid}\n`, 'the lock names us while we hold it');
+      assert.equal(readFileSync(lp, 'utf8').trim(), String(process.pid), 'the lock names us while we hold it');
       unlinkSync(lp);                    // a waiter decides we are dead and takes it over...
       writeFileSync(lp, successor);      // ...and publishes its own
     });
@@ -546,14 +585,36 @@ test('a holder whose lock was taken over does not delete its successor on the wa
     rmSync(lp);
   }
 
-  // A successor whose BYTES happen to match ours but whose inode does not — what a recycled pid
-  // re-taking its own lock looks like — is a successor too. Only the inode tells them apart.
+  // A successor carrying our own pid — what a recycled pid re-taking its own lock looks like — is
+  // a successor too. On ext4 it lands on our inode NUMBER, which the filesystem hands straight
+  // back, so there only the bytes can tell them apart: the successor's carry no nonce of ours.
+  // While a lock's bytes were the pid alone, this failed on every run on an ext4 Linux VM.
   lock.withLock(null, () => {
     unlinkSync(lp);
     writeFileSync(lp, `${process.pid}\n`);
   });
   assert.equal(existsSync(lp), true, 'a successor carrying our own pid is still not our lock');
   rmSync(lp);
+
+  // A successor carrying our EXACT bytes, nonce and all, on another inode. Two acquisitions do
+  // not write the same bytes, so this takes a copy, and the copy is the point: it isolates the
+  // inode half of the identity, the only thing that tells this file from ours. Our inode is
+  // pinned under a second name before the swap, so the filesystem cannot hand its number to the
+  // copy (ext4 would) and the two are different files on every filesystem.
+  const pinned = join(d, 'ours.pinned');
+  let ours = null, copy = null;
+  lock.withLock(null, () => {
+    const bytes = readFileSync(lp, 'utf8');
+    linkSync(lp, pinned);
+    ours = statSync(lp).ino;
+    unlinkSync(lp);
+    writeFileSync(lp, bytes);
+    copy = statSync(lp).ino;
+  });
+  assert.notEqual(copy, ours, 'sanity: the copy really is a different file');
+  assert.equal(existsSync(lp), true, 'a successor carrying our exact bytes is still not our lock');
+  rmSync(lp);
+  rmSync(pinned);
 
   // Which must not turn into a lock nothing ever clears. Over-caution here is its own outage.
   lock.withLock(null, () => 'ok');
