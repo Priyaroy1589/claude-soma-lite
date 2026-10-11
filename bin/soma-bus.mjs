@@ -38,15 +38,16 @@ import * as fleet from './lib/fleet.mjs';
 import * as lease from './lib/lease.mjs';
 import * as tmux from './lib/tmux.mjs';
 import { readBackpressure } from './lib/wd/backpressure.mjs';
+import { resolveBudgetClass } from './lib/wd/budget-class.mjs';
 import { readPane } from './lib/wd/pane-state.mjs';
 import { loadConfig } from './lib/config.mjs';
-import { validateHarnessReport } from './lib/harness.mjs';
+import { namedBudgetClassFor, validateHarnessReport } from './lib/harness.mjs';
 import { notify } from './lib/notify.mjs';
-import { p } from './lib/paths.mjs';
+import { p, worktreeDir } from './lib/paths.mjs';
 import { queuePaused, setQueuePaused } from './lib/queue.mjs';
 import { seatsSummary } from './lib/seats-summary.mjs';
 import { pick as pickOpenSeat } from './lib/seats.mjs';
-import { readUsage } from './lib/tokens.mjs';
+import { readDirUsage, readUsage } from './lib/tokens.mjs';
 
 /**
  * One diagnostic line, on stderr, never on stdout.
@@ -383,6 +384,19 @@ export function realDeps() {
     heartbeatAgeMs: (id) => mtimeAgeMs(p('heartbeats', id), null),
     readUsage,
     tailLog,
+
+    // --- the budget, as the breaker prices and meters it (issue #59) ----------
+    // `bus-tools` is import-free, so it consumes the class rather than the resolver: the one
+    // `wd/budget-class.mjs` the watchdog's meter calls, composed here with the real reads, the
+    // lead's own event stream and the registry's NAMED class. `soma_status` shows that class and
+    // never the row's `budget_class`, which only the inbox drain moves.
+    budgetClassOf: (task, cfg) => resolveBudgetClass(task, (id) => events.readEvents(id), cfg, namedBudgetClassFor),
+    // The meter's spend: `readDirUsage` of the lead's worktree, derived by `paths.worktreeDir` as
+    // the watchdog's `leadCwd` derives it, which makes it the transcript directory of the lead and
+    // its whole team. Fixed arity, because `readDirUsage` takes an options object a forwarded
+    // argument would set.
+    readDirUsage: (cwd) => readDirUsage(cwd),
+    worktreeDir,
 
     // --- admission switches ---------------------------------------------------
     //

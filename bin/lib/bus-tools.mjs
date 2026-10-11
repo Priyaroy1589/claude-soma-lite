@@ -246,6 +246,14 @@ const TMUX_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 /** A task row that has finished, one way or another. */
 const TERMINAL_STATES = new Set(['done', 'failed', 'skipped']);
 
+/**
+ * The rows the watchdog's budget breaker meters: a copy of its `METERED`, since this module
+ * imports nothing. A `blocked` lead keeps its live session and its team keeps spending, so it is
+ * metered; a finished lead is out of the breaker's hands, and a queued one never reached them.
+ * `soma_status` reads a spend for these rows alone (`budgetOf`).
+ */
+const METERED_STATES = new Set(['spawned', 'blocked']);
+
 /** The two a not-yet-promoted session gets: take the fleet, or look at it. */
 const CANDIDATE_TOOLS = ['soma_adopt', 'soma_status'];
 
@@ -913,8 +921,11 @@ export function leadTools(ctx) {
  * every adopt claims notify wake and the heartbeat repairs no pane), `updateFleet`
  * (`soma_spawn` refuses outright — it will not admit
  * non-transactionally), `admit`+`loadConfig` (no `max_leads` gate on a manual
- * spawn; no repo validation at intake; no budget percentage), `eventStreams` (the
- * inbox falls back to every task row plus `orch`), `heartbeatAgeMs`, `listPanes`,
+ * spawn; no repo validation at intake; no budget class or percentage), `budgetClassOf`
+ * (`budget_class` and `budget_pct` read null, never the row's own `budget_class`, which
+ * only the inbox drain moves), `readDirUsage`/`worktreeDir` (`budget_est_tokens` and
+ * `budget_pct` read null, never the lead's own session in place of its team's spend),
+ * `eventStreams` (the inbox falls back to every task row plus `orch`), `heartbeatAgeMs`, `listPanes`,
  * `queuePaused`/`setQueuePaused`, `backpressureState`, `tailLog`, `buildDigest`,
  * `resumeLead`, `readUsage`, `validateHarnessReport` (each degrades to a null
  * column or an honest refusal, never to a lie).
@@ -1797,14 +1808,84 @@ export function orchTools(ctx) {
     }
   };
 
-  /** The token cap this task is priced against, from the config's own numbers. */
-  const capOf = (task, cfg) => {
-    const budgets = cfg?.budgets;
-    // hasOwn, not `in`: a budget class named `constructor` would otherwise resolve
-    // through Object.prototype and price a lead against a function.
-    if (!isRecord(budgets) || !nonEmpty(task?.budget_class) || !Object.hasOwn(budgets, task.budget_class)) return null;
-    const cap = budgets[task.budget_class]?.tokens_cap;
-    return Number.isFinite(cap) && cap > 0 ? cap : null;
+  /**
+   * A number as the breaker reads one (`reqNum`, in `wd/budget.mjs` and in the watchdog's meter):
+   * a finite non-negative number, or a non-blank string that converts to one, so a hand-edited
+   * "1500000" in soma.json prices as 1500000 in both places. Null where the breaker would refuse
+   * the value outright.
+   */
+  const meterNumber = (raw) => {
+    const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+    return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : null;
+  };
+
+  /**
+   * The token cap `budget_pct` is a share of, read as `checkBudget` reads it, or null when there is
+   * no share to show: a class with no own `tokens_cap`, or 0, meters no tokens, and a cap the
+   * breaker refuses is no cap it enforces. The one place the status reads a cap.
+   */
+  const tokensCapOf = (cls) => {
+    const cap = isRecord(cls) && Object.hasOwn(cls, 'tokens_cap') ? meterNumber(cls.tokens_cap) : null;
+    return cap !== null && cap > 0 ? cap : null;
+  };
+
+  /**
+   * The three budget columns, read the way the breaker reads them (issue #59):
+   * `{budget_class, budget_est_tokens, budget_pct}`.
+   *
+   * The CLASS comes from `budgetClassOf`, the resolver the watchdog's meter calls
+   * (`wd/budget-class.mjs`), and never from the row's `budget_class`. Only the inbox
+   * drain moves that field, so until a drain an unpinned lead's row said null while the
+   * breaker was already metering it at its harness's class, and after an H1 -> H4
+   * supersede the row named the old class. With no resolver or no config to hand it, the
+   * column is null rather than that field. Every row with a lead id gets one: a stream
+   * read is small, and a queued or finished lead's class is still the one it would be, or
+   * was, priced at.
+   *
+   * The SPEND is the meter's: `readDirUsage(worktreeDir(repo, id))`, the lead AND its
+   * teammates, whose turns go to transcripts of their own (`tokens.readDirUsage`).
+   * `budget_est_tokens` carries it so the percentage can be checked against it. It is read
+   * for the rows the breaker meters (`METERED_STATES`) and no others: anywhere else there
+   * is no percentage the breaker is acting on, and a finished lead's whole team history is
+   * not streamed on every status call to make one up. The lead's own session stays where
+   * it was, in `est_tokens` and `turns`: `turn_cap` is calibrated per lead, and those two
+   * columns mean what they always meant.
+   *
+   * An id that is not a lead id names no stream and no directory this bus will read, so
+   * its row gets none of the three. Each read is caught on its own: one row's unreadable
+   * stream or transcript directory costs that row its columns, not the whole status.
+   */
+  const budgetOf = async (task, cfg) => {
+    const readable = LEAD_RE.test(task.id) && !RESERVED_STREAMS.has(task.id);
+    let name = null;
+    let cap = null;
+    if (readable && has('budgetClassOf') && isRecord(cfg)) {
+      try {
+        const priced = await deps.budgetClassOf(task, cfg);
+        if (isRecord(priced) && nonEmpty(priced.name)) {
+          name = priced.name;
+          cap = tokensCapOf(priced.cls);
+        }
+      } catch {
+        // A resolver that could not answer: this row's class is not known, and the rest of the
+        // status still is. (An unreadable stream is not this case: the resolver prices by the
+        // row's harness then, as the breaker does.)
+      }
+    }
+    let spent = null;
+    if (readable && METERED_STATES.has(task.status) && nonEmpty(task.repo) && has('readDirUsage') && has('worktreeDir')) {
+      try {
+        const usage = await deps.readDirUsage(await deps.worktreeDir(task.repo, task.id));
+        spent = isRecord(usage) ? meterNumber(usage.est_tokens) : null;
+      } catch {
+        // a transcript directory that cannot be read is not a spend of zero
+      }
+    }
+    return {
+      budget_class: cut(name, 32),
+      budget_est_tokens: spent,
+      budget_pct: cap !== null && spent !== null ? Math.round((spent / cap) * 100) : null,
+    };
   };
 
   const teamOf = async (target) => {
@@ -1880,8 +1961,7 @@ export function orchTools(ctx) {
     const live = liveness === 'alive';
     const recordedState = cut(task?.pane_state, 32);
     const usage = await usageOf(task);
-    const cap = capOf(task, cfg);
-    const est = Number.isFinite(usage.est_tokens) ? usage.est_tokens : null;
+    const budget = await budgetOf(task, cfg);
     return {
       lead: task.id,
       task_id: task.id,
@@ -1910,10 +1990,13 @@ export function orchTools(ctx) {
       // the orchestrator sees a lead approaching it.
       rotations_last_hour: rotationsLastHour(task?.rotations),
       harness: cut(task.harness, 32),
-      budget_class: cut(task.budget_class, 32),
+      // The class the breaker prices this lead at, and its spend as the breaker meters it:
+      // the lead and its team. `turns` and `est_tokens` are the lead's own session. See `budgetOf`.
+      budget_class: budget.budget_class,
       turns: Number.isFinite(usage.turns) ? usage.turns : null,
-      est_tokens: est,
-      budget_pct: cap !== null && est !== null ? Math.round((est / cap) * 100) : null,
+      est_tokens: Number.isFinite(usage.est_tokens) ? usage.est_tokens : null,
+      budget_est_tokens: budget.budget_est_tokens,
+      budget_pct: budget.budget_pct,
       // A fallback off the pinned model is detected, not prevented: this column is how the
       // orchestrator and the digest see that it happened. NOTE that with leads pinned to
       // `opus` the within-family case (Opus 5 -> Opus 4.5) satisfies the pin and so reaches

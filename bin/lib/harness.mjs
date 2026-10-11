@@ -10,7 +10,7 @@
  * kept field-compatible on purpose, so upstream patterns port without a fork. JSON
  * rather than the spec's YAML for one reason: zero runtime dependencies.
  *
- * Three functions, and each one exists because something downstream would otherwise
+ * Four functions, and each one exists because something downstream would otherwise
  * be guessing:
  *
  * - `loadHarnesses()` is the registry itself (`soma doctor` asserts it still holds
@@ -19,6 +19,10 @@
  * - `budgetClassFor(id)` is what the watchdog binds a circuit breaker to. It
  *   resolves *through* `loadConfig()`, never through a copy of DEFAULTS, so an
  *   operator retuning a class mid-run retunes the live breaker on the next tick.
+ * - `namedBudgetClassFor(id)` is the same answer with the class's name beside it, for
+ *   `soma_status`, which reports the class the breaker binds through the resolver both
+ *   share (`wd/budget-class.mjs`). `budgetClassFor` is a projection of it, so the name
+ *   shown and the caps enforced cannot come from two different reads.
  * - `validateHarnessReport(payload)` runs inside the bus, *before* a HARNESS event
  *   is stored, which puts two constraints on it that ordinary validators do not
  *   have. It must never throw — the transport hands a thrown message to the model
@@ -193,17 +197,33 @@ const menu = (registry) =>
  * does not define, and for a config or registry that could not be read — three
  * different diagnoses, but one meaning for the caller, which then has nothing to bind
  * a breaker to. The watchdog's answer to that case is its fallback class and the
- * HARNESS_DEFAULTED event (`budgetClassOf` in `soma-watchdog.mjs`), so no lead runs
- * breakerless; keeping this function total is what lets that fallback run.
+ * HARNESS_DEFAULTED event (`resolveBudgetClass` in `wd/budget-class.mjs`), so no lead
+ * runs breakerless; keeping this function total is what lets that fallback run.
  */
 export function budgetClassFor(harnessId) {
+  const named = namedBudgetClassFor(harnessId);
+  return named === null ? null : named.cls;
+}
+
+/**
+ * The same class, with its name: `{name, cls}`, or `null` exactly when `budgetClassFor`
+ * is `null`.
+ *
+ * `soma_status` shows the name beside a percentage of these caps (issue #59), so the two
+ * have to come out of one resolution: the same `resolveId`, the same registry entry, the
+ * same read of the config. A name looked up separately could name a class this fleet
+ * cannot price, or, with soma.json edited between two reads, a different one. Here a name
+ * is only ever returned with the caps it names, from the one `budgets` Map that holds
+ * record-valued classes alone.
+ */
+export function namedBudgetClassFor(harnessId) {
   const registry = loadHarnesses();
   const id = resolveId(registry, harnessId);
   if (id === null) return null;
-  const cls = registry[id].budget_class;
+  const name = registry[id].budget_class;
   const budgets = readBudgets();
-  if (typeof cls !== 'string' || budgets === null) return null;
-  return budgets.get(cls) ?? null;
+  if (typeof name !== 'string' || budgets === null || !budgets.has(name)) return null;
+  return { name, cls: budgets.get(name) };
 }
 
 /**

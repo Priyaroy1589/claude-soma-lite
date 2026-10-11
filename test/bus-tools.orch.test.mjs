@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
+import { resolveBudgetClass } from '../bin/lib/wd/budget-class.mjs';
 import { rotated, seatClosed } from '../bin/lib/wd/rotation-events.mjs';
 
 /**
@@ -85,6 +86,9 @@ const withoutKeys = (c, ...keys) => {
 
 const STALE_MS = 10 * 60 * 1000;
 
+/** The class each harness reserves, as `prompts/harnesses.json` ships the table. */
+const RESERVES = { H1: 'standard', H2: 'iterate', H3: 'iterate', H4: 'review', H5: 'babysit', H6: 'research' };
+
 function orch(opts = {}) {
   const s = {
     fleet: { tasks: rowsOf(opts.tasks ?? []), last_spawn_at: null },
@@ -111,6 +115,10 @@ function orch(opts = {}) {
     queuePaused: false,
     config: opts.config ?? { max_leads: 10, repos: {}, budgets: { standard: { tokens_cap: 1000 } } },
     usage: opts.usage ?? { est_tokens: 500, turns: 3, last_model: 'claude-fable-5' },
+    // What `tokens.readDirUsage` reads for a lead's worktree: the lead AND its team. Null is a lead
+    // with no teammates, whose directory is its own session; a test with a team hands one over.
+    dirUsage: opts.dirUsage ?? null,
+    dirReads: [], priced: [],
   };
   const deps = {
     // lease.heartbeat: stamps only the holder's own record, silently otherwise.
@@ -171,6 +179,25 @@ function orch(opts = {}) {
     spawnLead: (t) => { s.spawns.push(t.id); s.sessions.add(`lead-${t.id}`); return { lead: t.id, session_uuid: `u-${t.id}`, tmux_target: `lead-${t.id}`, cwd: `/w/${t.id}` }; },
     resumeLead: (t) => { s.resumes.push(t.id); s.sessions.add(`lead-${t.id}`); return { lead: t.id, session_uuid: t.lead_session_uuid }; },
     readUsage: () => s.usage,
+    // soma-bus's `budgetClassOf`, in shape: the SHARED resolver itself (the real one; it is pure)
+    // over the lead's own stream and `harness.namedBudgetClassFor`, which prices a harness's
+    // leading id against the fleet's own config and names the class beside its caps.
+    budgetClassOf: (task, cfg) => {
+      s.priced.push(task.id);
+      return resolveBudgetClass(task, (id) => s.events.filter((e) => e.lead === id), cfg, (harness) => {
+        const id = typeof harness === 'string' ? /^H[1-9][0-9]*/.exec(harness.trim().toUpperCase())?.[0] : undefined;
+        const name = id !== undefined && Object.hasOwn(RESERVES, id) ? RESERVES[id] : null;
+        const budgets = s.config?.budgets;
+        const cls = name !== null && budgets !== null && typeof budgets === 'object' && Object.hasOwn(budgets, name) ? budgets[name] : null;
+        return cls !== null && typeof cls === 'object' && !Array.isArray(cls) ? { name, cls } : null;
+      });
+    },
+    readDirUsage: (cwd) => {
+      s.dirReads.push(cwd);
+      return s.dirUsage === null ? { est_tokens: s.usage?.est_tokens ?? 0, turns: s.usage?.turns ?? 0 } : s.dirUsage(cwd);
+    },
+    // paths.worktreeDir, in shape: where the lead and its team run, and so where their transcripts land.
+    worktreeDir: (repo, id) => `/w/${repo}/${id}`,
     heartbeatAgeMs: () => 1234,
     setQueuePaused: (v) => { s.queuePaused = v; },
     queuePaused: () => s.queuePaused,
@@ -1506,6 +1533,225 @@ test('a hand-edited lease or task row cannot flood the model through status', as
   });
   const r = await bt.orchTools(c).get('soma_status')({});
   assert.ok(JSON.stringify(r).length < 8000, `${JSON.stringify(r).length} chars`);
+});
+
+// ---------------------------------------------------------------------------
+// soma_status's budget columns (issue #59): the class the breaker prices a lead at and the spend
+// it meters, never the row's `budget_class` (which only the inbox drain moves) and never the lead's
+// own session (which leaves out its teammates).
+// ---------------------------------------------------------------------------
+
+/** Four classes with four token caps, so a row's percentage says which class priced it. */
+const CLASSES = { max_leads: 10, repos: {}, budgets: { standard: { tokens_cap: 1000 }, iterate: { tokens_cap: 4000 }, review: { tokens_cap: 2000 }, babysit: { tokens_cap: 400 } } };
+
+/** The three budget columns of one status row. */
+const budgetCols = (row) => ({ budget_class: row.budget_class, budget_est_tokens: row.budget_est_tokens, budget_pct: row.budget_pct });
+
+test('status prices an unpinned lead by the HARNESS on its own stream before the inbox drains it, on the spend the breaker meters', async () => {
+  const bt = await load();
+  const c = orch({
+    config: structuredClone(CLASSES),
+    // Undrained: the row names no harness, and its class is null.
+    tasks: [{ id: 'cr-1', status: 'spawned', repo: 'acme', lead_session_uuid: 'u1', tmux_session: 'lead-cr-1' }],
+    events: [{ type: 'STARTED' }, { type: 'HARNESS', payload: { harness_id: 'H2 — the suite already runs', budget_class: 'iterate', plan_summary: 'p' } }],
+    usage: { est_tokens: 1000, turns: 7, last_model: 'claude-fable-5' },
+    dirUsage: (cwd) => ({ est_tokens: cwd === '/w/acme/cr-1' ? 3000 : 0, turns: 19 }),
+  });
+  const row = (await bt.orchTools(c).get('soma_status')({})).leads[0];
+  assert.equal(c.s.fleet.tasks[0].budget_class, null, 'the premise: nothing has told the row');
+  // Read off the row, this was `budget_class: null, budget_pct: null` while the watchdog was
+  // already metering the lead against iterate's cap.
+  assert.deepEqual(budgetCols(row), { budget_class: 'iterate', budget_est_tokens: 3000, budget_pct: 75 });
+  assert.deepEqual(c.s.dirReads, ['/w/acme/cr-1'], 'the directory the meter reads: worktreeDir(repo, id)');
+});
+
+test('after an H1 -> H4 supersede the inbox has not drained, status shows the new class, as the breaker does', async () => {
+  const bt = await load();
+  const c = orch({
+    config: structuredClone(CLASSES),
+    // The first report reached the row; the second, the documented degrade, has not.
+    tasks: [{ id: 'cr-1', status: 'spawned', harness: 'H1', budget_class: 'standard', lead_session_uuid: 'u1' }],
+    events: [{ type: 'HARNESS', payload: { harness_id: 'H1' } }, { type: 'HARNESS', payload: { harness_id: 'H4 — the review loop' } }],
+    dirUsage: () => ({ est_tokens: 1800, turns: 40 }),
+  });
+  const row = (await bt.orchTools(c).get('soma_status')({})).leads[0];
+  // Off the row: `standard`, at 180% of its cap, a review lead shown as tripped when it is not.
+  assert.deepEqual(budgetCols(row), { budget_class: 'review', budget_est_tokens: 1800, budget_pct: 90 });
+});
+
+test('a pinned lead shows its pin whatever harness it declares; a pin soma.json cannot bind shows the harness that prices it', async () => {
+  const bt = await load();
+  const c = orch({
+    config: structuredClone(CLASSES),
+    tasks: [
+      { id: 'cr-1', status: 'spawned', harness: 'H4', budget_class: 'babysit', budget_override: 'babysit', lead_session_uuid: 'u1' },
+      // `soma enqueue --file` stores what the file says; the breaker passes this pin over.
+      { id: 'cr-2', status: 'spawned', harness: 'H4', budget_class: 'premium', budget_override: 'premium', lead_session_uuid: 'u2' },
+    ],
+    events: [{ type: 'HARNESS', lead: 'cr-1', payload: { harness_id: 'H4' } }, { type: 'HARNESS', lead: 'cr-2', payload: { harness_id: 'H4' } }],
+    usage: { est_tokens: 100, turns: 2, last_model: 'claude-fable-5' },
+    dirUsage: () => ({ est_tokens: 300, turns: 9 }),
+  });
+  const [pinned, passedOver] = (await bt.orchTools(c).get('soma_status')({})).leads;
+  assert.deepEqual(budgetCols(pinned), { budget_class: 'babysit', budget_est_tokens: 300, budget_pct: 75 });
+  assert.deepEqual(budgetCols(passedOver), { budget_class: 'review', budget_est_tokens: 300, budget_pct: 15 });
+});
+
+test('budget_pct is the team\'s spend against the class cap, as the breaker meters it; est_tokens and turns stay the lead\'s own session', async () => {
+  const bt = await load();
+  const c = orch({
+    config: structuredClone(CLASSES),
+    tasks: [{ id: 'cr-1', status: 'spawned', harness: 'H1', budget_class: 'standard', lead_session_uuid: 'u1' }],
+    usage: { est_tokens: 250, turns: 4, last_model: 'claude-fable-5' },    // the lead alone
+    dirUsage: () => ({ est_tokens: 900, turns: 31 }),                      // the lead and its two teammates
+  });
+  const row = (await bt.orchTools(c).get('soma_status')({})).leads[0];
+  // Priced on the lead alone, this read 25% while the team had spent 90% of standard's cap: one tick
+  // from a BUDGET warning nothing on the row foretold.
+  assert.deepEqual(budgetCols(row), { budget_class: 'standard', budget_est_tokens: 900, budget_pct: 90 });
+  assert.equal(row.budget_pct, Math.round((row.budget_est_tokens / CLASSES.budgets.standard.tokens_cap) * 100), 'checkable against the column beside it');
+  assert.equal(row.est_tokens, 250, 'est_tokens is still the lead\'s own session');
+  assert.equal(row.turns, 4, 'and so is turns: turn_cap is calibrated per lead');
+});
+
+test('a budget dep this bus has not wired reads null, never the row\'s class', async () => {
+  const bt = await load();
+  const base = {
+    config: structuredClone(CLASSES),
+    tasks: [{ id: 'cr-1', status: 'spawned', harness: 'H4', budget_class: 'review', lead_session_uuid: 'u1' }],
+    dirUsage: () => ({ est_tokens: 1800, turns: 40 }),
+  };
+  const cases = [
+    // The row's `budget_class` may be a superseded report's class, so with no resolver it is not shown.
+    ['budgetClassOf', { budget_class: null, budget_est_tokens: 1800, budget_pct: null }],
+    // With no config, a pin cannot be told from a class nobody defined.
+    ['loadConfig', { budget_class: null, budget_est_tokens: 1800, budget_pct: null }],
+    ['readDirUsage', { budget_class: 'review', budget_est_tokens: null, budget_pct: null }],
+    ['worktreeDir', { budget_class: 'review', budget_est_tokens: null, budget_pct: null }],
+  ];
+  for (const [unwired, want] of cases) {
+    const c = orch({ ...base, deps: { [unwired]: undefined } });
+    const row = (await bt.orchTools(c).get('soma_status')({})).leads[0];
+    assert.deepEqual(budgetCols(row), want, unwired);
+    assert.equal(row.est_tokens, 500, `${unwired}: the session column does not depend on it`);
+  }
+});
+
+test('a budget read that fails costs that row its budget columns, never the reply, and names no path', async () => {
+  const bt = await load();
+  const c = orch({
+    config: structuredClone(CLASSES),
+    tasks: ['cr-1', 'cr-2', 'cr-3'].map((id) => ({ id, status: 'spawned', harness: 'H4', budget_class: 'review', lead_session_uuid: `u-${id}` })),
+    dirUsage: (cwd) => {
+      if (cwd.endsWith('/cr-2')) throw new Error("EACCES: permission denied, scandir '/Users/x/.claude/projects/-w-r-cr-2'");
+      return { est_tokens: 1800, turns: 40 };
+    },
+  });
+  const resolve = c.deps.budgetClassOf;
+  c.deps.budgetClassOf = (task, cfg) => {
+    if (task.id === 'cr-1') throw new Error("EACCES: permission denied, open '/Users/x/.soma/events/cr-1.ndjson'");
+    return resolve(task, cfg);
+  };
+  const r = await bt.orchTools(c).get('soma_status')({});
+  assert.deepEqual(r.leads.map(budgetCols), [
+    { budget_class: null, budget_est_tokens: 1800, budget_pct: null },
+    { budget_class: 'review', budget_est_tokens: null, budget_pct: null },
+    { budget_class: 'review', budget_est_tokens: 1800, budget_pct: 90 },
+  ]);
+  assert.ok(!/[/\\]/.test(JSON.stringify(r).replace(/https?:\/\//g, '')), 'no path may reach the model');
+});
+
+test('a spend reading that is not a measurement gives no spend and no percentage; one the meter would take is taken', async () => {
+  const bt = await load();
+  const spendOf = async (reading) => {
+    const c = orch({ config: structuredClone(CLASSES), tasks: [{ id: 'cr-1', status: 'spawned', harness: 'H4' }], dirUsage: () => reading });
+    return budgetCols((await bt.orchTools(c).get('soma_status')({})).leads[0]);
+  };
+  for (const reading of [null, {}, 'a lot', { est_tokens: Number.NaN }, { est_tokens: -1 }, { est_tokens: Infinity }, { est_tokens: '' }, { est_tokens: 'lots' }]) {
+    assert.deepEqual(await spendOf(reading), { budget_class: 'review', budget_est_tokens: null, budget_pct: null }, JSON.stringify(reading));
+  }
+  // The meter's own reading (`reqNum` over `readDirUsage().est_tokens`) takes a numeric string, so
+  // the column the percentage is checked against does too.
+  assert.deepEqual(await spendOf({ est_tokens: '1800' }), { budget_class: 'review', budget_est_tokens: 1800, budget_pct: 90 });
+});
+
+test('the token cap is read as the breaker reads it: a numeric string prices the same, and no cap or a refused one gives no percentage', async () => {
+  const bt = await load();
+  const { checkBudget } = await import('../bin/lib/wd/budget.mjs');
+  const spent = { est_tokens: 1600, turns: 0 };
+  /** The review class with `tokens_cap` set to `cap`, or with no `tokens_cap` key when `cap` is undefined. */
+  const reviewWith = (cap) => (cap === undefined ? { turn_cap: 600 } : { tokens_cap: cap, turn_cap: 600 });
+  /** budget_pct for a review lead whose team has spent 1600, under that class. */
+  const pctUnder = async (cap) => {
+    const c = orch({
+      config: { ...structuredClone(CLASSES), budgets: { ...structuredClone(CLASSES.budgets), review: reviewWith(cap) } },
+      tasks: [{ id: 'cr-1', status: 'spawned', harness: 'H4' }],
+      dirUsage: () => ({ est_tokens: spent.est_tokens }),
+    });
+    const row = (await bt.orchTools(c).get('soma_status')({})).leads[0];
+    assert.equal(row.budget_class, 'review', `${String(cap)}: the class is shown whatever its cap`);
+    return row.budget_pct;
+  };
+  // A hand-edited soma.json can say "2000": `checkBudget` reads it as 2000 and warns this lead at 80%,
+  // so the status shows the 80% the breaker is acting on, not a null beside a live warning.
+  for (const cap of [2000, '2000', ' 2000 ', '2e3']) {
+    assert.equal(checkBudget(spent, reviewWith(cap)), 'warn', `premise: the breaker warns at 80% under ${JSON.stringify(cap)}`);
+    assert.equal(await pctUnder(cap), 80, JSON.stringify(cap));
+  }
+  // 0 or absent is no token cap: the breaker meters no tokens for that class, so there is no
+  // percentage of one.
+  for (const cap of [0, '0', undefined]) {
+    assert.equal(checkBudget(spent, reviewWith(cap)), null, `premise: no token verdict under ${String(cap)}`);
+    assert.equal(await pctUnder(cap), null, String(cap));
+  }
+  // A cap the breaker refuses outright is no cap it enforces, so it is no percentage either.
+  for (const cap of ['', '  ', 'lots', -1, '-1', Infinity, 'Infinity', Number.NaN, null, true, [], {}]) {
+    assert.throws(() => checkBudget(spent, reviewWith(cap)), /tokens_cap/, `premise: the breaker refuses ${String(cap)}`);
+    assert.equal(await pctUnder(cap), null, String(cap));
+  }
+});
+
+test('only a lead the breaker meters gets a spend and a percentage; every row with a lead id gets its class', async () => {
+  const bt = await load();
+  const statuses = ['spawned', 'blocked', 'done', 'failed', 'skipped', 'queued'];
+  const c = orch({
+    config: structuredClone(CLASSES),
+    tasks: statuses.map((status, i) => ({ id: `cr-${i + 1}`, status, harness: 'H4', budget_class: 'review', lead_session_uuid: `u${i + 1}` })),
+    dirUsage: () => ({ est_tokens: 1800, turns: 40 }),
+  });
+  const tools = bt.orchTools(c);
+  const rows = Object.fromEntries((await tools.get('soma_status')({})).leads.map((row) => [row.status, row]));
+  // `blocked` is metered: a blocked lead keeps its live session, and its team keeps spending.
+  for (const status of ['spawned', 'blocked']) {
+    assert.deepEqual(budgetCols(rows[status]), { budget_class: 'review', budget_est_tokens: 1800, budget_pct: 90 }, status);
+  }
+  // A finished lead is out of the breaker's hands, and a queued one never reached them: there is no
+  // percentage the breaker is acting on, and a team's whole history is not read to make one up.
+  for (const status of ['done', 'failed', 'skipped']) {
+    assert.deepEqual(budgetCols(rows[status]), { budget_class: 'review', budget_est_tokens: null, budget_pct: null }, status);
+  }
+  const queued = (await tools.get('soma_status')({ lead: 'cr-6' })).leads[0];
+  assert.deepEqual(budgetCols(queued), { budget_class: 'review', budget_est_tokens: null, budget_pct: null }, 'queued');
+  assert.deepEqual(c.s.dirReads, ['/w/r/cr-1', '/w/r/cr-2'], 'only the metered rows\' directories are read');
+});
+
+test('a row whose id is not a lead id reads no stream and no directory; one with no repo reads no directory', async () => {
+  const bt = await load();
+  const c = orch({
+    config: structuredClone(CLASSES),
+    tasks: [
+      // Hand-edited: `fleet.enqueue` refuses an id like this, which names a path and not a stream.
+      { id: '../cr-1', status: 'spawned', harness: 'H4', budget_class: 'review' },
+      { id: 'cr-2', status: 'spawned', harness: 'H4', budget_class: 'review', repo: null },
+    ],
+  });
+  const r = await bt.orchTools(c).get('soma_status')({});
+  assert.deepEqual(r.leads.map(budgetCols), [
+    { budget_class: null, budget_est_tokens: null, budget_pct: null },
+    { budget_class: 'review', budget_est_tokens: null, budget_pct: null },
+  ]);
+  assert.deepEqual(c.s.priced, ['cr-2'], 'the resolver is never handed a path-shaped id');
+  assert.deepEqual(c.s.dirReads, [], 'and no directory is read for either row');
 });
 
 // ---------------------------------------------------------------------------

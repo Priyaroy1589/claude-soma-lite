@@ -465,6 +465,9 @@ The retired key `resume_token_guard` is stripped with a warning if your file sti
   declared and none of it can be priced (a harness the registry does not carry or soma.json cannot
   price, or an enqueue class soma.json does not define with no priceable harness behind it), or
   nothing was declared and even H1 cannot be priced, which means a broken install.
+  `soma_status` reports the same: `budget_class` is the class this rule picks, and `budget_pct` is
+  `budget_est_tokens`, the lead's and its team's spend, as a share of that class's `tokens_cap`;
+  its `est_tokens` and `turns` are the lead's own session.
 - `soma_enqueue` refuses a `budget_class` soma.json does not define (`unknown-budget-class`, and
   lists the classes it does define); `soma enqueue --file` stores what the file says. The breaker
   passes such a class over and logs `HARNESS_DEFAULTED` once for that lead: the lead is priced by
@@ -686,7 +689,7 @@ Two tools to be careful with:
 | tool | what it does |
 |---|---|
 | `soma_adopt` | Take the orchestrator lease: the promotion. Refused while a live session holds it, with `holder` and `holder_live` (`true`: the liveness check ran; `null`: it could not, so the refusal proves little). `force: true` steals it and types a `DEMOTED` notice into the old holder's pane. Operator decision only. |
-| `soma_status` | The fleet at a glance, read-only: one row per lead (status, liveness, pane state, seat, harness, budget class, turns, est tokens, budget %, model, heartbeat age, team panes, PR link), plus queue, backpressure, seat pool, watchdog health and lease. `lead` narrows it to one row. |
+| `soma_status` | The fleet at a glance, read-only: one row per lead (status, liveness, pane state, seat, harness, budget class (the one the breaker prices it at), turns and est tokens (the lead's own session), budget est tokens and budget % (the spend of the lead and its team, as the breaker meters it; null unless the lead is spawned or blocked, the only rows it meters), model, heartbeat age, team panes, PR link), plus queue, backpressure, seat pool, watchdog health and lease. `lead` narrows it to one row. |
 
 **Orchestrator role** (after a successful `soma_adopt`: the two above, plus ten):
 

@@ -192,7 +192,9 @@ while a resumed lead keeps its session and its note. A trip writes
 so a tripped lead can still file `COMPLETED` or `ERROR`, and nothing else.
 A lead is priced at the class pinned at enqueue when soma.json defines it, else at the class its
 newest `HARNESS` report reserves, else at `standard`; README's budget section has the exact rule
-and when `HARNESS_DEFAULTED` fires.
+and when `HARNESS_DEFAULTED` fires. `soma_status` shows that class as `budget_class`, and as
+`budget_pct` the share of its `tokens_cap` the lead and its team have spent (`budget_est_tokens`),
+for a spawned or blocked lead, the only rows the breaker meters.
 
 ### Config keys that are declared and read by nothing
 

@@ -1398,6 +1398,68 @@ test('a row enqueued before the pin existed has no budget_override key at all, a
   assert.deepEqual(eventsOf(early, 'WATCHDOG_ERROR'), []);
 });
 
+/**
+ * The braces-balanced body that follows the first match of `head` in `code`, with every string and
+ * template literal blanked to spaces first (lengths kept), so a brace or a call spelled inside a
+ * string counts for nothing. '' when `head` does not occur, so a pin on it fails rather than
+ * passing on an empty subject.
+ */
+const bodyAfter = (code, head) => {
+  const blank = code.replace(/'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\[\s\S]|[^`\\])*`/g, (s) => s[0] + ' '.repeat(s.length - 2) + s[0]);
+  const m = head.exec(blank);
+  const open = m === null ? -1 : blank.indexOf('{', m.index + m[0].length);
+  if (open === -1) return '';
+  let depth = 0;
+  for (let i = open; i < blank.length; i++) {
+    if (blank[i] === '{') depth += 1;
+    else if (blank[i] === '}' && --depth === 0) return blank.slice(open, i + 1);
+  }
+  return '';
+};
+
+/**
+ * `src` as the exact pin below compares it: comments stripped as the source pins here strip them,
+ * every run of whitespace collapsed to one space, and the ends trimmed. Both sides go through it,
+ * so the expected wiring can be laid out as the source lays it out.
+ */
+const normalised = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s+/g, ' ').trim();
+
+test('the breaker prices through the one resolver soma_status calls: budgetClassOf returns resolveBudgetClass and keeps no rule of its own', () => {
+  // Issue #59 was `soma_status` and this breaker naming different classes for one lead, because
+  // each carried its own rule. Both now call `resolveBudgetClass` (`wd/budget-class.mjs`), and no
+  // behavioural test here can tell when the tick grows its own copy again: the old rule inlined
+  // back, even with drift (a HARNESS tie going to the earlier row, a blocked lead skipping its
+  // stream, newest by position rather than by stamp), left the whole suite green. So the source is
+  // pinned, comments stripped as the other source pins here strip them, and `budgetClassOf`'s body,
+  // whitespace collapsed, is pinned EXACTLY, on purpose. A looser pin can be passed by a shape that
+  // keeps the call and prices around it: the call only in a trailing comment, a statement of its
+  // own ahead of the call, a row altered on its way in, a second call chained after it. A
+  // shared-resolver invariant has no partial form, so editing this wiring means editing this pin,
+  // deliberately. And `meter` prices through `budgetClassOf`.
+  const WIRING = `{
+    return resolveBudgetClass(task, (id) => deps.leadEvents(id), cfg, (harness) => {
+      const cls = deps.budgetClassFor(harness);
+      return cls === null || cls === undefined ? null : { name: null, cls };
+    });
+  }`;
+  const code = WD_SRC.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.match(code, /^import\s*\{[^}]*\bresolveBudgetClass\b[^}]*\}\s*from\s*'\.\/lib\/wd\/budget-class\.mjs';?$/m,
+    'the tick must import the shared resolver');
+  const body = bodyAfter(code, /\bfunction budgetClassOf\s*\(/);
+  assert.notEqual(body, '', 'budgetClassOf must be findable, or the pin below tests nothing');
+  assert.equal(normalised(body), normalised(WIRING),
+    'budgetClassOf must be exactly the shared-resolver wiring; changing it means changing this pin');
+  assert.match(bodyAfter(code, /\bfunction meter\s*\(/), /\bbudgetClassOf\s*\(\s*deps\s*,\s*cfg\s*,\s*task\s*\)/,
+    'and the meter must price through budgetClassOf');
+  // The old inline rule's helpers, by their own names: none of them comes back beside the call.
+  for (const name of ['definedClass', 'fallbackClass', 'pinName', 'DEFAULT_CLASS']) {
+    assert.doesNotMatch(code, new RegExp(`\\b(?:function|const|let|var)\\s+${name}\\b`), `${name} belongs to the inline rule the resolver replaced`);
+  }
+  // The control: the extraction is ONE function's body, not the file. `meter` mentions the resolver
+  // nowhere, so a call to it must not turn up in `meter`'s extracted body.
+  assert.doesNotMatch(bodyAfter(code, /\bfunction meter\s*\(/), /\bresolveBudgetClass\s*\(/, 'the extractor scopes to one body');
+});
+
 // ════════════════════════ Model deviation ════════════════════════
 
 test('deviation comes from modelDeviation() against the exported pin, and the pin is an INFIX', async () => {
