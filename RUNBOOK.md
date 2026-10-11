@@ -1333,30 +1333,36 @@ two states a LIVE server gives them too, and then both reports are wrong while t
 watchdog and its leads keep running:
 
 - **Its socket file was deleted while it runs** — a `/tmp` cleaner is the usual way. Measured in a
-  throwaway sandbox on tmux 3.6a, with a stand-in `soma-watchdog` session on a private socket rather
-  than a real fleet: once the live server's socket file was removed, tmux printed `error connecting
-  to <path> (No such file or directory)`, `soma status` reported the watchdog absent, and `soma
-  down` exited 0 saying none was running, while the server and that session stayed alive.
-  `SIGUSR1` to the server process recreated the socket, and `soma status` read the watchdog live
-  again (tmux(1) documents that signal for this). **Inferred, not reproduced:** that `soma up` would
-  then start a second server and a second watchdog on the same path. `up` needs a terminal to
-  confirm, so it was not run there; the inference is that a client that finds no socket file starts
-  a server there, which is what every first `soma up` does. **Recovery:** send `SIGUSR1` to the
-  orphaned server's process (`ps` lists it as `tmux -L <socket> …`) before anything else, and do not
-  run `soma up` until `soma status` reads the fleet again.
+  throwaway sandbox on tmux 3.6a, with stand-in sessions on a private socket rather than a real
+  fleet: once the live server's socket file was removed, tmux printed `error connecting to <path>
+  (No such file or directory)`, `soma status` reported the watchdog absent, and `soma down` exited
+  0 saying none was running, while the server and its sessions stayed alive. A `new-session` on the
+  same socket name (the call `soma up` makes to start its watchdog) then exited 0 and started a
+  SECOND server on the same path: a different pid, the first one still alive, and the socket
+  listing only the second one's sessions. Before any second server existed, `SIGUSR1` to the first
+  server's process recreated its socket, and `soma status` read the watchdog live again (tmux(1)
+  documents that signal for this). **Inferred, not reproduced on a fleet:** what follows a `soma
+  up` in this state, because `up` needs a terminal to confirm and was not run. Its new watchdog
+  would see none of the first server's leads, read them as dead (`LEAD_DEAD`) and respawn them,
+  leaving two leads on each worktree. **Recovery, in this order:** when leads are visibly running,
+  send `SIGUSR1` to the orphaned server's process (`ps` lists it as `tmux -L <socket> …`) BEFORE
+  any `soma up`, and run `soma up` only once `soma status` reads the fleet again.
 - **It is wedged, and its accept queue has overflowed.** Measured on macOS, tmux 3.6a: a server
   stopped with `SIGSTOP`, 300 clients started against it and killed, and the next client printed
   `no server running on <path>` while the server was alive; a `new-session` then started a fresh
   server on the same path and left the stopped one orphaned. So `status` and `down` misreport as
-  above, and `soma up` would start a second server and a second watchdog. **Recovery:** `SIGCONT`
-  resumes a stopped server. One that stays wedged has to be killed, which ends every session in it,
-  leads included, and from there it is the reboot path (§7, *Reboot contract*).
+  above, and `soma up` would start a second server and a second watchdog. **Recovery:** `SIGUSR1`
+  is no help here, because the socket file is still in place and the server is simply not accepting
+  on it. `SIGCONT` resumes a stopped server. One that stays wedged has to be killed, which ends
+  every session in it, leads included, and from there it is the reboot path (§7, *Reboot contract*).
 
 Nothing is written on the wrong reading. `soma kill` does not take it (it refuses with exit 3, as
 for any unreadable tmux), and the watchdog never does (it skips the tick). The damage is a report
 that says the fleet is down when it is not, and a second fleet if you answer that report with `soma
-up`. `ps` is what tells a server that is really gone from these two states: if a tmux server process
-for soma's socket is still alive, you are in one of them.
+up`. That risk is not new: `up` would start the second fleet on any unreadable tmux whatever
+`status` said, because its own already-running check reads a `null` as "not running", and it did
+so before this reading existed. `ps` is what tells a server that is really gone from these two
+states: if a tmux server process for soma's socket is still alive, you are in one of them.
 
 ---
 

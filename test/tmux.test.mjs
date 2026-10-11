@@ -547,7 +547,11 @@ test('against a real tmux: the transcript path, the wake, and a wedged server', 
   });
 
   try {
-    t.newSession({ name, cwd: dir, env: { PATH: process.env.PATH, HOME: process.env.HOME }, argv: ['sh', '-c', 'echo BIRTH-LINE; cat'], logPath });
+    // `-f /dev/null` on the call that STARTS the server, the only one that reads a config: the
+    // operator's ~/.tmux.conf may load plugins that restore and save sessions, and a throwaway
+    // server must run none of them. tmux takes the flag anywhere before the command, so it rides `run`.
+    t.newSession({ name, cwd: dir, env: { PATH: process.env.PATH, HOME: process.env.HOME }, argv: ['sh', '-c', 'echo BIRTH-LINE; cat'], logPath },
+      (args) => t.defaultRun(['-f', '/dev/null', ...args]));
   } catch (e) {
     // A pty-exhausted host ("fork failed: Device not configured") is an OS
     // limit, not a regression — do not fail the fleet's build over it.
@@ -617,7 +621,8 @@ test('against a real tmux: serverAbsent reads a never-started and a killed serve
   // ...while the watchdog's own reading of the very same thing stays "not measured".
   assert.equal(t.liveSessions(), null);
 
-  const up = t.defaultRun(['new-session', '-d', '-s', `soma-absent-probe-${process.pid}`, 'cat']);
+  // `-f /dev/null` on the call that starts the server, for the reason the test above gives.
+  const up = t.defaultRun(['-f', '/dev/null', 'new-session', '-d', '-s', `soma-absent-probe-${process.pid}`, 'cat']);
   // A pty-exhausted host is an OS limit, not a regression (the same allowance as the test above).
   if (up.code !== 0) return t_.skip(`tmux could not start a session here: ${up.stderr.trim()}`);
   assert.equal(t.serverAbsent(), false, 'a running server is not absent');
