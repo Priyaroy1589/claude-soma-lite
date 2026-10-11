@@ -6,7 +6,8 @@
  * can be attached, and it attaches them as *files* rather than argv because argv
  * binds one process while a file binds everything that reads it from disk:
  *
- *   leads/<id>/mcp.json            the lead's entire MCP surface: one server, soma.
+ *   leads/<id>/mcp.json            the lead's entire MCP surface: soma and the stateless
+ *                                  sequential-thinking server, nothing else.
  *   leads/<id>/settings.json       the base of the lead's `--settings`: model pin and three
  *                                  hooks, and DELIBERATELY NO `permissions` BLOCK.
  *                                  NOT the file `--settings` points at — `spawn`'s
@@ -48,11 +49,13 @@
  *   connectors and plugin servers. See `enumerateUserMcpServers` for what each
  *   source can and cannot see, and STANDING_DENIES for the prefix rules.
  *
- * - **The lead's MCP config holds exactly one server.** Two would be a recursion
- *   guard failure, not a convenience: a lead that can reach an orchestrator bus
- *   can spawn leads, which can spawn leads. `soma doctor` asserts the single-server
- *   property, and `--strict-mcp-config` (spawner) is what stops user scope from
- *   adding a second behind our back.
+ * - **The lead's MCP config holds exactly two servers, `soma` and the stateless
+ *   `sequential-thinking`.** The guard is that neither reaches an orchestrator bus,
+ *   because a lead that reaches one can spawn leads, which can spawn leads. So a third
+ *   server is a recursion-guard decision, not a convenience (`writeLeadMcpConfig` says
+ *   what bar the second one cleared). `soma doctor` asserts that exact set (`lead mcp
+ *   single-server`), and `--strict-mcp-config` (spawner) is what stops user scope from
+ *   adding another behind our back.
  *
  * - **NO `permissions` BLOCK IN THE LEAD FILE — that absence is load-bearing, and putting
  *   one back is the build's worst regression.** `writeLeadSettings` used to write

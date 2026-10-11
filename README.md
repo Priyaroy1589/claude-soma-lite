@@ -532,9 +532,9 @@ Doctor prints 48 named checks plus one row per configured repo. Each row is `ok 
   `CLAUDE_CODE_SESSION_ID` is unobserved from a plain shell. Before the first lead exists,
   `every worktree guard file carries rules`, `guard file matches the generator` and
   `lead mcp single-server` are unobserved too.
-- **Once a lead exists, `lead mcp single-server` reads `FAIL`.** It requires a lead's MCP config to
-  name only `soma`, but leads now also get the sequential-thinking server and the check was not
-  updated. Doctor then exits 3. Every other `FAIL` is real.
+- **Once a lead exists, `lead mcp single-server` reads `ok`.** Despite its name, it checks that a
+  lead's MCP config names exactly the two servers soma writes there: `soma` and the stateless
+  sequential-thinking server. Any `FAIL` is real.
 - **`repos readable — 0 repos configured` is not "ready".** It means there was nothing to probe.
 - **`claude cd-compound read runs` = FAIL** means your Claude Code build stops on a permission
   prompt that bypass mode cannot skip (Claude Code 2.1.259 did, and unattended sessions sat on it
@@ -804,7 +804,6 @@ details.
 | `backpressure: FROZEN … org_level_disabled_until` | the organisation's spend cap was reached | once the cap is lifted, move or kill leads whose transcript still ends on the cap, then `soma thaw` |
 | a promoted session shows an empty fleet | the bus is pinned to the wrong state root | re-run `soma init` from the right shell; check the `SOMA_HOME=` it prints |
 | `soma doctor` says `INCOMPLETE`, never `PASS` | expected: two checks are always unobserved on this build | read the `????` rows against [Reading `soma doctor`](#reading-soma-doctor) |
-| `soma doctor` fails `lead mcp single-server` | expected once a lead exists: the check predates the sequential-thinking server | nothing; any other `FAIL` is real |
 | every lead shows `0` tokens | the wrong Claude Code config root, so no transcript matches. The budget breaker is welded open | doctor's `claude config root` row; use your wrapper |
 | `soma status` shows `LIVE ?` everywhere | tmux could not be read, which is not a dead fleet | `tmux -L soma ls` |
 | `soma kill` or `soma down` exits 3 | soma could not confirm the session stopped, so it changed nothing | `soma status`, then try again |
