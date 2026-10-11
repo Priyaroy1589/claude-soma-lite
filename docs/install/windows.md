@@ -33,7 +33,6 @@ what its guardrails do not cover.
 - **soma has no Windows code path.** Nothing in `bin/` branches for native Windows. The only
   Windows-specific code is the WSL notification path, which calls `powershell.exe` from inside
   Linux to show a Windows toast.
-- **The test script needs a POSIX shell.** `npm test` uses shell syntax that `cmd.exe` cannot run.
 
 Claude Code itself does run natively on Windows
 ([Claude Code setup](https://code.claude.com/docs/en/setup#set-up-on-windows)), but soma cannot use

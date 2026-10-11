@@ -12,6 +12,7 @@
  *   assertion carries the weight instead — see `queue.test.mjs` for the precedent. An
  *   assertion count is a claim about how many measurements were taken.
  */
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
