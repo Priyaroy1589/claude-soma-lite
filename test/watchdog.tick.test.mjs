@@ -1530,6 +1530,206 @@ test('liveness that could not be read skips reconcile and revival, and says so',
   assert.deepEqual(c.calls.readDirUsage, ['/w/a']);
 });
 
+// ════════════════════════ The revival backoff ════════════════════════
+//
+// Every 30 s tick used to be allowed a revival, so a lead that died for a persistent reason (a bad
+// credential, a broken worktree) spent all three attempts in about 90 s and gave up before anyone
+// could read its death screen. Now the second revival comes no sooner than 15 minutes after the
+// first and the third no sooner than an hour after the second, timed from the row's `revived_at`.
+// While a lead waits, nothing happens at all: the dead pane stays up for `soma peek`, and the row
+// keeps its status and its slot.
+
+/**
+ * A dead lead (no live pane) whose last revival was `ago` ms before NOW, after `attempts` of them.
+ * `pane_state` and `started_at` are seeded so the census and the meter have nothing of their own to
+ * write: any write to this row is then the revival's.
+ */
+const waiting = (attempts, ago, over = {}) => row({
+  id: 'a', status: 'spawned', lead_session_uuid: 'u', attempts, revived_at: NOW - ago,
+  pane_state: 'absent', started_at: NOW - 180 * MIN, ...over,
+});
+
+/**
+ * Which of row `id`'s fields each transaction changed, one sorted list per transaction that changed
+ * any. Read off `c.store`, so a field the tick sets only on its own snapshot never shows.
+ */
+const rowWrites = (c, id = 'a') => {
+  const writes = [];
+  const inner = c.deps.updateFleet;
+  c.deps.updateFleet = (mutate) => {
+    const before = structuredClone(c.store.tasks.find((t) => t?.id === id) ?? {});
+    const out = inner(mutate);
+    const after = c.store.tasks.find((t) => t?.id === id) ?? {};
+    const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+      .filter((k) => JSON.stringify(before[k]) !== JSON.stringify(after[k]));
+    if (keys.length > 0) writes.push(keys.sort());
+    return out;
+  };
+  return writes;
+};
+
+test('a dead lead revived a minute ago waits out its 15 minutes: nothing is captured, logged, charged, killed or written', async () => {
+  const { tick } = await load('backoff-wait-' + Date.now());
+  const c = ctx({ fleet: { tasks: [waiting(1, MIN)] }, alive: new Set() });
+  const writes = rowWrites(c);
+  await tick(c.deps);
+  assert.deepEqual(eventsOf(c, 'LEAD_DEAD'), [], 'the death is logged when the relaunch happens, not on every tick of the wait');
+  assert.deepEqual(eventsOf(c, 'REVIVED'), []);
+  assert.deepEqual(eventsOf(c, 'GAVE_UP'), []);
+  assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), []);
+  assert.deepEqual(c.calls.capturePane, [], 'the death scene is read at the relaunch, off the pane the wait leaves standing');
+  assert.deepEqual(c.calls.killSession, [], 'that pane is what `soma peek` shows, and keeping it readable is what the wait is for');
+  assert.deepEqual(c.calls.spawnLead, []);
+  assert.deepEqual(c.calls.resumeLead, []);
+  assert.deepEqual(c.calls.notify, []);
+  assert.deepEqual(writes, [], `no transaction may touch the row while it waits: ${JSON.stringify(writes)}`);
+  assert.equal(c.task().attempts, 1);
+  assert.equal(c.task().revived_at, NOW - MIN);
+  assert.equal(c.task().status, 'spawned', 'the row keeps its status, and with it its slot');
+});
+
+test('a hand-edited fractional attempts count waits out its step too: 1.5 is held like 1, not relaunched at once', async () => {
+  const { tick } = await load('backoff-frac-' + Date.now());
+  // `planRevival` accepts any non-negative finite `attempts`, so a row hand-edited to 1.5 is one the
+  // tick revives. The schedule has no entry at index 1.5: unfloored, the step is undefined, the wait
+  // is NaN, `NaN > 0` is false, and the lead is relaunched at once with no backoff at all.
+  const c = ctx({ fleet: { tasks: [waiting(1.5, MIN)] }, alive: new Set() });
+  await tick(c.deps);
+  assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), [], 'a count planRevival accepts is not refused here either');
+  assert.deepEqual(eventsOf(c, 'LEAD_DEAD'), []);
+  assert.deepEqual(c.calls.capturePane, []);
+  assert.deepEqual(c.calls.killSession, []);
+  assert.deepEqual(c.calls.resumeLead, []);
+  assert.deepEqual(c.calls.spawnLead, []);
+  assert.equal(c.task().attempts, 1.5, 'no attempt is charged while it waits');
+  // The control: fifteen minutes on, the same row goes, as a row at 1 would.
+  const due = ctx({ fleet: { tasks: [waiting(1.5, 15 * MIN)] }, alive: new Set() });
+  await tick(due.deps);
+  assert.deepEqual(due.calls.resumeLead, ['a']);
+});
+
+test('a waiting lead does not pick a seat either: the pick belongs to the relaunch', async () => {
+  const { tick } = await load('backoff-seat-' + Date.now());
+  // The pick reads the pool and can throw on a malformed `seats` entry. Made on every tick of an
+  // hour's wait, it would be an hour of reads, and of WATCHDOG_ERRORs for a relaunch not yet due.
+  const mk = (ago) => ctx({
+    cfg: cfgOf({ seats: [{ config_dir: '/s/a', label: 'seat-a' }] }),
+    fleet: { tasks: [waiting(1, ago, { seat: 'seat-a' })] },
+    alive: new Set(),
+    pickSeat: () => ({ config_dir: '/s/a', label: 'seat-a', closed_until: 0, closed_reason: null, unverified: false }),
+  });
+  const held = mk(MIN);
+  await tick(held.deps);
+  assert.equal(held.calls.pickSeat, 0);
+  assert.deepEqual(held.calls.resumeLead, []);
+  // The control: once the wait is over, the same fixture picks and relaunches onto the seat.
+  const due = mk(15 * MIN);
+  await tick(due.deps);
+  assert.equal(due.calls.pickSeat, 1);
+  assert.deepEqual(due.calls.resumeLead, ['a']);
+  assert.deepEqual(due.calls.resumeOpts, [{ configDir: '/s/a' }]);
+});
+
+test('fifteen minutes after the first revival, the second one goes', async () => {
+  const { tick } = await load('backoff-15-' + Date.now());
+  const c = ctx({ fleet: { tasks: [waiting(1, 15 * MIN)] }, alive: new Set() });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'LEAD_DEAD').payload.attempts, 1);
+  assert.deepEqual(c.calls.killSession, ['lead-a']);
+  assert.deepEqual(c.calls.resumeLead, ['a']);
+  assert.equal(oneEvent(c, 'REVIVED').payload.attempt, 2);
+  assert.equal(c.task().attempts, 2);
+  assert.equal(c.task().revived_at, NOW, 'the third revival is timed from this one');
+});
+
+test('the third revival waits an hour after the second, not fifteen minutes', async () => {
+  const { tick } = await load('backoff-60-' + Date.now());
+  for (const ago of [16 * MIN, 59 * MIN]) {
+    const held = ctx({ fleet: { tasks: [waiting(2, ago)] }, alive: new Set() });
+    await tick(held.deps);
+    assert.deepEqual(eventsOf(held, 'LEAD_DEAD'), [], `${ago / MIN} minutes into the hour`);
+    assert.deepEqual(held.calls.killSession, []);
+    assert.deepEqual(held.calls.resumeLead, []);
+    assert.equal(held.task().attempts, 2);
+  }
+  const due = ctx({ fleet: { tasks: [waiting(2, 60 * MIN)] }, alive: new Set() });
+  await tick(due.deps);
+  assert.equal(oneEvent(due, 'REVIVED').payload.attempt, 3);
+  assert.deepEqual(due.calls.resumeLead, ['a']);
+  assert.equal(due.task().attempts, 3);
+  assert.equal(due.task().revived_at, NOW);
+});
+
+test('a revival stamps revived_at and attempts in ONE transaction, the first revival included', async () => {
+  const { tick } = await load('backoff-txn-' + Date.now());
+  // attempts 0 and no stamp, which is every row before its first death. The first revival is
+  // immediate, and it is also the one that has to stamp the row, or the second is never held.
+  const c = ctx({
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u', attempts: 0, pane_state: 'absent', started_at: NOW - 180 * MIN })] },
+    alive: new Set(),
+  });
+  const writes = rowWrites(c);
+  await tick(c.deps);
+  assert.deepEqual(c.calls.resumeLead, ['a']);
+  assert.equal(c.task().attempts, 1);
+  assert.equal(c.task().revived_at, NOW);
+  // Two writes would leave a window in which the attempt is charged and the stamp is not, and a
+  // revival read in it would go at once, which is the storm this exists to end.
+  assert.deepEqual(writes.filter((keys) => keys.includes('attempts') || keys.includes('revived_at')), [['attempts', 'revived_at']]);
+});
+
+test('at three attempts it gives up at once: the backoff never delays GAVE_UP', async () => {
+  const { tick } = await load('backoff-giveup-' + Date.now());
+  // A minute after the third revival. Held by the backoff, this lead would sit dead in its slot
+  // for another hour before saying so, and the GAVE_UP and its toast are what a human acts on.
+  const c = ctx({ fleet: { tasks: [waiting(3, MIN)] }, alive: new Set() });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'GAVE_UP').payload.attempts, 3);
+  assert.equal(c.calls.notify.length, 1);
+  assert.deepEqual(c.calls.killSession, [], 'the dead pane is still the post-mortem');
+  assert.deepEqual(c.calls.spawnLead, []);
+  assert.deepEqual(c.calls.resumeLead, []);
+});
+
+test('a lead still waiting is not this tick\'s launch, so admission goes ahead', async () => {
+  const { tick } = await load('backoff-admit-' + Date.now());
+  const c = ctx({ fleet: { tasks: [waiting(1, MIN), row({ id: 'b', status: 'queued' })] }, alive: new Set() });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.resumeLead, [], 'a is waiting');
+  assert.deepEqual(c.calls.spawnLead, ['b'], 'so the one launch this tick allows is b\'s');
+  assert.equal(c.task('b').status, 'spawned');
+  assert.equal(c.task('a').status, 'spawned', 'a keeps its slot while it waits');
+});
+
+test('a revived_at in the future holds nothing: the lead is revived at once and re-stamped from the corrected clock', async () => {
+  const { tick } = await load('backoff-future-' + Date.now());
+  // A year ahead: the clock stepped back since the last revival, or the row was edited by hand.
+  // Held against it, this lead would sit dead in its slot, with nothing logged, for a year and an
+  // hour. Revived now, it is stamped from this clock, and every later wait is bounded again.
+  const c = ctx({ fleet: { tasks: [waiting(2, -365 * 24 * 60 * MIN)] }, alive: new Set() });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'LEAD_DEAD').payload.attempts, 2);
+  assert.deepEqual(c.calls.killSession, ['lead-a']);
+  assert.deepEqual(c.calls.resumeLead, ['a']);
+  assert.equal(c.task().attempts, 3);
+  assert.equal(c.task().revived_at, NOW);
+});
+
+test('a revived_at that is not a time is refused by name, before anything is spent', async () => {
+  const { tick } = await load('backoff-bad-' + Date.now());
+  const c = ctx({ fleet: { tasks: [waiting(1, 0, { revived_at: 'soon' })] }, alive: new Set() });
+  await tick(c.deps);
+  const err = oneEvent(c, 'WATCHDOG_ERROR');
+  assert.equal(err.lead, 'a');
+  assert.equal(err.payload.where, 'revival');
+  assert.match(err.payload.error, /revived_at/);
+  assert.deepEqual(eventsOf(c, 'LEAD_DEAD'), []);
+  assert.deepEqual(c.calls.capturePane, []);
+  assert.deepEqual(c.calls.killSession, []);
+  assert.deepEqual(c.calls.resumeLead, []);
+  assert.equal(c.task().attempts, 1, 'no attempt is charged on a stamp nobody can read');
+});
+
 // ════════════════════════ The pane census ════════════════════════
 //
 // `status` is the lifecycle word and stays untouched. What the PANE shows is a second field,

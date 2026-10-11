@@ -202,6 +202,70 @@ test('planRevival reads zero_tail_rows without letting it move the verdict', asy
   assert.throws(() => planRevival({ attempts: 0 }, { zero_tail_rows: 3 }, cfg), /live_context is missing/);
 });
 
+// The backoff between revivals. Without it every 30 s tick could revive, so a lead that dies
+// for a persistent reason spent its three attempts in about 90 s, before anyone could read the
+// death screen. `revivalWaitMs` is the ms still to wait, measured from the row's `revived_at`.
+const RW_NOW = 1_352_844_800_000;
+const RW_MIN = 60_000;
+
+test('revivalWaitMs: the first revival is immediate, the second waits 15 minutes and the third an hour, from revived_at', async () => {
+  const { revivalWaitMs, REVIVAL_BACKOFF_MS } = await import('../bin/lib/wd/revive.mjs?backoff-' + Date.now());
+  // The schedule, one entry per attempt already spent, and nobody's to edit at run time.
+  assert.deepEqual(REVIVAL_BACKOFF_MS, [0, 15 * RW_MIN, 60 * RW_MIN]);
+  assert.equal(Object.isFrozen(REVIVAL_BACKOFF_MS), true);
+  // The first revival waits for nothing, a stamp included.
+  assert.equal(revivalWaitMs({ attempts: 0 }, RW_NOW), 0);
+  assert.equal(revivalWaitMs({}, RW_NOW), 0);
+  assert.equal(revivalWaitMs({ attempts: 0, revived_at: RW_NOW - 1 }, RW_NOW), 0);
+  // The second: 15 minutes after the first, to the millisecond.
+  assert.equal(revivalWaitMs({ attempts: 1, revived_at: RW_NOW - RW_MIN }, RW_NOW), 14 * RW_MIN);
+  assert.equal(revivalWaitMs({ attempts: 1, revived_at: RW_NOW - 15 * RW_MIN + 1 }, RW_NOW), 1);
+  assert.equal(revivalWaitMs({ attempts: 1, revived_at: RW_NOW - 15 * RW_MIN }, RW_NOW), 0);
+  assert.equal(revivalWaitMs({ attempts: 1, revived_at: RW_NOW - 9 * 60 * RW_MIN }, RW_NOW), 0);
+  // The third: an hour after the second, so 15 minutes is not enough.
+  assert.equal(revivalWaitMs({ attempts: 2, revived_at: RW_NOW - 15 * RW_MIN }, RW_NOW), 45 * RW_MIN);
+  assert.equal(revivalWaitMs({ attempts: 2, revived_at: RW_NOW - 60 * RW_MIN + 1 }, RW_NOW), 1);
+  assert.equal(revivalWaitMs({ attempts: 2, revived_at: RW_NOW - 60 * RW_MIN }, RW_NOW), 0);
+  // Capped at the hour. Past the schedule the step stays an hour and never grows; GAVE_UP itself
+  // is the tick's to decide, before this is asked, and it is not delayed.
+  assert.equal(revivalWaitMs({ attempts: 3, revived_at: RW_NOW - RW_MIN }, RW_NOW), 59 * RW_MIN);
+  assert.equal(revivalWaitMs({ attempts: 7, revived_at: RW_NOW - RW_MIN }, RW_NOW), 59 * RW_MIN);
+  // A hand-edited numeric string is honoured, as `attempts` is everywhere in this module.
+  assert.equal(revivalWaitMs({ attempts: '1', revived_at: String(RW_NOW - RW_MIN) }, RW_NOW), 14 * RW_MIN);
+});
+
+test('revivalWaitMs: an absent revived_at is no wait, and one that is not a time is refused by name', async () => {
+  const { revivalWaitMs } = await import('../bin/lib/wd/revive.mjs?backoff-shape-' + Date.now());
+  // A row revived before the stamp existed carries attempts and no `revived_at`. It is not held:
+  // the revival it gets stamps the row, so the leniency costs at most one early revival.
+  assert.equal(revivalWaitMs({ attempts: 2 }, RW_NOW), 0);
+  assert.equal(revivalWaitMs({ attempts: 2, revived_at: null }, RW_NOW), 0);
+  // Present and unreadable is a hand edit or a torn write. Read as "no stamp" it would revive at
+  // once; read as 0 (the epoch) it would too. Neither is the row's history, so it is named.
+  for (const bad of ['soon', '', -1, Number.NaN, Number.POSITIVE_INFINITY, {}, [], true]) {
+    assert.throws(() => revivalWaitMs({ attempts: 1, revived_at: bad }, RW_NOW), /revivalWaitMs: task\.revived_at must be a non-negative finite number/, String(bad));
+  }
+  // Refused even when no wait is owed, so a bad stamp is reported on the first tick it is read.
+  assert.throws(() => revivalWaitMs({ attempts: 0, revived_at: 'soon' }, RW_NOW), /task\.revived_at/);
+  assert.throws(() => revivalWaitMs({ attempts: 'many', revived_at: RW_NOW }, RW_NOW), /revivalWaitMs: task\.attempts must be a non-negative finite number/);
+  assert.throws(() => revivalWaitMs({ attempts: -1 }, RW_NOW), /task\.attempts/);
+  assert.throws(() => revivalWaitMs({ attempts: 1, revived_at: RW_NOW - RW_MIN }, undefined), /revivalWaitMs: now must be a non-negative finite number/);
+});
+
+test('revivalWaitMs: a stamp in the future holds nothing, so no wait outlasts one step from the tick that reads it', async () => {
+  const { revivalWaitMs } = await import('../bin/lib/wd/revive.mjs?backoff-future-' + Date.now());
+  // The clock stepped back after the last revival, or a hand edit put the stamp ahead. Measured
+  // against it, the wait would be the step plus however far ahead the stamp is: no bound at all, and
+  // spent in silence with the slot held. So it holds nothing: the revival goes now, and stamps the
+  // row again from the corrected clock.
+  assert.equal(revivalWaitMs({ attempts: 1, revived_at: RW_NOW + 1 }, RW_NOW), 0);
+  assert.equal(revivalWaitMs({ attempts: 2, revived_at: RW_NOW + 10 * RW_MIN }, RW_NOW), 0);
+  assert.equal(revivalWaitMs({ attempts: 2, revived_at: RW_NOW + 365 * 24 * 60 * RW_MIN }, RW_NOW), 0);
+  // A stamp at exactly now is the present, not the future: the whole step is owed.
+  assert.equal(revivalWaitMs({ attempts: 1, revived_at: RW_NOW }, RW_NOW), 15 * RW_MIN);
+  assert.equal(revivalWaitMs({ attempts: 2, revived_at: RW_NOW }, RW_NOW), 60 * RW_MIN);
+});
+
 // ─────────────────────────── budget ───────────────────────────
 
 test('checkBudget binds the five real budget classes from DEFAULTS', async () => {

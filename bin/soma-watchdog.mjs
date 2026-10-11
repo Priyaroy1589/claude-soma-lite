@@ -99,7 +99,7 @@ import { checkBudget, tripPath, warnPath } from './lib/wd/budget.mjs';
 import { classifyLimit } from './lib/wd/limit-state.mjs';
 import { CAPTURE_TIMEOUT_MS, CENSUS_LINES, takeCensus } from './lib/wd/pane-state.mjs';
 import { reconcile } from './lib/wd/reconcile.mjs';
-import { planRevival } from './lib/wd/revive.mjs';
+import { planRevival, revivalWaitMs } from './lib/wd/revive.mjs';
 // Every rotation event this file writes goes through these builders. `rotationFailed` is
 // consumed by the revert's `revertRotation`; it is imported here so the line is written once and
 // the revert needs no import of its own.
@@ -843,11 +843,11 @@ export async function tick(deps) {
 }
 
 /**
- * Bring one dead lead back, or give up on it. Returns whether a session was launched.
+ * Bring one dead lead back, wait, or give up on it. Returns whether a session was launched.
  *
  * Ordering is the whole of the kill-before-respawn rule and every step of it is forced:
  *
- *   capture → LEAD_DEAD → attempts → killSession → respawn
+ *   giveup? → backoff → seat → capture → LEAD_DEAD → attempts + revived_at → killSession → respawn
  *
  * The kill destroys the pane, so the final screen must be read BEFORE it (`logs/<id>.log` is a
  * real file written by `pipe-pane` and survives; the live screen does not). The kill must come
@@ -856,7 +856,8 @@ export async function tick(deps) {
  * silently reusing a session name makes the pane, the log target, the heartbeat and the
  * liveness read ambiguous at once — and `remain-on-exit` means it exists for a *dead* lead too,
  * so without this kill every revival respawn is blocked permanently. `attempts` is stamped
- * before the launch so a launch that throws still counts toward the three.
+ * before the launch so a launch that throws still counts toward the three, and `revived_at` is
+ * stamped in the same transaction, so a launch that throws still times the next attempt.
  */
 function revive(deps, cfg, task, history, now, paneState = null) {
   const id = task.id;
@@ -888,6 +889,18 @@ function revive(deps, cfg, task, history, now, paneState = null) {
     }
     return false;
   }
+
+  // The backoff (`wd/revive.mjs`): the second revival comes no sooner than 15 minutes after the
+  // first and the third no sooner than an hour after the second, timed from the row's `revived_at`
+  // (a stamp in the future holds nothing). Without it every 30 s tick could revive, and a lead
+  // dying for a persistent reason gave up in about 90 s, before anyone could look. AFTER the giveup
+  // branch, so GAVE_UP is never held, and BEFORE anything is spent: while the lead waits, nothing
+  // is captured, logged, charged or killed, so its dead pane stays up as the death screen
+  // `soma peek` shows, and the LEAD_DEAD that reads it comes at the relaunch. The row stays
+  // `spawned` and keeps its slot, and the false hands this tick's one launch back to admission. A
+  // stamp `revivalWaitMs` cannot read throws here, before the seat pick, and costs the lead the
+  // same nothing.
+  if (revivalWaitMs(task, now) > 0) return false;
 
   // Where the relaunch will go, decided BEFORE anything is spent. Onto an open seat, like every
   // launch (design §4); with every seat closed the row's OWN seat is used, closed as it is — the
@@ -929,13 +942,19 @@ function revive(deps, cfg, task, history, now, paneState = null) {
     lead: id,
   });
 
+  // ONE transaction for the charge and the stamp. Two would leave a window in which the attempt is
+  // charged with no stamp beside it, and a revival read in it would go at once.
   const attempt = attempts + 1;
   deps.updateFleet((live) => {
     const r = (Array.isArray(live?.tasks) ? live.tasks : []).find((x) => x?.id === id);
-    if (r) r.attempts = attempt;
+    if (r) {
+      r.attempts = attempt;
+      r.revived_at = now;
+    }
     return true;
   });
   task.attempts = attempt;
+  task.revived_at = now;
 
   deps.killSession(sessionName(id));
 

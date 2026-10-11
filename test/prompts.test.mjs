@@ -647,11 +647,14 @@ const PROMPT_RULES = {
         // The pins are per-row and clause-shaped for the reason the final review recorded: a
         // section-wide pin on `/watchdog/` is satisfied by any of the eight other rows, and a
         // single alternation across a row's two clauses leaves either one deletable.
-        { at: /`LEAD_DEAD`/, why: 'a death and its relaunch, and how fast the attempts burn', pins: [
+        { at: /`LEAD_DEAD`/, why: 'a death and its relaunch, and how far apart the attempts are', pins: [
           ['that the watchdog already relaunched it', /relaunched/i],
           ['the attempt budget', /[Tt]hree\s+attempts/],
           ['what the last one becomes', /GAVE_UP/],
-          ['and that the three are not spaced out', /no\s+cooldown/i],
+          ['the backoff', /15\s+minutes[\s\S]{0,60}?an\s+hour/i],
+          ['that nothing is logged while a lead waits', /nothing\s+is\s+logged/i],
+        ], no: [
+          ['the retired claim that nothing spaces the attempts', /no\s+cooldown/i],
         ] },
         { at: /`BLOCKED`/, why: 'a freed slot, and how the lead gets back in', pins: [
           ['what elapsed', /blocked_slot_minutes/],
@@ -715,6 +718,7 @@ const PROMPT_RULES = {
         { at: /`LEAD_DEAD_SHELL`/, why: 'a pane that is a shell, and the two moves by status', pins: [
           ['what the pane is', /bare\s+shell/i],
           ['that the spawned case is the watchdog\'s', /revived\s+by\s+the\s+watchdog/i],
+          ['that a recent relaunch waits out its backoff', /backoff/i],
           ['that the other rows are the orchestrator\'s', /soma_kill/],
           ['then re-queue', /re-queue/i],
           ['the ban', /[Nn]ever\s+`?soma_send`?/],

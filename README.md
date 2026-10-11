@@ -791,8 +791,6 @@ details.
   contract. `soma_send` it a pointer to `soma_task()`.
 - **There is no digest composer.** `soma_digest` refuses, `digests/` stays empty, and `soma digest`
   prints the raw event log.
-- **No revival cooldown.** A lead that dies for a persistent reason uses all three revival attempts
-  in about 90 seconds and lands on `GAVE_UP`. Read the death screen in the `LEAD_DEAD` event.
 - **A tripped budget cannot be cleared by any verb or tool.** `rm "$SOMA_HOME/leads/<id>/BUDGET_TRIPPED"`
   or kill the lead.
 - **`soma up` does not run doctor.** A fleet can open on a machine with a failing check.
@@ -815,7 +813,7 @@ details.
 | a lead's status line says `Not logged in` | an environment name that auth needs did not reach the lead | `USER` is on both allow-lists in this build; re-prove `oauthUnderEnvI` after Claude Code upgrades |
 | a lead is alive but silent forever | its budget breaker tripped, and **no verb clears it** | `rm "$SOMA_HOME/leads/<id>/BUDGET_TRIPPED"`, or `soma kill <lead>` |
 | a lead sits on `Do you want to proceed?` after a `cd … && grep …` | the Claude Code build prompts under bypass (2.1.259 did); doctor's `claude cd-compound read runs` is `FAIL` | move the lead to a fixed build. If it must stay, `touch "$SOMA_HOME/leads/<id>/CD_COMPOUND_ASKS"` arms the gate to deny that shape with a fix-it reason; `rm` it afterwards |
-| a lead hit `GAVE_UP` in about 90 s | **no revival cooldown**: consecutive ticks burn all 3 attempts | read the death screen in the `LEAD_DEAD` event, not the `GAVE_UP` row; `soma peek` still has the pane |
+| a dead lead's pane stays up, with no `LEAD_DEAD`, for up to an hour | the revival backoff: the first relaunch is immediate, the second comes no sooner than 15 minutes after the first, and the third no sooner than an hour after the second. Nothing is logged while a lead waits | read the death screen with `soma peek <lead>`. The row stays `spawned` and keeps its slot; `LEAD_DEAD` and `REVIVED` arrive at the relaunch, and `GAVE_UP` after the third attempt is not delayed |
 | a lead forgot its instructions | the `PostCompact` hook exists, but **nothing registers it** | `soma send <lead> "Call soma_task() and re-read your brief."` |
 | a lead is stuck on `Quick safety check` | the wrong `.claude.json` was read, so the worktree had no trust mark | always go through your wrapper, so `CLAUDE_CONFIG_DIR` reaches the watchdog |
 | `LEAD_BLOCKED_ON_PROMPT`, or `PANE prompt` in `soma status` | the lead hit a permission or trust dialog, or is asking you a question (`pane_kind: question`) | answer it at the pane: `soma attach <lead>`. **Never `soma send` it**: the Enter approves the pending command. Escape at the pane declines *and* stops the turn, so follow with an instruction |
@@ -889,7 +887,7 @@ build. Re-prove the RUNBOOK §10 invariants after every upgrade.
 
 - **Finishing the operator experience (v1.x):** the digest composer; `hold`/`release` and `gc`; a way
   to clear a tripped budget; installers for the inject and `PostCompact` hooks; `soma up` running
-  doctor; a revival cooldown; the live canary driver; a writeback ledger; case- and
+  doctor; storm-aware revival; the live canary driver; a writeback ledger; case- and
   quote-insensitive credential matching in the gate; notification coalescing; `meta.json` and the
   per-task `base_sha`.
 - **Account rotation, declared out of scope for now:** detecting the orchestrator's own usage

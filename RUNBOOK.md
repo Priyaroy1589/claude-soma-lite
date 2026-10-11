@@ -614,6 +614,16 @@ The watchdog tick (default 30 s) does seven things:
 1. **Liveness, reconcile, revival.** Reads panes, not session names — `remain-on-exit` keeps a dead
    lead's session alive on purpose, because that pane *is* the death scene. A dead lead gets its
    final screen captured, a `LEAD_DEAD` event, then resume-or-fresh-respawn, up to 3 attempts.
+   The attempts are spaced out, so that you can read a death screen before the next attempt
+   replaces it: the first revival is immediate, the second comes no sooner than 15 minutes after
+   the first, and the third no sooner than an hour after the second, timed from the previous
+   relaunch (the row's `revived_at`, written in the same transaction as `attempts`). While a lead
+   waits, its row stays `spawned` and keeps its slot, nothing is logged, and `soma peek <lead>`
+   shows the death screen; `LEAD_DEAD` and `REVIVED` come at the relaunch, as before. `GAVE_UP`
+   after the third attempt is not delayed. A row last revived before `revived_at` existed is not
+   held, and the revival it gets stamps it. A `revived_at` in the future (the clock stepped back)
+   holds nothing: the lead is revived at once and stamped again from the corrected clock, so no
+   dead lead waits longer than its step (15 minutes or an hour) from the tick that finds it dead.
    A `spawned` row whose pane the census read as a bare shell is dead here too (its `LEAD_DEAD`
    carries `pane_state: dead_shell`); a shell on any other row is surfaced and left standing —
    killing a finished lead's pane is the unbuilt `linger_minutes` reaper's job.
@@ -682,7 +692,8 @@ consulted)` and proceeds. There is no `inbox` subcommand.
 > that is not `failed`/`skipped`, kills the lingering session, sets the row `queued` and logs
 > `RETRIED`. What it does *not* do is force worktree recreation — the `-r2` path is the worktree
 > layer's own behaviour on a dirty reuse. Same for **reconcile-driven revival**, which the ROADMAP
-> lists as v1.x and which the shipped tick fully wires (`resumeLead`/`spawnLead`, 3 attempts).
+> once listed as v1.x and which the shipped tick fully wires (`resumeLead`/`spawnLead`, 3 attempts
+> spaced out as §6.3 says).
 >
 > And **`thaw` is built**: the shipped arm lifts an org spend-cap freeze (it clears
 > `state/backpressure.json`) and refuses a live storm — §9. `docs/ROADMAP.md` now records only the half
@@ -930,8 +941,9 @@ recorded in `docs/ROADMAP.md` as v1.x.
 | **A tripped budget cannot be cleared.** Nothing unlinks `leads/<id>/BUDGET_TRIPPED` — no CLI verb, no MCP tool — and the deny message tells the lead *"Ask the orchestrator to clear the trip"*, which the orchestrator has no way to do. | A tripped lead is alive, holding its slot, and able to call nothing but the bus. It will ask, and nothing can answer. | Delete the file by hand (`rm "$SOMA_HOME/leads/<id>/BUDGET_TRIPPED"`) or `soma kill` the lead. There is no third option. |
 | **`soma up` never calls doctor.** Spec §13's "the queue refuses to open until all three pass" is not enforced anywhere; `runDoctor` is reachable only through `soma doctor`. | A fleet opens on a machine with a failing MCP-deny-drift check, an erased guard file, or unauthenticated `gh`. This is **wider than the `--canary` gap in §5.4**. | Run `soma doctor` yourself, every time, before `soma up`. Treat the golden path in §5 as three commands and not two. |
 | **`serialize_with` does not exist.** The orchestrator prompt used to instruct it; `soma_enqueue`'s schema sets `additionalProperties:false` and omits it, and admission is pure FIFO. The instruction is removed as of this branch. | Two tickets touching one module get two leads and two draft PRs that fight. | Enqueue same-module tickets one at a time — the second after the first reports `COMPLETED`. The orchestrator prompt now says so. |
-| **No revival cooldown.** The 1-hour backoff the design pairs with the 3-attempt limit is not implemented. | A lead that dies for a persistent reason (bad credential, wedged repo) burns **all three revival attempts in about 90 seconds** of consecutive ticks and lands on `GAVE_UP` before you can look at it. | Read the `LEAD_DEAD` payload's captured death screen rather than the `GAVE_UP`. `soma peek` still has the pane. |
 | **A Claude Code build that prompts under bypass** (the stalled-lead incident). Claude Code 2.1.259 raised a bypass-immune permission prompt on `cd <dir> && grep <relative file>` whenever a `Read()` deny existed — leads carry 13 — and `tested_claude` admits patch releases by design. 2.1.263 fixed it; the fleet cannot tell which build a lead runs from inside a hook. | A lead or teammate sits on `Do you want to proceed?` with nobody at the pane: measured 79 stalls summing 214 hours, the worst 40 hours, all on 2.1.259. `soma doctor`'s `claude cd-compound read runs` check is **FAIL** on such a build. | Cycle the leads onto a fixed build (`soma kill` + `soma_resume` relaunches `claude` from PATH). If the fleet must keep running on the asking build, arm the gate's emergency lever **per lead**: `touch "$SOMA_HOME/leads/<id>/CD_COMPOUND_ASKS"` — the PreToolUse gate then denies the asking shape with a reason that says what to type instead (one retry turn per matching call, ~14% of Bash calls on a 2.1.259-class build) — and `rm` the flag once the lead is on a fixed build. Unarmed it costs nothing and does nothing; never leave it armed on a build that does not ask. |
+
+The **revival cooldown** is no longer on this list: it ships, and §6.3 gives the schedule.
 
 ---
 

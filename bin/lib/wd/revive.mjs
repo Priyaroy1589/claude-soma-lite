@@ -2,13 +2,24 @@
  * Revival policy for a lead whose tmux session is gone: `resume` | `fresh` | `giveup`.
  *
  * Pure: a task row, a usage reading and the config in, one word out. The tick captures
- * the death scene, performs the respawn and stamps `attempts`; this only decides which
- * of the three it is, and it decides the same way every time for the same inputs.
+ * the death scene, performs the respawn and stamps `attempts` and `revived_at`; this only
+ * decides which of the three it is, and `revivalWaitMs` below decides when, and both decide
+ * the same way every time for the same inputs.
  *
  * - **`giveup` after 3 attempts.** Design §10: resume-first, 3 attempts, then one
  *   GAVE_UP event and a toast. An unbounded revival loop on a lead that dies during
  *   startup is a quota leak that looks like progress, so the cap outranks everything
  *   else — a saturated *and* exhausted lead is `giveup`, not `fresh`.
+ *
+ * - **A backoff between the attempts, and none before GAVE_UP.** The design pairs the three
+ *   attempts with a cooldown of up to an hour, and that pairing is what makes three safe:
+ *   without it every 30 s tick could revive, so a lead dying for a persistent reason (a bad
+ *   credential, a broken worktree) spent all three in about 90 s and gave up before anyone
+ *   could read its death screen. `revivalWaitMs` is the half that says when. It is a second
+ *   function rather than a fourth word here because `planRevival` is asked without a clock
+ *   (`exhausted()` asks it about admission's spawn failures, which have no revival to time),
+ *   and because a wait is not a plan: the plan is what happens once the wait is over. GAVE_UP
+ *   is never held: the dead pane it leaves standing is already the post-mortem.
  *
  * - **`fresh` over `resume` once the context is saturated.** `--resume` replays a
  *   session's own history into its context window; past `resumeContextLimit(cfg)` (700k of
@@ -88,6 +99,15 @@ import { resumeContextLimit } from '../tokens.mjs';
 const MAX_ATTEMPTS = 3;
 
 /**
+ * The wait before each revival, indexed by the attempts already spent and timed from the previous
+ * relaunch: the first revival is immediate, the second comes no sooner than 15 minutes after the
+ * first, the third no sooner than an hour after the second (four times the step before, capped at
+ * the design's hour). One entry per attempt `MAX_ATTEMPTS` allows. Frozen, because every later
+ * revival reads it. Exported for the tests.
+ */
+export const REVIVAL_BACKOFF_MS = Object.freeze([0, 15 * 60_000, 60 * 60_000]);
+
+/**
  * @param {{attempts?: number}} task the fleet row for the dead lead — `attempts` is
  *   genuinely optional: absent means never revived, which reads as 0
  * @param {{live_context: number, zero_tail_rows?: number}|null} usage `readUsage()` for its
@@ -111,6 +131,49 @@ export function planRevival(task, usage, cfg) {
   if (attempts >= MAX_ATTEMPTS) return 'giveup';
   if (live >= limit) return 'fresh';
   return 'resume';
+}
+
+/**
+ * How long the dead lead on `task` must still wait before its next revival, in ms; 0 means go.
+ *
+ * Measured from `task.revived_at`, the tick's clock at the previous relaunch, which the tick stamps
+ * in the same transaction as `attempts`: two writes would leave a window in which an attempt is
+ * charged with no stamp beside it, and a revival read in that window would go at once. The step is
+ * `REVIVAL_BACKOFF_MS` at the attempts already spent, so a first revival never waits, and past the
+ * schedule the step stays at the hour. The tick asks this only once `planRevival` has answered
+ * something other than `giveup`, which is never held.
+ *
+ * The same absent-versus-garbage rule as `attempts`:
+ *
+ * - **An absent `revived_at` is no wait.** That is a row never revived, or one revived before the
+ *   stamp existed. The leniency is bounded: the revival it gets stamps the row, so it costs at most
+ *   one early revival.
+ * - **A present one that is not a non-negative finite number is refused by name**, even when no
+ *   wait is owed, so a bad stamp is reported on the first tick that reads it. A hand-edited numeric
+ *   string is honoured, as `attempts` is, and nothing is coerced: read as "no stamp", garbage would
+ *   revive at once, and read as 0 (the epoch) it would too. Neither is the row's history.
+ *
+ * **A stamp in the future holds nothing.** The clock stepped back after the relaunch, or a hand edit
+ * put the stamp ahead, and either way the time since the relaunch cannot be read off this clock.
+ * Measured against it anyway, the wait is the step plus however far ahead the stamp is, which has no
+ * bound, and is spent in silence with the slot held. This is asked again on every tick, so capping
+ * the returned number would change nothing about when the revival happens. So the revival goes now,
+ * and its stamp comes from the corrected clock. That is the bound this function keeps: a dead lead
+ * never waits more than one step from the tick that finds it dead. What it costs is one early
+ * revival per backward step of the clock, and that revival is logged like any other.
+ *
+ * @param {{attempts?: number, revived_at?: number}} task the fleet row for the dead lead
+ * @param {number} now the tick's clock, in ms
+ * @returns {number} the ms still to wait; 0 means revive now
+ */
+export function revivalWaitMs(task, now) {
+  const at = reqNum('revivalWaitMs: now', now);
+  const attempts = task?.attempts == null ? 0 : reqNum('revivalWaitMs: task.attempts', task.attempts);
+  if (task?.revived_at == null) return 0;
+  const stamp = reqNum('revivalWaitMs: task.revived_at', task.revived_at);
+  if (stamp > at) return 0;
+  const step = REVIVAL_BACKOFF_MS[Math.min(Math.floor(attempts), REVIVAL_BACKOFF_MS.length - 1)];
+  return Math.max(0, stamp + step - at);
 }
 
 /**
