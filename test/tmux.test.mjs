@@ -631,8 +631,14 @@ test('against a real tmux: serverAbsent reads a never-started and a killed serve
   assert.ok(socketPath.startsWith(realpathSync(dir)), `expected a socket inside the sandbox, got ${socketPath}`);
 
   // kill-server: the server is gone, its socket file stays behind (measured on 3.6a), and a connect
-  // to it is refused — tmux's OTHER sentence, "no server running on …".
+  // to it is refused — tmux's OTHER sentence, "no server running on …". Gone once it has finished
+  // exiting, that is: kill-server returns first, and a server on its way out drops a client
+  // unanswered, "server exited unexpectedly", which serverAbsent deliberately does not read as
+  // absent (issue #43). So the wait is bounded, and a server that never goes still fails.
   assert.equal(t.defaultRun(['kill-server']).code, 0);
+  for (const deadline = Date.now() + 5000; !t.serverAbsent() && Date.now() < deadline;) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
   assert.equal(t.serverAbsent(), true, `after kill-server — tmux said: ${said()}`);
   if (existsSync(socketPath)) assert.match(said(), /^no server running on /, 'a stale socket file must be the path this exercised');
 });

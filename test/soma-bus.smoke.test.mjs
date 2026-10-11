@@ -350,14 +350,27 @@ test('paneOnServer needs both halves of one answer: the pane it asked about, on 
   assert.deepEqual(spawned, [], 'nothing to prove costs no tmux call');
 });
 
-test('a pane on a server that is not running is a gone pane, and no path reaches the caller', { skip: !tmuxInstalled && 'tmux not installed' }, (t_) => {
+test('a pane on a server that is not running is a gone pane, and no path reaches the caller', { skip: !tmuxInstalled && 'tmux not installed' }, async (t_) => {
   const name = `t12-noserver-${process.pid}`;
   const pane = livePane(name);
   if (!pane) return t_.skip('tmux could not start a session here');
   tmux.defaultRun(['kill-server']);
   sessions.clear();
+  // kill-server returns before the server has finished exiting. A probe in that window reaches a
+  // server on its way out, which drops it unanswered: tmux says "server exited unexpectedly", not
+  // "no server running" (issue #43, seen on loaded hosts). Stdout is empty then too, so the pane
+  // already reads gone...
+  assert.equal(bus.hasPane(pane), false, 'the pane reads gone the moment kill-server returns, whatever tmux says then');
 
-  const probe = tmux.defaultRun(['display-message', '-p', '-t', pane, '#{pane_id}']);
+  // ...and the sentence below is the one tmux says once the server has gone, so the same probe is
+  // re-run, bounded, until it says it. A server that never goes away still fails the match, with
+  // the last thing tmux said.
+  const probeOnce = () => tmux.defaultRun(['display-message', '-p', '-t', pane, '#{pane_id}']);
+  let probe = probeOnce();
+  for (const deadline = Date.now() + 5000; !/no server running/.test(probe.stderr) && Date.now() < deadline;) {
+    await new Promise((r) => setTimeout(r, 50));
+    probe = probeOnce();
+  }
   assert.equal(probe.code, 1);
   assert.equal(probe.stdout, '', 'the "no server running on <socket path>" line is stderr, not stdout');
   assert.match(probe.stderr, /no server running/);
