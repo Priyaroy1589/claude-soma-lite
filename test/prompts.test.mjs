@@ -806,7 +806,9 @@ const PROMPT_RULES = {
       heading: /^##\s+Writeback\b/, label: 'writeback',
       headPins: [
         ['that a writeback is a comment and nothing else', /comment-only/i],
-        ['and that posting twice is the failure mode', /(ledger|idempotent)/i],
+        // The heading used to say "ledgered" too. Nothing in this build keeps a writeback ledger, so
+        // the heading may not claim one; the body's ledger claims are banned by shape in the rule below.
+        ['and that posting twice is the failure mode, with no ledger claimed', /^(?![\s\S]*ledger)[\s\S]*idempotent/i],
       ],
       rules: [
         { at: /\*\*Jira\*\*/, why: 'the Jira writeback', pins: [
@@ -826,12 +828,27 @@ const PROMPT_RULES = {
           ['the ban', /never\s+edited/i],
           ['and who applies the snippet instead', /operator\s+applies/i],
         ] },
-        { at: null, why: 'the writeback ledger', pins: [
+        // The duplicate check, and the record of what was posted. This rule used to pin a writeback
+        // LEDGER: two events, `WRITEBACK_OK` and `WRITEBACK_FAILED`, that the orchestrator was told to
+        // "append yourself", and a digest said to render from them. No orchestrator tool can append
+        // an arbitrary event and nothing in `bin/` writes either type, so it now pins what is true:
+        // the comments already on the target are the only record, and a failed comment goes to the
+        // operator. The old claims are banned by shape, so a partial edit cannot leave one behind.
+        { at: null, why: 'the duplicate check, and the record nothing in this build keeps', pins: [
           ['checked before posting', /before\s+posting/i],
+          ['against the target’s own comments for the PR URL', /target['’]s\s+existing\s+comments\s+for\s+the\s+PR\s+URL/i],
           ['why', /double-comment/i],
-          ['the success event', /WRITEBACK_OK/],
-          ['the failure event', /WRITEBACK_FAILED/],
-          ['and that the digest reads the ledger, not optimism', /ledger,\s*not\s*\n?\s*from\s+optimism/i],
+          // One clause, three facts, inside one paragraph: nothing records it, there is no event to
+          // append, and there is no tool that could append one.
+          ['that nothing records a writeback, with no ledger event and no tool to append one',
+            /\bnothing\b(?:(?!\n\s*\n)[\s\S]){0,40}?\brecords?\s+(?:a\s+|any\s+)?writebacks?\b(?:(?!\n\s*\n)[\s\S]){0,80}?\bno\s+ledger\s+event\b(?:(?!\n\s*\n)[\s\S]){0,80}?\bno\s+tool\b/i],
+          ['and that a failed comment goes to the operator', /\bfail(?:ed|s|ure)?\b(?:(?!\n\s*\n)[\s\S]){0,100}?\btell\s+the\s+operator\b/i],
+        ], no: [
+          ['a ledger event the orchestrator is told to append', /WRITEBACK_(?:OK|FAILED)/],
+          ['the instruction to append it', /append\s+the\s+ledger\s+event/i],
+          ['a ledger to check before posting', /WRITEBACK\s+ledger/i],
+          ['a digest said to render from that ledger', /ledger,\s*not\s+from\s+optimism/i],
+          ['a "re-auth needed" toast that nothing sends', /re-auth\s+needed["”]?\s+toast/i],
         ] },
       ],
     },
@@ -868,7 +885,14 @@ const PROMPT_RULES = {
           ['draft PRs only', /[Dd]raft\s+PRs?\s+only/],
           ['through the wrapper', /soma-pr/],
           ['one worktree per task', /[Oo]ne\s+worktree\s+per\s+task/],
-          ['and escalation rather than a guess', /NEEDS_INPUT/],
+          // Escalation goes to the operator, in the orchestrator's own words. This used to read "a
+          // `NEEDS_INPUT` digest entry and a toast", and the orchestrator can produce neither: no
+          // tool of its own appends an event or sends a toast, and the digest composer is not built.
+          ['and escalation to the operator rather than a guess', /\bescalate\b[^.]{0,40}?\bto\s+the\s+operator\b[^.]{0,120}?\bnot\s+a\s+guess\b/i],
+        ], no: [
+          ['a digest entry the orchestrator cannot write', /digest\s+entry/i],
+          ['a toast the orchestrator cannot send', /\btoast\b/i],
+          ['a NEEDS_INPUT digest', /`NEEDS_INPUT`\s+digest/],
         ] },
       ],
     },

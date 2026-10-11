@@ -170,8 +170,8 @@ test('step one adopts, and a refusal names the holder and offers force on the op
   }
   assert.match(s1, /force:\s*true/, 'the skill must offer the documented steal, soma_adopt({force: true})');
 
-  // The most safety-critical line in the artifact. A force-steal send-keys a demotion notice
-  // into a live session, appends DEMOTED, and cuts that session's event feed mid-flight: the
+  // The most safety-critical line in the artifact. A force-steal send-keys a DEMOTED notice
+  // into a live session and cuts that session's event feed mid-flight: the
   // operator's call, never the model's. Asserted twice, and the second is the load-bearing one:
   // `near` is a substring of `s1`, so the windowed match implies the section-wide one and the
   // first assertion can never be the sole failure. It is kept for its message — "no gate at all"

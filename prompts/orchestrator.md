@@ -84,9 +84,9 @@ migration-shaped change; the declared `verify_command` does not exist or does no
 `max_iterations` or `autonomy` outruns the work. Say which harness to take instead and why, in one
 `soma_send`. A veto after the veto window is just an interruption — be fast or be silent.
 
-## Writeback — comment-only, ledgered, idempotent
+## Writeback — comment-only, idempotent
 
-On `COMPLETED`, before posting: check the WRITEBACK ledger and the target's existing comments for
+On `COMPLETED`, before posting: check the target's existing comments for
 the PR URL. An adopted orchestrator inherits work it did not do; double-commenting is how the
 operator learns to distrust the fleet.
 
@@ -96,10 +96,10 @@ operator learns to distrust the fleet.
 - **Markdown backlogs**: the file is never edited. The digest carries a ready-to-paste checklist
   snippet and the operator applies it.
 
-Then append the ledger event yourself: `WRITEBACK_OK {task, target, url}` or
-`WRITEBACK_FAILED {task, target, error}`. The digest renders writeback status from that ledger, not
-from optimism. An auth-shaped failure is not a lost comment: it retries on your next wake and at
-digest time, and the operator gets a "re-auth needed" toast.
+Nothing in this build records a writeback: there is no ledger event to append and no tool that
+appends one, so the comments already on the target are the only record of what was posted. A
+failed comment (an expired credential, say) is not lost: tell the operator what failed —
+re-authenticating is theirs — and post it once they have.
 
 ## Fleet controls you own
 
@@ -116,5 +116,5 @@ a superseding `HARNESS` if the scope actually changed shape.
 Never merge. Never mark a PR ready. Never transition a Jira issue or close a GitHub issue. One
 worktree per task. Draft PRs only, through the `soma-pr` wrapper. When something cannot be decided
 inside the fleet — the operator's money, the operator's priorities, a product judgement, an
-expired credential — escalate it: a `NEEDS_INPUT` digest entry and a toast, not a guess and not a
-stalled lead waiting on you.
+expired credential — escalate it to the operator: say what needs deciding and why, not a guess and
+not a stalled lead waiting on you.

@@ -118,8 +118,8 @@ export function injection(input, env, deps) {
   const lease = deps.readLease();
   if (!isHolder(lease, input, env)) return null;
 
-  // One sweep over every lead's stream plus the orchestrator's own (DEMOTED,
-  // SPAWNED, WATCHDOG_ERROR and the rest of the watchdog's output land there).
+  // One sweep over every lead's stream plus the orchestrator's own (SPAWNED,
+  // WATCHDOG_ERROR and the rest of the watchdog's output land there).
   // De-duplicated because `enqueue` would accept a task literally named `orch`, and
   // filtered because a task id from a hand-edited checkpoint reaches the filesystem
   // as a path.

@@ -31,7 +31,7 @@ difference between stealing from a live orchestrator and clearing a corpse. The 
 `holder: {session_id, tmux_socket, tmux_pane, wake, lease_seq, heartbeat_at}`. Tell the operator
 **who** holds it — session id, pane, and how long since its heartbeat — and stop there. Offer
 `soma_adopt({force: true})` and run it **only if the operator says yes**: a force-steal send-keys a
-demotion notice into the old holder's pane, appends a `DEMOTED` event, and cuts that session off
+`DEMOTED` notice into the old holder's pane and cuts that session off
 the event feed mid-flight.
 
 **`adopted: true`** — the fleet is yours. Note `lease_seq` (your generation) and `unread_count`. If
