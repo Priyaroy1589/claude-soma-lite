@@ -202,11 +202,8 @@ not know yet (*the operator's live transcripts carry no usage field this module 
 That failure is about your Claude Code version, not your install.
 
 On Linux, including WSL2, `npm test` currently has known failures that come from the test
-fixtures, not from your install. Expect up to four more:
+fixtures, not from your install. Expect up to three more:
 
-- *the leads root is matched with the state root symlinks resolved, not as configured* assumes
-  macOS's symlinked `$TMPDIR`
-  ([issue 31](https://github.com/techfreakworm/claude-soma-lite/issues/31)).
 - *a holder whose lock was taken over does not delete its successor on the way out*, *the
   checkpoint lock releases the lock it published, not whatever holds that name* and *a takeover
   unlinks the file it judged, or nothing at all* assume a deleted file's inode number is not

@@ -1503,16 +1503,25 @@ test('a redirect onto the state root itself is denied (arm c); the old lead-only
  * A REAL state root with the per-lead control directory really on disk, plus a verdict
  * function for a lead session and for a teammate session over the same root.
  *
- * The root is a `mkdtemp` under `$TMPDIR` **on purpose, and it is the fixture's whole point.**
- * On macOS that is `/var/folders/…` while every path `resolveTarget` hands back comes through
- * `realpath` as `/private/var/folders/…`, so a prefix test against the configured spelling alone
- * matches nothing. A fixture with a tidy unsymlinked root would pass while the rule was a no-op
- * on the machine it ships to — which is the "measured on a no-op" trap, in fixture form.
+ * The root is reached **through a symlink the fixture makes itself, and that is the fixture's
+ * whole point.** `home` (the configured `SOMA_HOME`) is a link to a real directory beside it, so
+ * every path `resolveTarget` hands back comes through `realpath` spelled differently from the
+ * configured root, and a prefix test against the configured spelling alone matches nothing. That
+ * is the machine this ships to: on macOS `$TMPDIR` is `/var/folders/…` and resolves to
+ * `/private/var/folders/…`. The fixture used to borrow that symlink by putting the root under
+ * `$TMPDIR`, which made it exist on macOS only: Linux's `/tmp` is a real directory, so there the
+ * two spellings were one, and the symlink-resolution test could only fail its own precondition. A
+ * fixture with a tidy unsymlinked root passes while the rule is a no-op — which is the "measured
+ * on a no-op" trap, in fixture form.
  */
 function leadsFixture(t) {
-  const home = mkdtempSync(join(tmpdir(), 'soma-leads-'));
+  const base = mkdtempSync(join(tmpdir(), 'soma-leads-'));
+  const real = join(base, 'real');
+  mkdirSync(real);
+  const home = join(base, 'link');
+  symlinkSync(real, home);
   const wt = mkdtempSync(join(tmpdir(), 'soma-leads-wt-'));
-  t.after(() => { rmSync(home, { recursive: true, force: true }); rmSync(wt, { recursive: true, force: true }); });
+  t.after(() => { rmSync(base, { recursive: true, force: true }); rmSync(wt, { recursive: true, force: true }); });
   const L = join(home, 'leads', 'cr-1');
   mkdirSync(L, { recursive: true });
   mkdirSync(join(home, 'heartbeats'), { recursive: true });
@@ -1726,11 +1735,11 @@ test('the leads root is matched with the state root symlinks resolved, not as co
   // `/var/folders/…` and comes back `/private/var/folders/…`. Comparing only the configured
   // spelling would match NOTHING for exactly the paths this rule exists to catch.
   //
-  // The fixture root is real, so this test only means something if the two spellings actually
-  // differ — assert that first, or the test silently becomes a tautology on a platform where
-  // `$TMPDIR` is not symlinked.
+  // This test only means something if the two spellings actually differ. The fixture makes them
+  // differ on every platform by configuring the root as a symlink, and this asserts it first, so
+  // a fixture that stops doing that fails here instead of silently becoming a tautology.
   const real = realpathSync(home);
-  assert.notEqual(real, home, 'this fixture cannot test symlink resolution if $TMPDIR is not symlinked');
+  assert.notEqual(real, home, 'the fixture state root must be reached through a symlink, or this test cannot fail');
   assert.equal(v(`rm ${join(L, 'settings.launch.json')}`), 'leads',
     'the configured spelling of the leads root no longer matches');
   assert.equal(v(`rm ${join(real, 'leads', 'cr-1', 'settings.launch.json')}`), 'leads',
