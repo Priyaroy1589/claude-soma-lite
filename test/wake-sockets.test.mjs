@@ -26,24 +26,29 @@
  *
  * ⚠ TMUX SAFETY. Every server here lives under a throwaway `TMUX_TMPDIR`, set before anything
  * loads `tmux.mjs`, so even the server named `soma` (deliberately the default name) is a stranger to
- * any live fleet's. `-f /dev/null` keeps the operator's tmux.conf, and any plugin in it that saves
+ * any live fleet's. `tmux-sandbox.mjs` makes it, short enough for a socket to bind in under any
+ * TMPDIR (issue #46). `-f /dev/null` keeps the operator's tmux.conf, and any plugin in it that saves
  * or restores sessions, out of these servers. `$TMUX` is dropped, so no tmux call in this process
- * can fall back to the server the suite happens to run inside. `after` kills both servers and
- * deletes the directory.
+ * can fall back to the server the suite happens to run inside. `after` stops the bus and kills both
+ * servers before it deletes the directory, because tmux reads a `TMUX_TMPDIR` that does not exist
+ * as unset: a tmux call made after that would go to `/tmp`, where the live servers are.
  */
 import './soma-home.mjs';
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { delimiter, dirname, join } from 'node:path';
+import { tmuxSandbox } from './tmux-sandbox.mjs';
 
 // --- The sandbox, before anything else. Nothing below may reach a tmux server outside it. -----
 // Short names on purpose: a Unix socket path must stay under ~104 bytes, and tmux reports the
-// realpath (`/private/var/...` on macOS).
-const D = mkdtempSync(join(tmpdir(), 'sw-'));
-process.env.TMUX_TMPDIR = D;
+// realpath (`/private/var/...` on macOS). tmux-sandbox.mjs puts D where the longest of them, `soma`,
+// fits: under the system temp dir when it can, under `/tmp` when that is too long (issue #46). With
+// no room anywhere there is no D, every test here skips with the reason, and nothing calls tmux.
+const SANDBOX = tmuxSandbox('soma', { prefix: 'sw-' });
+const D = SANDBOX.dir;
+if (D) process.env.TMUX_TMPDIR = D;
 delete process.env.TMUX;
 delete process.env.TMUX_PANE;
 
@@ -54,8 +59,8 @@ const saved = { SOMA_TMUX_SOCKET: process.env.SOMA_TMUX_SOCKET, SOMA_HOME: proce
 const FLEET_A = 'soma';   // the default socket name: a throwaway here, because of TMUX_TMPDIR
 const FLEET_B = 'swb';
 process.env.SOMA_TMUX_SOCKET = FLEET_B;
-const HOME_B = join(D, 'home-b');
-process.env.SOMA_HOME = HOME_B;
+const HOME_B = D && join(D, 'home-b');
+if (D) process.env.SOMA_HOME = HOME_B;
 
 const { buildLeadEnv } = await import('../bin/lib/spawn.mjs');
 const { writeLeadMcpConfig } = await import('../bin/lib/settings-gen.mjs');
@@ -64,7 +69,7 @@ const tmux = await import('../bin/lib/tmux.mjs');
 const somaBus = await import('../bin/soma-bus.mjs');
 
 const tmuxInstalled = spawnSync('tmux', ['-V']).status === 0;
-const skip = !tmuxInstalled && 'tmux not installed';
+const skip = !tmuxInstalled ? 'tmux not installed' : !D && SANDBOX.skip;
 const LEAD = 'cr-b';
 const WAKE_LINE = `[soma] ${LEAD} NEEDS_INPUT. Call soma_inbox.`;
 const started = new Set();
@@ -163,14 +168,21 @@ const startBus = (args, env) => {
   };
 };
 
-after(() => {
-  try { bus?.child.kill('SIGKILL'); } catch { /* already gone */ }
+after(async () => {
+  // Removing D is what lifts the tmux sandbox, whatever TMUX_TMPDIR still says: tmux reads a
+  // TMUX_TMPDIR that does not exist as unset and goes to /tmp, where the live servers are, the one
+  // named `soma` included. So everything that could still call tmux stops first: the bus is killed
+  // and waited for, and both servers are killed while D still holds their sockets. Nothing calls
+  // tmux once D has gone, and this process ends with the file.
+  if (bus && bus.child.exitCode === null && bus.child.signalCode === null) {
+    const exited = new Promise((resolve) => bus.child.once('exit', resolve));
+    bus.child.kill('SIGKILL');
+    await exited;
+  }
   for (const socket of started) {
     try { tm(socket, 'kill-server'); } catch { /* already gone */ }
   }
-  rmSync(D, { recursive: true, force: true });
-  // The tmux sandbox is deliberately NOT lifted: this process ends with the file, and a tmux call
-  // made after lifting it would reach the server named `soma` outside it.
+  if (D) rmSync(D, { recursive: true, force: true });
   for (const [k, v] of Object.entries(saved)) {
     if (v === undefined) delete process.env[k]; else process.env[k] = v;
   }

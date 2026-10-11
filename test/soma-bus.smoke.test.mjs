@@ -7,15 +7,25 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { pathToFileURL } from 'node:url';
+import { startSkip, tmuxSandbox } from './tmux-sandbox.mjs';
 
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
-const tmuxInstalled = spawnSync('tmux', ['-V']).status === 0;
 const TEST_SOCKET = `soma-t12-${process.pid}`;
 const savedSocket = process.env.SOMA_TMUX_SOCKET;
 const savedHome = process.env.SOMA_HOME;
+const savedTmpdir = process.env.TMUX_TMPDIR;
+
+// The throwaway server lives in a short private TMUX_TMPDIR of its own (tmux-sandbox.mjs): its
+// socket binds under any TMPDIR (issue #46), and no socket name used here can reach a live server.
+// Set before the first tmux call, because every tmux child, the bus's included, inherits it. With
+// no room for the socket anywhere, the real-tmux tests skip and say so.
+const BOX = tmuxSandbox(TEST_SOCKET, { prefix: 'sb-' });
+if (BOX.dir) process.env.TMUX_TMPDIR = BOX.dir;
+const tmuxInstalled = spawnSync('tmux', ['-V']).status === 0;
+const noRealTmux = !tmuxInstalled ? 'tmux not installed' : !BOX.dir && BOX.skip;
 
 // Set BEFORE the first import of `lib/tmux.mjs`, which captures the socket name at
 // load time. This is the only point at which the bus's own `hasPane` — whose default
@@ -55,26 +65,32 @@ const freshHome = () => {
   return home;
 };
 
-/** A real detached tmux session on the throwaway socket; returns its pane id. */
+/**
+ * A real detached tmux session on the throwaway socket: `{ pane }`, its pane id, or `{ why }`, the
+ * reason the caller skips with when tmux could not give it one.
+ */
 const livePane = (name) => {
-  const created = tmux.defaultRun(['new-session', '-d', '-s', name, 'sleep', '600']);
-  if (created.code !== 0) return null;   // pty-exhausted host: the caller skips
+  // `-f /dev/null` on the call that starts the server, the only one that reads a config: the
+  // operator's tmux.conf may load plugins that save and restore sessions.
+  const created = tmux.defaultRun(['-f', '/dev/null', 'new-session', '-d', '-s', name, 'sleep', '600']);
+  if (created.code !== 0) return { why: startSkip(created.stderr, BOX.socket) };
   sessions.add(name);
-  const row = tmux.defaultRun(['list-panes', '-a', '-F', '#{session_name}\t#{pane_id}']).stdout
-    .split('\n').find((l) => l.startsWith(`${name}\t`));
-  return row ? row.split('\t')[1] : null;
+  const listed = tmux.defaultRun(['list-panes', '-a', '-F', '#{session_name}\t#{pane_id}']);
+  const row = listed.stdout.split('\n').find((l) => l.startsWith(`${name}\t`));
+  return row ? { pane: row.split('\t')[1] } : { why: startSkip(listed.stderr, BOX.socket) };
 };
 
 after(() => {
-  if (tmuxInstalled) {
-    const socketPath = tmux.defaultRun(['display-message', '-p', '#{socket_path}']).stdout.trim();
-    tmux.defaultRun(['kill-server']);
-    // Neither the last session dying nor kill-server unlinks the socket file.
-    if (socketPath.includes(TEST_SOCKET)) rmSync(socketPath, { force: true });
-  }
+  // The server first, then the box, then the environment. tmux reads a TMUX_TMPDIR that does not
+  // exist as unset and goes to /tmp, where the live servers are, so a kill-server sent after the
+  // box had gone would go there. The box takes the socket file with it, which neither the last
+  // session dying nor kill-server unlinks.
+  if (tmuxInstalled) tmux.defaultRun(['kill-server']);
+  if (BOX.dir) rmSync(BOX.dir, { recursive: true, force: true });
   for (const d of trash) rmSync(d, { recursive: true, force: true });
   if (savedSocket === undefined) delete process.env.SOMA_TMUX_SOCKET; else process.env.SOMA_TMUX_SOCKET = savedSocket;
   if (savedHome === undefined) delete process.env.SOMA_HOME; else process.env.SOMA_HOME = savedHome;
+  if (savedTmpdir === undefined) delete process.env.TMUX_TMPDIR; else process.env.TMUX_TMPDIR = savedTmpdir;
 });
 
 const ORCH_TOOLS = [
@@ -236,10 +252,12 @@ test('the deferred deps refuse in a sentence rather than crashing, and name no p
 // 3. hasPane — the probe whose failure is invisible in BOTH directions
 // ---------------------------------------------------------------------------
 
-test('the two spellings first suggested for hasPane are wrong on this tmux, in opposite directions', { skip: !tmuxInstalled && 'tmux not installed' }, (t_) => {
+test('the two spellings first suggested for hasPane are wrong on this tmux, in opposite directions', { skip: noRealTmux }, (t_) => {
   assert.equal(tmux.tmuxArgs([])[1], TEST_SOCKET, 'this test must not run on the production socket');
-  const pane = livePane(`t12-canary-${process.pid}`);
-  if (!pane) return t_.skip('tmux could not start a session here');
+  const { pane, why } = livePane(`t12-canary-${process.pid}`);
+  if (!pane) return t_.skip(why);
+  assert.equal(tmux.defaultRun(['display-message', '-p', '#{socket_path}']).stdout.trim(), BOX.socket,
+    'the server must be in this file\'s box, at the socket path the box was sized for');
 
   // This is the canary, not a restatement of the fix: it measures the platform, so
   // a future tmux that changes either behaviour reddens here and says which one.
@@ -268,10 +286,10 @@ test('the two spellings first suggested for hasPane are wrong on this tmux, in o
   assert.equal(liveProbe.stdout.trim(), pane, 'the output is not');
 });
 
-test('hasPane answers for a live pane and for a pane that is gone, through the real default run', { skip: !tmuxInstalled && 'tmux not installed' }, (t_) => {
+test('hasPane answers for a live pane and for a pane that is gone, through the real default run', { skip: noRealTmux }, (t_) => {
   const name = `t12-live-${process.pid}`;
-  const pane = livePane(name);
-  if (!pane) return t_.skip('tmux could not start a session here');
+  const { pane, why } = livePane(name);
+  if (!pane) return t_.skip(why);
 
   assert.equal(bus.hasPane(pane), true, `the live pane ${pane} must read present`);
   assert.equal(bus.hasPane('%99999'), false, 'a pane id that was never allocated must read gone');
@@ -350,10 +368,10 @@ test('paneOnServer needs both halves of one answer: the pane it asked about, on 
   assert.deepEqual(spawned, [], 'nothing to prove costs no tmux call');
 });
 
-test('a pane on a server that is not running is a gone pane, and no path reaches the caller', { skip: !tmuxInstalled && 'tmux not installed' }, async (t_) => {
+test('a pane on a server that is not running is a gone pane, and no path reaches the caller', { skip: noRealTmux }, async (t_) => {
   const name = `t12-noserver-${process.pid}`;
-  const pane = livePane(name);
-  if (!pane) return t_.skip('tmux could not start a session here');
+  const { pane, why } = livePane(name);
+  if (!pane) return t_.skip(why);
   tmux.defaultRun(['kill-server']);
   sessions.clear();
   // kill-server returns before the server has finished exiting. A probe in that window reaches a
@@ -378,11 +396,11 @@ test('a pane on a server that is not running is a gone pane, and no path reaches
   assert.equal(bus.hasPane(pane), false);
 });
 
-test('leaseStale, with this predicate, keeps the three states apart', { skip: !tmuxInstalled && 'tmux not installed' }, (t_) => {
+test('leaseStale, with this predicate, keeps the three states apart', { skip: noRealTmux }, (t_) => {
   freshHome();
   const name = `t12-stale-${process.pid}`;
-  const pane = livePane(name);
-  if (!pane) return t_.skip('tmux could not start a session here');
+  const { pane, why } = livePane(name);
+  if (!pane) return t_.skip(why);
 
   // Live pane, fresh heartbeat: NOT stale. With trap A's predicate this is `true`,
   // and the fleet is silently stealable out from under a working orchestrator.
@@ -404,11 +422,11 @@ test('leaseStale, with this predicate, keeps the three states apart', { skip: !t
   assert.equal(lease.leaseStale({ ...live, heartbeat_at: Date.now() - 11 * 60_000 }, bus.hasPane), true);
 });
 
-test('soma_adopt, on real modules and real tmux, refuses a live holder and takes a dead one', { skip: !tmuxInstalled && 'tmux not installed' }, async (t_) => {
+test('soma_adopt, on real modules and real tmux, refuses a live holder and takes a dead one', { skip: noRealTmux }, async (t_) => {
   freshHome();
   const name = `t12-adopt-${process.pid}`;
-  const pane = livePane(name);
-  if (!pane) return t_.skip('tmux could not start a session here');
+  const { pane, why } = livePane(name);
+  if (!pane) return t_.skip(why);
 
   // An incumbent whose pane is right there and whose heartbeat is seconds old.
   const granted = lease.acquireLease({ session_id: 'sess-INCUMBENT', tmux_socket: TEST_SOCKET, tmux_pane: pane, wake: 'tmux' });
