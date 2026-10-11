@@ -801,6 +801,35 @@ test('a configured fleet catches a repo typo at intake; an unconfigured one queu
   assert.deepEqual(r2.queued, ['cr-9']);
 });
 
+test('enqueue hands the fleet the configured repo map, so a repo-level verify_hint can reach the row', async () => {
+  const bt = await load();
+  /** The fixture's enqueue, plus a record of the options it was handed. */
+  const recording = (seen) => (tasks, opts) => {
+    seen.push(opts);
+    return { queued: tasks.map((x) => x.id), skipped: [] };
+  };
+  const repos = { 'acme-app': { path: '/repos/acme-app', verify_hint: 'yarn test' } };
+  const seen = [];
+  const c = orch({ config: { max_leads: 10, repos, budgets: {} }, deps: { enqueue: recording(seen) } });
+  const r = await bt.orchTools(c).get('soma_enqueue')({ tasks: [{ id: 'cr-1', repo: 'acme-app', brief: 'b' }] });
+  assert.deepEqual(r.queued, ['cr-1']);
+  assert.equal(seen.length, 1);
+  // `fleet.enqueue` falls back to `repos[task.repo].verify_hint`, and it never reads soma.json
+  // itself, so a fallback the bus does not pass the map to never happens.
+  assert.deepEqual(seen[0]?.repos, repos, 'soma_enqueue must pass soma.json\'s repos as enqueue(tasks, { repos })');
+
+  // No config to read, unwired or unparseable, means no repo map. It does not mean a failed
+  // enqueue: the task still queues, with nothing to fall back on.
+  for (const [why, loadConfig] of [['unwired', undefined], ['throws', () => { throw new SyntaxError('Unexpected token } in JSON'); }]]) {
+    const calls = [];
+    const bare = orch({ deps: { loadConfig, enqueue: recording(calls) } });
+    const r2 = await bt.orchTools(bare).get('soma_enqueue')({ tasks: [{ id: 'cr-2', repo: 'r', brief: 'b' }] });
+    assert.deepEqual(r2.queued, ['cr-2'], `loadConfig ${why}: the task must still queue`);
+    assert.equal(calls.length, 1, `loadConfig ${why}`);
+    assert.equal(calls[0]?.repos ?? null, null, `loadConfig ${why}: there is no repo map to pass`);
+  }
+});
+
 test('an unbounded brief is refused rather than written into the checkpoint', async () => {
   const bt = await load();
   const c = orch();

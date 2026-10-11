@@ -159,7 +159,7 @@ an unconfigured repo cannot spawn:
 | `blocked_slot_minutes` | `120` | How long a lead that asked a question keeps its admission slot before the row flips to `blocked` and the slot frees. |
 | `settle_minutes` | `30` | Quiet window before `FLEET_SETTLED`. |
 | `budgets` | see below | Per-lead token/turn/wall caps by class. |
-| `repos` | `{}` | `{ "<key>": { path, base_branch } }`. `base_branch` falls back to `develop`. |
+| `repos` | `{}` | `{ "<key>": { path, base_branch, verify_hint } }`. `base_branch` falls back to `develop`. A task without its own `verify_hint` takes the repo's at enqueue. |
 | `teammate_mcp_allow` | `[]` | Hands specific MCP servers back to teammates. Read `README.md` for its two measured limits before using it. |
 | `seats` | `[]` | The account pool (design 2026-09-15 §2): `[{ "config_dir": "~/.claude-seat-b", "label": "seat-b" }]`, one entry per Claude Code config dir that holds a separate `claude auth login` and whose `projects/` is a symlink to the fleet's shared transcript tree. Empty = one account, no rotation. An array, so an edit **replaces** the pool, and its ORDER is the priority order — every launch takes the first entry that is open and not `unverified`, so the account you watch goes LAST (§7 step 4). `~` expands against your home when the pool loads; a `config_dir` must be **absolute or `~`-prefixed** — a relative one is `resolve()`d against the cwd of whichever process read the pool, so a watchdog started from your home and a `soma` command run inside a repo name two different directories for the same entry, and the one that does not exist simply contributes nothing to the worktree MCP deny list without saying so; an empty `config_dir` is refused with a sentence; a missing `label` defaults to the dir's basename. `lib/seats.mjs` reads it; closures land in `state/seats.json` (`closed_until` is epoch ms, `0` = open) and are never shorter than five minutes nor longer than 32 days. A corrupt `state/seats.json` is never overwritten — fix or delete it by hand. |
 | `resume_context_fraction` | `0.7` | Revival guard as a fraction of the context window, not an absolute. |
@@ -517,7 +517,7 @@ soma enqueue --file tasks.json
 `tasks.json` is a **JSON array** (an object keyed by id is the likely mistake and is refused by
 name). Each row needs at least `id`, matching `^[a-z][a-z0-9-]{0,63}$` — it becomes a directory
 name, a tmux target and an event stream, so nothing else is admitted. Fields that survive into the
-fleet row: `id`, `title`, `repo`, `source`, `brief`, `base_branch`, `budget_class`.
+fleet row: `id`, `title`, `repo`, `source`, `brief`, `base_branch`, `budget_class`, `verify_hint`.
 
 ```json
 [
@@ -532,14 +532,11 @@ twenty-nine — and every drop is printed. If rows were offered and **none** was
 exits **3**, because `queued 0` beside a zero exit is how a plan of thirty duplicate ids reads as a
 success.
 
-> **Defect found, reported, not fixed:** `verify_hint` is dropped. `prompts/orchestrator.md` tells
-> the orchestrator to send it in `soma_enqueue`, `soma.json`'s `repos` schema comment lists it
-> per-repo, `bin/lib/standing.mjs` builds the lead's brief from `task.verify_hint`, and
-> `soma_task` echoes it — but `fleet.enqueue` constructs the row from an explicit field list that
-> does not include it, and nothing reads the per-repo one either. Effect: **every lead's standing
-> brief says `verify: (none configured)`**, so it must agree the gate command with its verifier in
-> step 0 instead of being told. It degrades gracefully; it is not silent-wrong. Name the verify
-> command inside the `brief` text until this is fixed.
+A task keeps its `verify_hint`, the command its lead's independent verifier runs. A task without one
+takes `repos.<name>.verify_hint` from `soma.json` at enqueue, so a hint added there later does not
+reach tasks already queued. The lead's standing brief names it on its `verify:` line and `soma_task`
+returns it. With neither, the brief says `verify: (none configured)` and the lead agrees the gate
+command with its verifier in step 0.
 
 ### 6.3 What happens then, without you
 

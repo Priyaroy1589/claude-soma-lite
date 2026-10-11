@@ -298,8 +298,8 @@ Stay at the terminal for this. It is the use RUNBOOK §11 says the project is re
    ```
 
    Ids must match `^[a-z][a-z0-9-]{0,63}$`. Invalid and duplicate rows are skipped and counted, not
-   fatal, so compare the printed count with what you sent. Put the verify command inside `brief`:
-   a separate `verify_hint` field is dropped at enqueue.
+   fatal, so compare the printed count with what you sent. Put the verify command in `verify_hint`,
+   or once per repo as `repos.<name>.verify_hint` in `soma.json`; the lead's brief names it.
 
 2. **Open the queue.**
 

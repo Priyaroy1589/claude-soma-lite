@@ -249,6 +249,27 @@ export const updateFleet = (mutate) =>
   });
 
 /**
+ * The command a task's verifier runs: the task's own `verify_hint`, else its repo's in
+ * `repos`, else null.
+ *
+ * Only a string with something besides whitespace in it counts, so the '' of an unfilled
+ * template slot or a 42 in a hand-written plan cannot hide the repo's. The one that counts
+ * is kept as given, not trimmed: the row records what was sent, and the brief flattens what
+ * it renders. The repo has to be a string and an OWN key of a non-array map, because every
+ * plain object answers to `constructor`, `toString` and `__proto__` and none of them is a
+ * configured repo; and `?.`, because a hand-edited soma.json can hold `"r": null`.
+ */
+function verifyHintFor(task, repos) {
+  const usable = (v) => typeof v === 'string' && v.trim() !== '';
+  if (usable(task.verify_hint)) return task.verify_hint;
+  const entry = repos !== null && typeof repos === 'object' && !Array.isArray(repos)
+    && typeof task.repo === 'string' && Object.hasOwn(repos, task.repo)
+    ? repos[task.repo]
+    : null;
+  return usable(entry?.verify_hint) ? entry.verify_hint : null;
+}
+
+/**
  * Add `tasks` to the queue; returns the ids that were queued plus, for each one that
  * was not, why.
  *
@@ -257,8 +278,14 @@ export const updateFleet = (mutate) =>
  * because "enqueued 30" when 4 were dropped is how a fleet quietly runs short. The
  * typeof guard before the regex is not redundant: `ID_RE.test(undefined)` tests the
  * string `"undefined"` and passes.
+ *
+ * `repos` is soma.json's `repos` map; this module never reads the config itself. A task
+ * with no `verify_hint` of its own takes its repo's here, at enqueue, because the row is
+ * what both the lead's standing brief and `soma_task` read: resolved once onto the row,
+ * the two cannot disagree, and a resume, which rewrites the brief from the same row, gets
+ * it too. The cost is that a repo hint added to soma.json later misses rows already queued.
  */
-export function enqueue(tasks) {
+export function enqueue(tasks, { repos } = {}) {
   if (!Array.isArray(tasks)) throw new TypeError(`enqueue: tasks must be an array, got ${typeof tasks}`);
   return updateFleet((fleet) => {
     const have = new Set(fleet.tasks.map((t) => t.id));
@@ -287,6 +314,7 @@ export function enqueue(tasks) {
         status: 'queued',
         base_branch: t.base_branch ?? null,
         budget_class: t.budget_class ?? null,
+        verify_hint: verifyHintFor(t, repos),
         lead_session_uuid: null,
         tmux_session: null,
         attempts: 0,

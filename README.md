@@ -418,7 +418,7 @@ With `repos` empty, a task cannot spawn: the watchdog retries it three times and
 | `resume_context_fraction` | `0.7` | Revival resumes a dead lead's session unless its live context is at least this fraction of the window; then it starts fresh. |
 | `resume_context_window` | `1000000` | The context window that fraction applies to. |
 | `budgets` | see below | Per-class token, turn and wall-clock caps. |
-| `repos` | `{}` | `{ "<key>": { "path": "<absolute>", "base_branch": "<branch>" } }`. Doctor fails an entry that lacks either. When `base_branch` is missing, a spawn falls back to `develop`. A repo-level `verify_hint` is read by nothing. |
+| `repos` | `{}` | `{ "<key>": { "path": "<absolute>", "base_branch": "<branch>" } }`. Doctor fails an entry that lacks either. When `base_branch` is missing, a spawn falls back to `develop`. An optional `verify_hint` (the repo's verify command) is copied onto every task enqueued without one of its own. |
 | `teammate_mcp_allow` | `[]` | Personal MCP servers handed back to teammates, by exact name. See below. |
 | `seats` | `[]` | The account-rotation pool, in priority order: `[{ "config_dir": "~/.claude-seat-2", "label": "seat-2" }]`. `config_dir` must be absolute or `~`-prefixed. Empty means one account and no rotation. |
 | `linger_minutes` | `45` | **Read by nothing.** The reaper that would use it is not built. |
@@ -600,8 +600,8 @@ may still be running.
 `soma enqueue --file` takes a JSON **array** (an object keyed by id is refused). Each row needs an
 `id` matching `^[a-z][a-z0-9-]{0,63}$`, because it becomes a directory name, a tmux session and an
 event stream. Fields kept on the row: `id`, `title`, `repo`, `brief`, `base_branch`, `budget_class`,
-`source`. Anything else is dropped, **including `verify_hint`**, so put the verify command inside
-the `brief`. Invalid and duplicate rows are skipped rather than fatal, and the counts are printed:
+`verify_hint`, `source`. Anything else is dropped. A row with no `verify_hint` takes its repo's from
+`soma.json`. Invalid and duplicate rows are skipped rather than fatal, and the counts are printed:
 compare them with what you sent.
 
 ```json
@@ -611,6 +611,7 @@ compare them with what you sent.
     "repo": "my-repo",
     "base_branch": "main",
     "brief": "Done when signing in lands on /home and `npm test -- login` passes. Leave the session store alone.",
+    "verify_hint": "npm test -- login",
     "source": { "kind": "github", "ref": "my-org/my-repo#42" } }
 ]
 ```
@@ -775,8 +776,6 @@ details.
   cannot occur yet.
 - **No stall detector and no teammate monitoring.** `STALLED` and `TEAMMATE_DOWN` have no producer,
   so silence is not health. Use `soma_status` heartbeat age and `soma_transcript`.
-- **`verify_hint` is dropped at enqueue**, so every lead's standing brief says
-  `verify: (none configured)`. Put the verify command in the brief.
 - **`serialize_with` does not exist.** Admission is strict FIFO. Enqueue a second ticket for the same
   module only after the first reports `COMPLETED`.
 - **Long `soma send` messages** can land in the composer without being submitted. `soma status` then

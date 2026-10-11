@@ -477,8 +477,8 @@ Do all of it in a Windows Terminal Ubuntu tab, not over SSH (see [WSL caveats](#
    ```
 
    Ids must match `^[a-z][a-z0-9-]{0,63}$`. Invalid and duplicate rows are skipped and counted, not
-   fatal, so compare the printed count with what you sent. Put the verify command inside `brief`:
-   a separate `verify_hint` field is dropped at enqueue.
+   fatal, so compare the printed count with what you sent. Put the verify command in `verify_hint`,
+   or once per repo as `repos.<name>.verify_hint` in `soma.json`; the lead's brief names it.
 
 5. **Watch.**
 

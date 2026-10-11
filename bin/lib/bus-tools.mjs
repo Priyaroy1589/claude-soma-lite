@@ -1438,8 +1438,7 @@ export function orchTools(ctx) {
   // -------------------------------------------------------------------------
 
   /** Repo names the operator has configured, or null when nothing is configured. */
-  const knownRepos = async () => {
-    const repos = (await configOf())?.repos;
+  const knownRepos = (repos) => {
     if (!isRecord(repos)) return null;
     const names = Object.keys(repos);
     // An unconfigured fleet validates nothing: refusing every task on a fresh
@@ -1455,7 +1454,10 @@ export function orchTools(ctx) {
     if (tasks.length > MAX_ENQUEUE) {
       return refuse(`${tasks.length} tasks in one call is more than a backlog; send at most ${MAX_ENQUEUE} per call`);
     }
-    const known = await knownRepos();
+    // One read of soma.json for both uses: the names gate intake below, and the map itself goes
+    // to `enqueue`, which never reads the config and needs it for a repo's `verify_hint`.
+    const repos = (await configOf())?.repos;
+    const known = knownRepos(repos);
     const rejected = [];
     const accepted = [];
     for (const task of tasks) {
@@ -1485,7 +1487,7 @@ export function orchTools(ctx) {
     let result = { queued: [], skipped: [] };
     if (accepted.length) {
       try {
-        result = (await deps.enqueue(accepted)) ?? result;
+        result = (await deps.enqueue(accepted, { repos })) ?? result;
       } catch (e) {
         return refuse(`the fleet checkpoint could not be updated${codeOf(e)}`);
       }

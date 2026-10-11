@@ -668,6 +668,87 @@ test('enqueue forwards tasks to fleet.enqueue', async (t) => {
   assert.match(h.stdout(), /cr-1/);
 });
 
+/** `fleet.enqueue`'s stub, recording the options it was handed beside the tasks. */
+const enqueueInto = (seen) => (tasks, opts) => {
+  seen.push(opts);
+  return { queued: tasks.map((x) => x.id), skipped: [] };
+};
+
+test('enqueue hands fleet.enqueue the repos soma.json configures, so a repo-level verify_hint reaches the row', async (t) => {
+  const home = root(t);
+  const tasksFile = () => JSON.stringify([{ id: 'cr-1', repo: 'r', brief: 'b' }]);
+  const repos = { r: { path: '/repos/r', base_branch: 'develop', verify_hint: 'yarn test' } };
+
+  // State 1: the wiring. `fleet.enqueue` never reads soma.json itself, so the map has to travel
+  // with the tasks.
+  const seen = [];
+  const h = mk({ readFile: tasksFile, loadConfig: () => ({ max_leads: 10, budgets: {}, repos }), enqueue: enqueueInto(seen) });
+  assert.equal(await dispatch(['enqueue', '--file', 'tasks.json'], h.deps), 0);
+  assert.equal(seen.length, 1);
+  assert.deepEqual(seen[0]?.repos, repos, 'soma enqueue must pass d.loadConfig().repos as enqueue(tasks, { repos })');
+
+  // State 2: the real modules. The real soma.json under SOMA_HOME, the real loadConfig and the
+  // real fleet.enqueue, read back off the checkpoint they wrote.
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ repos }));
+  const r = mk({ readFile: tasksFile });
+  delete r.deps.loadConfig;
+  delete r.deps.enqueue;
+  assert.equal(await dispatch(['enqueue', '--file', 'tasks.json'], r.deps), 0);
+  const row = JSON.parse(readFileSync(join(home, 'state', 'fleet.json'), 'utf8')).tasks.find((x) => x.id === 'cr-1');
+  assert.equal(row?.verify_hint, 'yarn test');
+});
+
+test('enqueue still queues when soma.json cannot be read, and says on one stderr line that no repo verify_hint was applied', async (t) => {
+  const home = root(t);
+  // Nothing in this error names soma.json, so a warning that names it was worded by the arm itself.
+  const seen = [];
+  const h = mk({
+    readFile: () => JSON.stringify([{ id: 'cr-1', repo: 'r', brief: 'b' }]),
+    loadConfig: () => { throw new SyntaxError('Unexpected token } in JSON at position 12'); },
+    enqueue: enqueueInto(seen),
+  });
+  assert.equal(await dispatch(['enqueue', '--file', 'tasks.json'], h.deps), 0, 'a config the operator broke must not block the queue');
+  assert.equal(seen.length, 1, 'the task is queued anyway');
+  assert.equal(seen[0]?.repos ?? null, null, 'with no repo map');
+  assert.match(h.stdout(), /queued 1: cr-1/);
+  assert.equal(h.err.length, 1, `one warning, got: ${JSON.stringify(h.err)}`);
+  assert.doesNotMatch(h.err[0], /\n/, 'on one line');
+  assert.match(h.err[0], /soma\.json/, 'naming the file that could not be read');
+  // The negation is the claim: "no repo verify_hint was applied", or "verify_hint … not applied".
+  assert.match(h.err[0], /\b(?:no|without)\b[^\n]{0,30}\bverify_hints?\b|\bverify_hints?\b[^\n]{0,40}\bnot\b/i,
+    'and what was lost: no repo verify_hint was applied');
+
+  // The same through the real modules: a soma.json that is not JSON, and the task's own hint
+  // still lands, because it never depended on the config.
+  writeFileSync(join(home, 'soma.json'), '{"repos": ');
+  const r = mk({ readFile: () => JSON.stringify([{ id: 'cr-2', repo: 'r', brief: 'b', verify_hint: 'npm test' }]) });
+  delete r.deps.loadConfig;
+  delete r.deps.enqueue;
+  assert.equal(await dispatch(['enqueue', '--file', 'tasks.json'], r.deps), 0);
+  assert.match(r.stderr(), /soma\.json/);
+  const row = JSON.parse(readFileSync(join(home, 'state', 'fleet.json'), 'utf8')).tasks.find((x) => x.id === 'cr-2');
+  assert.equal(row?.verify_hint, 'npm test');
+});
+
+test('enqueue\'s soma.json warning stays on one line when the parse error quotes the file across lines', async (t) => {
+  const home = root(t);
+  // A pretty-printed soma.json with a bare token. V8's JSON.parse message quotes the source
+  // around the bad token, newlines included, and the real loadConfig passes that message on.
+  writeFileSync(join(home, 'soma.json'), '{\n  "repos": {\n    "r": { "path": x }\n  }\n}\n');
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  assert.throws(() => loadConfig(), (e) => /\n/.test(e.message), 'the premise: the real loadConfig error for this file spans lines');
+
+  const r = mk({ readFile: () => JSON.stringify([{ id: 'cr-3', repo: 'r', brief: 'b', verify_hint: 'npm test' }]) });
+  delete r.deps.loadConfig;
+  delete r.deps.enqueue;
+  assert.equal(await dispatch(['enqueue', '--file', 'tasks.json'], r.deps), 0);
+  assert.equal(r.err.length, 1, `one warning, got: ${JSON.stringify(r.err)}`);
+  assert.doesNotMatch(r.err[0], /\n/, 'on one line: the parse error is folded into it, not printed as the file excerpt it quotes');
+  assert.match(r.err[0], /soma\.json/, 'naming the file that could not be read');
+  const row = JSON.parse(readFileSync(join(home, 'state', 'fleet.json'), 'utf8')).tasks.find((x) => x.id === 'cr-3');
+  assert.equal(row?.verify_hint, 'npm test', 'and the task still queues with its own hint');
+});
+
 test('enqueue reports what was DROPPED, not only what was queued', async (t) => {
   root(t);
   // `fleet.enqueue` skips an invalid or duplicate id rather than throwing, and says which:

@@ -979,9 +979,19 @@ export async function dispatch(argv, deps = {}) {
           + ` ${tasks === null ? 'null' : typeof tasks}.`);
         return USAGE_CODE;
       }
+      // The repo map goes with the tasks, because `fleet.enqueue` never reads soma.json and a
+      // task with no `verify_hint` of its own takes its repo's. A soma.json that will not load
+      // costs only that fallback, said out loud; it does not hold up the queue, and a task's
+      // own hint never depended on it.
+      let repos = null;
+      try {
+        repos = d.loadConfig()?.repos;
+      } catch (e) {
+        d.warn(`soma enqueue: soma.json could not be read (${oneLine(reason(e))}), so no repo verify_hint was applied; tasks keep only their own.`);
+      }
       let r;
       try {
-        r = d.enqueue(tasks);
+        r = d.enqueue(tasks, { repos });
       } catch (e) {
         d.warn(`soma enqueue: ${reason(e)}`);
         return ENV;

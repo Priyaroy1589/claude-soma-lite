@@ -788,6 +788,17 @@ test('every tool declares the arguments its handler actually reads', () => {
   assert.equal(bus.describe('soma_report').inputSchema.properties.type.enum.length, 6);
 });
 
+test('a soma_enqueue task row declares verify_hint, as a string', () => {
+  // `prompts/orchestrator.md` tells the model to send `verify_hint` with each task. Task rows are
+  // declared `additionalProperties: false`, so while the field is undeclared the schema tells the
+  // model it may not send the one field the prompt asks for.
+  const item = bus.describe('soma_enqueue').inputSchema.properties.tasks.items;
+  assert.equal(item.additionalProperties, false, 'the premise: an undeclared row field is refused');
+  assert.equal(item.properties.verify_hint?.type, 'string', 'soma_enqueue\'s task row must declare verify_hint as a string');
+  // Optional, like every field but the id: a task with none falls back to its repo's hint in soma.json.
+  assert.deepEqual(item.required, ['id']);
+});
+
 test('describe answers for a name it has never heard of instead of throwing', () => {
   // serve() calls describe once per key in the live Map, and a throw during
   // tools/list costs the session its whole tool list.

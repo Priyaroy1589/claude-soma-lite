@@ -174,12 +174,15 @@ test('a queued task carries the whole record, and the checkpoint round-trips thr
   assert.deepEqual(Object.keys(one).sort(), [
     'attempts', 'base_branch', 'base_sha', 'brief', 'budget_class', 'created', 'id',
     'lead_session_uuid', 'repo', 'rotations', 'seat', 'source', 'status', 'title', 'tmux_session', 'updated',
+    'verify_hint',
   ]);
   assert.equal(one.status, 'queued');
   assert.equal(one.attempts, 0);
   assert.equal(one.base_branch, 'develop');
   assert.deepEqual(one.source, { kind: 'md', ref: 'x' });
   assert.ok(Number.isInteger(one.created) && one.created === one.updated);
+  // No verify command on the task and no repo map to fall back on: null, written, not absent.
+  assert.equal(one.verify_hint, null);
 
   // Absent optional fields become null/{}/'' rather than `undefined`, which
   // JSON.stringify would drop — the in-memory record and the persisted one have to
@@ -189,6 +192,7 @@ test('a queued task carries the whole record, and the checkpoint round-trips thr
   assert.equal(two.repo, null);
   assert.deepEqual(two.source, {});
   assert.equal(two.brief, '');
+  assert.equal(two.verify_hint, null);
 
   const onDisk = JSON.parse(readFileSync(p('state', 'fleet.json'), 'utf8'));
   assert.deepEqual(onDisk.tasks.map((x) => x.id), ['cr-1', 'cr-2']);
@@ -227,6 +231,139 @@ test('a corrupt checkpoint fails loudly instead of being read — and overwritte
   assert.deepEqual(after.future_field, { keep: true });
   assert.equal(after.last_spawn_at, 7);
   assert.deepEqual(after.tasks.map((x) => x.id), ['cr-3']);
+});
+
+// --------------------------------------------------------------------------- verify_hint
+//
+// The command a lead's verifier runs. Two readers depend on finding it on the row:
+// `standing.mjs` renders it as the brief's `- verify:` line and `soma_task` returns it. Both
+// read `task.verify_hint`, so a row built without the field gives every lead a brief that says
+// `verify: (none configured)`, even when the orchestrator sent one or soma.json configures one
+// for the repo.
+
+/** Each row's verify_hint by id. A missing key shows in a failed diff as `undefined`, not as null. */
+const hints = (fleet) => Object.fromEntries(fleet.tasks.map((x) => [x.id, x.verify_hint]));
+
+test('a task\'s own verify_hint lands on the row as given, and survives the trip through the file', async (t) => {
+  const { f, p } = await fresh(t, 'verify-own');
+  f.enqueue([task('cr-1', { verify_hint: 'npm test' }), task('cr-2', { verify_hint: '  yarn test --run ' })]);
+  // Stored as given, not trimmed. The row records what the orchestrator sent, and the brief's
+  // `fact()` already flattens and trims whatever it renders.
+  const want = { 'cr-1': 'npm test', 'cr-2': '  yarn test --run ' };
+  assert.deepEqual(hints(f.readFleet()), want);
+  assert.deepEqual(hints(JSON.parse(readFileSync(p('state', 'fleet.json'), 'utf8'))), want, 'the checkpoint on disk carries it');
+  // The bus that enqueues and the lead's bus that answers `soma_task` are different processes,
+  // so the file has to carry the hint, not the module instance that wrote it.
+  const reloaded = await import('../bin/lib/fleet.mjs?verify-own-reload');
+  assert.deepEqual(hints(reloaded.readFleet()), want);
+});
+
+test('a task with no usable verify_hint of its own takes its repo\'s from soma.json, and its own still wins', async (t) => {
+  const { f } = await fresh(t, 'verify-repo');
+  const repos = { r: { path: '/repos/r', verify_hint: 'yarn test' } };
+  f.enqueue([
+    task('cr-1'),
+    // None of these is a command, so none may hide the repo's: '' and whitespace come from an
+    // unfilled template slot, and the rest are type slips in a hand-written plan.
+    task('cr-2', { verify_hint: '' }),
+    task('cr-3', { verify_hint: '   ' }),
+    task('cr-4', { verify_hint: null }),
+    task('cr-5', { verify_hint: 42 }),
+    task('cr-6', { verify_hint: {} }),
+    task('cr-7', { verify_hint: true }),
+    // A command named for this task is more specific than the repo's default.
+    task('cr-8', { verify_hint: 'npm test' }),
+  ], { repos });
+  assert.deepEqual(hints(f.readFleet()), {
+    'cr-1': 'yarn test', 'cr-2': 'yarn test', 'cr-3': 'yarn test', 'cr-4': 'yarn test',
+    'cr-5': 'yarn test', 'cr-6': 'yarn test', 'cr-7': 'yarn test', 'cr-8': 'npm test',
+  });
+});
+
+test('verify_hint is null when neither the task nor its repo names one, and only the repo map\'s own entries count', async (t) => {
+  const { f } = await fresh(t, 'verify-none');
+  // `r` carries a real hint, so a null below is never just the map being empty.
+  const repos = {
+    r: { path: '/repos/r', verify_hint: 'yarn test' },
+    bare: { path: '/repos/bare' },
+    blank: { path: '/repos/blank', verify_hint: '  ' },
+    odd: { path: '/repos/odd', verify_hint: 7 },
+    gone: null,
+  };
+  f.enqueue([
+    task('cr-1', { repo: 'bare' }),         // an entry with no hint
+    task('cr-2', { repo: 'blank' }),        // a blank one
+    task('cr-3', { repo: 'odd' }),          // one that is not a command
+    task('cr-4', { repo: 'gone' }),         // a hand-edited null entry
+    task('cr-5', { repo: 'elsewhere' }),    // a repo the map does not name
+    task('cr-6', { repo: undefined }),      // no repo at all
+    // Names every plain object answers to through its prototype: `repos[name]` is
+    // Object.prototype, the Object constructor and a function. None is a configured repo.
+    task('cr-7', { repo: '__proto__' }),
+    task('cr-8', { repo: 'constructor' }),
+    task('cr-9', { repo: 'toString' }),
+  ], { repos });
+  // No map at all: no second argument, an empty one, and the null or undefined a bus hands
+  // over when no config is wired or soma.json will not load. Enqueue must still work.
+  f.enqueue([task('cr-10')]);
+  f.enqueue([task('cr-11')], {});
+  f.enqueue([task('cr-12')], { repos: null });
+  f.enqueue([task('cr-13')], { repos: undefined });
+  // An entry the map only inherits is not one the operator configured.
+  f.enqueue([task('cr-14', { repo: 'inherited' })], { repos: Object.create({ inherited: { path: '/repos/i', verify_hint: 'yarn test' } }) });
+
+  const ids = Array.from({ length: 14 }, (_, i) => `cr-${i + 1}`);
+  assert.deepEqual(f.readFleet().tasks.map((x) => x.id), ids, 'every task was queued');
+  assert.deepEqual(hints(f.readFleet()), Object.fromEntries(ids.map((id) => [id, null])));
+});
+
+test('a repo is looked up by its name only: not by a key its string form matches, and not in an array', async (t) => {
+  const { f } = await fresh(t, 'verify-repo-key');
+  const entry = { path: '/repos/r', verify_hint: 'yarn test' };
+  // `Object.hasOwn` turns its key into a string, so a repo that is not a string finds an own key
+  // spelled like it: null finds "null", undefined finds "undefined", 42 finds "42". None of them
+  // is a repo name. `r` in the same map is the control: a real name still finds its hint.
+  f.enqueue([task('cr-1', { repo: null }), task('cr-2', { repo: 'r' })], { repos: { null: entry, r: entry } });
+  f.enqueue([task('cr-3', { repo: undefined })], { repos: { undefined: entry } });
+  f.enqueue([task('cr-4', { repo: 42 })], { repos: { 42: entry } });
+  // soma.json's repos is an object keyed by name. An array's indexes are own keys too, but an
+  // array is not a repo map.
+  f.enqueue([task('cr-5', { repo: '0' })], { repos: [entry] });
+  assert.deepEqual(hints(f.readFleet()), { 'cr-1': null, 'cr-2': 'yarn test', 'cr-3': null, 'cr-4': null, 'cr-5': null });
+});
+
+test('a verify_hint given at enqueue, or configured for the repo, reaches the lead in its standing brief and in soma_task', async (t) => {
+  const { f } = await fresh(t, 'verify-e2e');
+  const { writeStanding } = await import('../bin/lib/standing.mjs?verify-e2e');
+  const { leadTools } = await import('../bin/lib/bus-tools.mjs?verify-e2e');
+
+  /**
+   * The two places a lead learns its verify command, both fed from the real row: the brief
+   * the spawner writes from it, and `soma_task` answered by a `taskFor` that reads the real
+   * checkpoint the way `soma-bus.mjs` wires it.
+   */
+  const lead = async (id) => {
+    const row = f.readFleet().tasks.find((x) => x.id === id);
+    const brief = readFileSync(writeStanding(row), 'utf8');
+    const tools = leadTools({ env: { SOMA_LEAD_NAME: id }, deps: { taskFor: (lid) => f.readFleet().tasks.find((x) => x.id === lid) ?? {} } });
+    return { brief, verify: brief.split('\n').filter((l) => l.startsWith('- verify:')), task: await tools.get('soma_task')({}) };
+  };
+
+  // Sent by the orchestrator with the task.
+  f.enqueue([{ id: 'cr-1', repo: 'r', brief: 'b', verify_hint: 'npm test' }]);
+  const own = await lead('cr-1');
+  assert.equal(own.verify.length, 1, 'the brief has exactly one verify line');
+  assert.match(own.verify[0], /^- verify: `npm test`/);
+  assert.doesNotMatch(own.brief, /\(none configured\)/);
+  assert.equal(own.task.verify_hint, 'npm test');
+
+  // Configured for the repo in soma.json, with nothing on the task.
+  f.enqueue([{ id: 'cr-2', repo: 'r', brief: 'b' }], { repos: { r: { path: '/repos/r', verify_hint: 'yarn test' } } });
+  const cfg = await lead('cr-2');
+  assert.equal(cfg.verify.length, 1, 'the brief has exactly one verify line');
+  assert.match(cfg.verify[0], /^- verify: `yarn test`/);
+  assert.doesNotMatch(cfg.brief, /\(none configured\)/);
+  assert.equal(cfg.task.verify_hint, 'yarn test');
 });
 
 // --------------------------------------------------------------------------- seats (account rotation)

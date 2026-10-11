@@ -587,6 +587,7 @@ const SPECS = {
           brief: str('The assignment: goal, constraints, and a checkable definition of done. Authored by you.'),
           base_branch: str('Branch to cut the worktree from. Defaults to the repo\'s configured base.'),
           budget_class: str('Override the token budget class instead of letting the lead\'s harness pick it.'),
+          verify_hint: str('The command the lead\'s independent verifier runs to prove the task done, e.g. "npm test". A task without one gets its repo\'s `verify_hint` from soma.json at enqueue.'),
           source: { type: 'object', description: 'Provenance, e.g. {ref: "PROJ-42"}.' },
         }, ['id']),
       },
