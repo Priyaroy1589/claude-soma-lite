@@ -639,10 +639,10 @@ orchestrator tool call is a heartbeat, so open each turn with `soma_inbox` or `s
 > [!WARNING]
 > **Other places to run the orchestrator.** Outside tmux also works, but a lead's wake-up then
 > arrives only as a desktop notification, and the events wait for your next turn: safe, only
-> slower. **Never start the orchestrator in your own tmux while leads are running:** the bus
-> records your pane's id without checking which tmux server it is on, and a wake-up is typed into
-> the pane with that id on soma's server, which can be a lead's or a teammate's. For a fleet on
-> another socket, such as `soma2`'s, start the orchestrator inside that fleet's own tmux server
+> slower. The same holds in your own tmux, on any server that is not soma's: the bus cannot prove
+> your pane is on soma's server, so it adopts with `wake notify` (`degraded_wake: true`). Only a
+> pane on soma's own server gets keystroke wake-ups. For a fleet on another socket, such as
+> `soma2`'s, start the orchestrator inside that fleet's own tmux server
 > (`tmux -L soma_second new-session -s orchestrator`): a lead types its wake-ups only on its own
 > fleet's server.
 

@@ -909,7 +909,9 @@ export function leadTools(ctx) {
  * session can be shown to hold the lease, so every gated tool refuses** — it is wired in
  * `realDeps()` and is no longer optional in practice), `leaseStale`/
  * `hasPane` (a dead holder must wait out its heartbeat instead of being adopted
- * over instantly), `updateFleet` (`soma_spawn` refuses outright — it will not admit
+ * over instantly), `paneOnServer` (no pane can be proven to be on soma's server, so
+ * every adopt claims notify wake and the heartbeat repairs no pane), `updateFleet`
+ * (`soma_spawn` refuses outright — it will not admit
  * non-transactionally), `admit`+`loadConfig` (no `max_leads` gate on a manual
  * spawn; no repo validation at intake; no budget percentage), `eventStreams` (the
  * inbox falls back to every task row plus `orch`), `heartbeatAgeMs`, `listPanes`,
@@ -977,12 +979,34 @@ export function orchTools(ctx) {
    */
   const socket = () => busSocket(env);
 
-  /**
-   * This session's tmux pane, or null outside tmux. One spelling, shared by `claimOf` (which
-   * writes it) and `beat` (which repairs it) — two spellings could disagree about what this
-   * session's pane is, and the repair would then fight the claim.
-   */
+  /** This session's tmux pane as its environment states it, or null outside tmux. Unproven: see `provenPane`. */
   const paneOf = () => (nonEmpty(env?.SOMA_TMUX_PANE) ? env.SOMA_TMUX_PANE : null);
+
+  /**
+   * This session's pane, PROVEN to be on this bus's own tmux server, or null (issue #2).
+   *
+   * A pane id is a small per-server counter, so `$TMUX_PANE` alone cannot say which server it
+   * means. A session promoted in the operator's everyday tmux offers that server's `%3`, and on
+   * soma's server `%3` is a lead or a teammate: recorded as a keystroke target, every urgent wake
+   * went to that stranger. So the pane is offered to `paneOnServer` together with the session's
+   * `$TMUX`, and only a `true` makes it this session's pane. Anything else is null — a session
+   * outside tmux, one in another server, no server, a missing pane, a verifier that throws, and no
+   * verifier wired at all — because null is the notify claim: toasts and pull delivery, never a
+   * keystroke into an unproven pane.
+   *
+   * One spelling, shared by `claimOf` (which writes it) and `beat` (which repairs it): two could
+   * disagree about what this session's pane is, and the repair would then fight the claim. It costs
+   * one tmux round trip, so `soma_adopt` takes it once per call and `beat` at most once a minute.
+   */
+  const provenPane = async () => {
+    const pane = paneOf();
+    if (pane === null || !has('paneOnServer')) return null;
+    try {
+      return (await deps.paneOnServer(pane, env?.TMUX)) === true ? pane : null;
+    } catch {
+      return null;
+    }
+  };
 
   /**
    * Stamp the lease, at most once a minute — the whole reason this wrapper exists.
@@ -1017,9 +1041,11 @@ export function orchTools(ctx) {
       // The pane travels with the stamp: see `lease.heartbeat`. A resumed session keeps its
       // session id and gets a NEW pane id, so the holder's own environment is the only place
       // the truth lives, and a heartbeat is the only thing that happens often enough to carry
-      // it. `paneOf()` is the same expression `claimOf()` uses, so the repair cannot disagree
-      // with the claim it is repairing.
-      await deps.heartbeat(sid, { pane: paneOf() });
+      // it. `provenPane()` is the same proof `claimOf()` uses, so the repair cannot disagree
+      // with the claim it is repairing — and a session resumed into another tmux server offers
+      // null, which `lease.heartbeat` leaves alone, rather than a pane id that means a stranger
+      // on soma's server. This floor is what keeps the proof to one tmux call a minute.
+      await deps.heartbeat(sid, { pane: await provenPane() });
     } catch {
       // The lease keeps its previous stamp; the next call tries again. A busy fleet
       // lock is not a reason to fail the operator's actual request.
@@ -1303,9 +1329,14 @@ export function orchTools(ctx) {
   /**
    * What this session claims when it takes the fleet. Field by field, because the
    * lease record's shape is a contract four other readers depend on.
+   *
+   * Keystroke wakes only for a pane proven to be on this bus's server (`provenPane`); anything
+   * else claims `notify`, with no pane and no socket, and the adopt reply then says
+   * `degraded_wake: true`. Async because the proof is a tmux round trip, so `soma_adopt` takes
+   * the claim ONCE and reuses it for the comparison, the grant and the reply.
    */
-  const claimOf = () => {
-    const pane = paneOf();
+  const claimOf = async () => {
+    const pane = await provenPane();
     const wake = pane ? 'tmux' : 'notify';
     return { session_id: sessionId(), tmux_socket: wake === 'tmux' ? socket() : null, tmux_pane: pane, wake };
   };
@@ -1353,6 +1384,9 @@ export function orchTools(ctx) {
     }
 
     const current = await leaseOf();
+    // Taken ONCE and reused below for the comparison, the grant and the reply: the claim costs a
+    // tmux round trip now (`provenPane`), and three proofs could also answer three ways.
+    const claim = await claimOf();
 
     /**
      * Already ours, and the record still describes us: an idempotent success.
@@ -1366,15 +1400,14 @@ export function orchTools(ctx) {
      */
     const mine = !!current && current.session_id === sessionId();
     if (mine) {
-      const want = claimOf();
-      if (current.wake === want.wake && (current.tmux_pane ?? null) === want.tmux_pane
-        && (current.tmux_socket ?? null) === want.tmux_socket) {
+      if (current.wake === claim.wake && (current.tmux_pane ?? null) === claim.tmux_pane
+        && (current.tmux_socket ?? null) === claim.tmux_socket) {
         return {
           adopted: true,
           already_held: true,
           lease_seq: Number.isInteger(current.lease_seq) ? current.lease_seq : null,
-          wake: want.wake,
-          degraded_wake: want.wake !== 'tmux',
+          wake: claim.wake,
+          degraded_wake: claim.wake !== 'tmux',
           forced: false,
           stolen_from: null,
           demoted_notice: null,
@@ -1384,8 +1417,9 @@ export function orchTools(ctx) {
       }
       // The record disagrees with this session's environment (it was promoted
       // outside tmux and is now inside a pane, or its pane id changed across a
-      // reattach), so it is rewritten rather than left describing a wake path that
-      // goes nowhere.
+      // reattach, or its pane can no longer be proven to be on soma's server), so it
+      // is rewritten rather than left describing a wake path that goes nowhere — or
+      // into somebody else's pane.
     }
 
     const stale = await staleOf(current);
@@ -1396,7 +1430,7 @@ export function orchTools(ctx) {
 
     let grant;
     try {
-      grant = await deps.acquireLease(claimOf(), { force: forced });
+      grant = await deps.acquireLease(claim, { force: forced });
     } catch (e) {
       return { adopted: false, error: `the orchestrator lease could not be claimed; the fleet lock is unavailable${codeOf(e)}` };
     }
@@ -1417,7 +1451,7 @@ export function orchTools(ctx) {
     return {
       adopted: true,
       lease_seq: Number.isInteger(grant.lease_seq) ? grant.lease_seq : null,
-      wake: claimOf().wake,
+      wake: claim.wake,
       degraded_wake: grant.degraded === true,
       // "we took it from somebody else", not "we passed a flag": every first
       // adoption of a free fleet passes force (a null lease is a stale lease) and so

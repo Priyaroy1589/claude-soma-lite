@@ -1,34 +1,42 @@
 /**
- * Issue #1 on real tmux: two fleets, two tmux servers, one pane id.
+ * Wake keystrokes and tmux servers, on real tmux: two servers, one pane id.
  *
- * Seen in the field: a default fleet on socket `soma` and a second fleet on a socket of its own,
- * both orchestrators sitting in pane `%40` of their own server — and every NEEDS_INPUT and
- * COMPLETED wake from the second fleet's leads was typed into the FIRST fleet's orchestrator. A
- * pane id is a small per-server counter, so two servers sharing one is the ordinary case rather
- * than a coincidence. The lead's bus never learned its fleet's socket (`env -i` dropped it and the
- * lead's `mcp.json` did not set it), so it fell back to `soma` and typed `%40` there.
+ * A pane id is a small per-server counter, so two tmux servers that both have a `%0` (or a `%40`)
+ * is the ordinary case, not a coincidence. Two defects typed wakes into a stranger's pane because
+ * of it, and this file stages both, safely.
  *
- * This file stages exactly that, safely. Two fresh servers whose first pane is `%0` on both;
- * fleet B's lease naming `%0` on its own socket; and a bus started with the environment a really
- * spawned lead's bus gets: `spawn.buildLeadEnv`'s output plus the `soma` entry of the `mcp.json`
- * that `settings-gen.writeLeadMcpConfig` writes for that lead, which is what Claude Code hands an
- * MCP server (its own process env, plus the config's `env`). The lead files NEEDS_INPUT over the
- * bus's own stdio, and the two panes say where the wake landed: each runs `cat`, which echoes what
- * is typed into it. Before the fix the line lands in fleet A's pane; after it, in fleet B's.
+ * Issue #1. Seen in the field: a default fleet on socket `soma` and a second fleet on a socket of
+ * its own, both orchestrators in pane `%40` of their own server, and every NEEDS_INPUT and COMPLETED
+ * wake from the second fleet's leads was typed into the FIRST fleet's orchestrator. The lead's bus
+ * never learned its fleet's socket (`env -i` dropped it and the lead's `mcp.json` did not set it),
+ * so it fell back to `soma` and typed `%40` there. Staged here with fleet B's lease naming `%0` on
+ * its own socket and a bus started with the environment a really spawned lead's bus gets:
+ * `spawn.buildLeadEnv`'s output plus the `soma` entry of the `mcp.json` that
+ * `settings-gen.writeLeadMcpConfig` writes for that lead, which is what Claude Code hands an MCP
+ * server (its own process env, plus the config's `env`). The lead files NEEDS_INPUT over the bus's
+ * own stdio, and the two panes say where the wake landed: each runs `cat`, which echoes what is
+ * typed into it. Before the fix the line lands in fleet A's pane; after it, in fleet B's.
+ *
+ * Issue #2. `soma_adopt` recorded `$TMUX_PANE` as a keystroke target without checking that the pane
+ * is on soma's server, so an orchestrator promoted in the operator's everyday tmux recorded a pane
+ * id that, on soma's server, belongs to a lead or a teammate. The proof is one round trip on the
+ * bus's own server, `soma-bus.paneOnServer`, which also requires the session's `$TMUX` to name that
+ * server. Here the bus is fleet B's, on `swb`, and the server named `soma` is the other server: it
+ * stands in for the operator's own.
  *
  * ⚠ TMUX SAFETY. Every server here lives under a throwaway `TMUX_TMPDIR`, set before anything
- * loads `tmux.mjs`, so even the server named `soma` (fleet A, deliberately the default name) is a
- * stranger to any live fleet's. `-f /dev/null` keeps the operator's tmux.conf, and any plugin in it
- * that saves or restores sessions, out of these servers. `$TMUX` is dropped, so no tmux call in
- * this process can fall back to the server the suite happens to run inside. `after` kills both
- * servers and deletes the directory.
+ * loads `tmux.mjs`, so even the server named `soma` (deliberately the default name) is a stranger to
+ * any live fleet's. `-f /dev/null` keeps the operator's tmux.conf, and any plugin in it that saves
+ * or restores sessions, out of these servers. `$TMUX` is dropped, so no tmux call in this process
+ * can fall back to the server the suite happens to run inside. `after` kills both servers and
+ * deletes the directory.
  */
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 
 // --- The sandbox, before anything else. Nothing below may reach a tmux server outside it. -----
 // Short names on purpose: a Unix socket path must stay under ~104 bytes, and tmux reports the
@@ -38,9 +46,9 @@ process.env.TMUX_TMPDIR = D;
 delete process.env.TMUX;
 delete process.env.TMUX_PANE;
 
-// The spawner is fleet B's. `tmux.mjs` reads `SOMA_TMUX_SOCKET` once, at load, so it is set here,
-// before the dynamic imports below: the same position a fleet-B watchdog is in, whose environment
-// carries it (`soma up` forwards it through `WATCHDOG_ENV_ALLOW`).
+// This process is fleet B's: its spawner and its bus. `tmux.mjs` reads `SOMA_TMUX_SOCKET` once, at
+// load, so it is set here, before the dynamic imports below: the same position a fleet-B watchdog
+// is in, whose environment carries it (`soma up` forwards it through `WATCHDOG_ENV_ALLOW`).
 const saved = { SOMA_TMUX_SOCKET: process.env.SOMA_TMUX_SOCKET, SOMA_HOME: process.env.SOMA_HOME };
 const FLEET_A = 'soma';   // the default socket name: a throwaway here, because of TMUX_TMPDIR
 const FLEET_B = 'swb';
@@ -50,19 +58,21 @@ process.env.SOMA_HOME = HOME_B;
 
 const { buildLeadEnv } = await import('../bin/lib/spawn.mjs');
 const { writeLeadMcpConfig } = await import('../bin/lib/settings-gen.mjs');
-const { acquireLease } = await import('../bin/lib/lease.mjs');
+const { acquireLease, readLease } = await import('../bin/lib/lease.mjs');
 const tmux = await import('../bin/lib/tmux.mjs');
+const somaBus = await import('../bin/soma-bus.mjs');
 
 const tmuxInstalled = spawnSync('tmux', ['-V']).status === 0;
+const skip = !tmuxInstalled && 'tmux not installed';
 const LEAD = 'cr-b';
 const WAKE_LINE = `[soma] ${LEAD} NEEDS_INPUT. Call soma_inbox.`;
 const started = new Set();
 let bus = null;
 
 /**
- * tmux on one of this file's two servers. `-f /dev/null` is only read by the command that starts
- * a server, and costs nothing on the others, so every call carries it rather than remembering
- * which one starts the server.
+ * tmux on one of this file's servers. `-f /dev/null` is only read by the command that starts a
+ * server, and costs nothing on the others, so every call carries it rather than remembering which
+ * one starts the server.
  */
 const tm = (socket, ...args) => execFileSync('tmux', ['-f', '/dev/null', '-L', socket, ...args], {
   env: { ...process.env, TMUX_TMPDIR: D },
@@ -96,6 +106,35 @@ const orchestrator = async (socket, label) => {
   started.add(socket);
   assert.ok(await until(() => screen(socket).includes(label)), `${socket}: the orchestrator pane never printed its label`);
   return tm(socket, 'display-message', '-p', '-t', 'orch:', '#{pane_id}').trim();
+};
+
+/** Both fleets, started once and shared by every test here. Both orchestrators sit in `%0`. */
+let fleetsStarted = null;
+const fleets = () => {
+  fleetsStarted ??= (async () => {
+    const a = await orchestrator(FLEET_A, 'fleet-a-orchestrator');
+    const b = await orchestrator(FLEET_B, 'fleet-b-orchestrator');
+    assert.equal(a, '%0', 'fixture: a fresh server numbers its first pane %0');
+    assert.equal(b, a, 'fixture: the two orchestrators must share a pane id, as in the field report');
+    return { a, b };
+  })();
+  return fleetsStarted;
+};
+
+/**
+ * `$TMUX` as tmux itself sets it for a process in a pane on `socket`, read from inside one (a
+ * second window, so `%0` is left alone) rather than assembled here: the proof compares against
+ * exactly this string, so it should come from tmux.
+ */
+const tmuxVars = new Map();
+const tmuxVarOf = async (socket) => {
+  if (!tmuxVars.has(socket)) {
+    const out = join(D, `${socket}.tmux`);
+    tm(socket, 'new-window', '-d', '-t', 'orch:', 'sh', '-c', `printf %s "$TMUX" > '${out}'; exec sleep 600`);
+    assert.ok(await until(() => existsSync(out) && readFileSync(out, 'utf8') !== ''), `${socket}: no $TMUX came back`);
+    tmuxVars.set(socket, readFileSync(out, 'utf8'));
+  }
+  return tmuxVars.get(socket);
 };
 
 /** The bus as Claude Code runs it for a lead: a child process, JSON-RPC over its own stdio. */
@@ -136,14 +175,16 @@ after(() => {
   }
 });
 
-test("a lead's wake lands on its own fleet's tmux server, not on the default one's pane with the same id", { skip: !tmuxInstalled && 'tmux not installed' }, async () => {
+// ---------------------------------------------------------------------------
+// Issue #1: a lead's wake goes to its own fleet's server
+// ---------------------------------------------------------------------------
+
+test("a lead's wake lands on its own fleet's tmux server, not on the default one's pane with the same id", { skip }, async () => {
   assert.equal(tmux.socketName(), FLEET_B, "fixture: the spawner side must be fleet B's, or this measures nothing");
+  process.env.SOMA_HOME = HOME_B;
 
   // Two fleets, and the collision the field report had: both orchestrators in the same pane id.
-  const paneA = await orchestrator(FLEET_A, 'fleet-a-orchestrator');
-  const paneB = await orchestrator(FLEET_B, 'fleet-b-orchestrator');
-  assert.equal(paneA, '%0', 'fixture: a fresh server numbers its first pane %0');
-  assert.equal(paneB, paneA, 'fixture: the two orchestrators must share a pane id, as in the field report');
+  const { b: paneB } = await fleets();
 
   // Fleet B's lease, through the real API, naming its orchestrator's pane on its own server.
   const grant = acquireLease({ session_id: 'orch-b', tmux_socket: FLEET_B, tmux_pane: paneB, wake: 'tmux' }, { force: true });
@@ -189,4 +230,62 @@ test("a lead's wake lands on its own fleet's tmux server, not on the default one
   assert.ok(!a.includes(WAKE_LINE),
     `fleet B's wake was typed into fleet A's orchestrator (pane %0 on the server named soma), which is the field report:\n${a}`);
   assert.ok(b.includes(WAKE_LINE), `fleet B's orchestrator never got its own lead's wake:\n${b}`);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #2: only a pane on soma's own server is a keystroke target
+// ---------------------------------------------------------------------------
+
+test("the adopt proof: a pane id soma's server has proves nothing unless the session's $TMUX names that server", { skip }, async () => {
+  await fleets();
+  const otherTmux = await tmuxVarOf(FLEET_A);   // a session in another server: the operator's own, say
+  const ownTmux = await tmuxVarOf(FLEET_B);     // a session in the bus's own server
+  // The canary, measured rather than assumed: `$TMUX` names its server by `#{socket_path}`, byte for
+  // byte, realpath and all. A tmux that changed either spelling reddens here, not in the proof.
+  assert.equal(ownTmux.split(',')[0], tm(FLEET_B, 'display-message', '-p', '-t', '%0', '#{socket_path}').trim());
+  assert.notEqual(otherTmux.split(',')[0], ownTmux.split(',')[0]);
+
+  // The collision: `%0` is on the bus's server as well, so pane existence alone says yes.
+  assert.equal(somaBus.hasPane('%0'), true, "fixture: %0 must exist on the bus's own server, or this is not the collision");
+  assert.equal(somaBus.paneOnServer('%0', otherTmux), false, "a session in another server's %0 is not in this server's %0");
+  assert.equal(somaBus.paneOnServer('%0', ownTmux), true, "a session in this server's %0 is proven");
+  assert.equal(somaBus.paneOnServer('%99', ownTmux), false, 'a pane this server does not have');
+  for (const none of [undefined, '']) assert.equal(somaBus.paneOnServer('%0', none), false, `$TMUX ${JSON.stringify(none)}`);
+
+  // The bus's own server not running: the same probe, aimed at a socket nothing listens on (the
+  // `run` seam every tmux wrapper takes), from a session whose `$TMUX` names that socket.
+  const idle = (args) => {
+    try {
+      return { stdout: tm('swn', ...args), code: 0 };
+    } catch (e) {
+      return { stdout: String(e.stdout ?? ''), code: e.status ?? 1 };
+    }
+  };
+  assert.equal(somaBus.paneOnServer('%0', `${dirname(ownTmux.split(',')[0])}/swn,1,0`, idle), false);
+});
+
+test('adopting from a pane on another tmux server records notify wake, on the real wiring and real tmux', { skip }, async () => {
+  await fleets();
+  const otherTmux = await tmuxVarOf(FLEET_A);
+  const ownTmux = await tmuxVarOf(FLEET_B);
+  /** A promoted session in pane `%0` of whichever server `$TMUX` names, adopting a fresh fleet. */
+  const adopt = async (home, tmuxVar) => {
+    process.env.SOMA_HOME = join(D, home);
+    const env = somaBus.busEnv({ SOMA_ROLE: 'candidate', CLAUDE_CODE_SESSION_ID: `orch-${home}`, TMUX_PANE: '%0', TMUX: tmuxVar, SOMA_TMUX_SOCKET: FLEET_B });
+    const reply = await somaBus.buildTools(env).tools.get('soma_adopt')({});
+    const held = readLease();
+    return { reply, claim: { tmux_socket: held?.tmux_socket, tmux_pane: held?.tmux_pane, wake: held?.wake } };
+  };
+
+  const other = await adopt('home-other', otherTmux);
+  assert.equal(other.reply.adopted, true);
+  assert.equal(other.reply.wake, 'notify', "soma's server has a %0 too, and it is not this session");
+  assert.equal(other.reply.degraded_wake, true);
+  assert.deepEqual(other.claim, { tmux_socket: null, tmux_pane: null, wake: 'notify' });
+
+  const own = await adopt('home-own', ownTmux);
+  assert.equal(own.reply.adopted, true);
+  assert.equal(own.reply.wake, 'tmux');
+  assert.equal(own.reply.degraded_wake, false);
+  assert.deepEqual(own.claim, { tmux_socket: FLEET_B, tmux_pane: '%0', wake: 'tmux' });
 });

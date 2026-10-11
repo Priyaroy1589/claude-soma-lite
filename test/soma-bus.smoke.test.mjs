@@ -313,6 +313,42 @@ test('hasPane reads the output, never the exit code', () => {
   assert.deepEqual(none, [], 'an empty pane must not be probed');
 });
 
+/**
+ * Issue #2's proof, against recorded answers. The real-tmux half, two servers that both have a
+ * `%0`, is in `test/wake-sockets.test.mjs`, inside a TMUX_TMPDIR sandbox.
+ */
+test('paneOnServer needs both halves of one answer: the pane it asked about, on the server $TMUX names', () => {
+  const calls = [];
+  const record = (result) => (args) => { calls.push(args); return result; };
+  const TMUX = '/tmp/tmux-1000/soma,4242,0';
+
+  assert.equal(bus.paneOnServer('%7', TMUX, record({ stdout: '%7 /tmp/tmux-1000/soma\n', code: 0 })), true);
+  assert.deepEqual(calls[0], ['display-message', '-p', '-t', '%7', '#{pane_id} #{socket_path}'],
+    'one round trip on the bus\'s own socket; a space, not a tab, because a client with no UTF-8 locale prints a tab as _');
+
+  // The collision this exists for: the pane is there, on THIS server, but the session's $TMUX
+  // names another one. A pane-existence probe says yes here, and that yes was the bug.
+  assert.equal(bus.paneOnServer('%7', '/tmp/tmux-1000/default,999,0', record({ stdout: '%7 /tmp/tmux-1000/soma', code: 0 })), false);
+  // The pane is missing: tmux exits 0 with an EMPTY pane id and still prints the socket path.
+  assert.equal(bus.paneOnServer('%7', TMUX, record({ stdout: ' /tmp/tmux-1000/soma\n', code: 0 })), false);
+  // No server: exit 1 and nothing on stdout (the "no server running on <path>" line is stderr).
+  assert.equal(bus.paneOnServer('%7', TMUX, record({ stdout: '', code: 1 })), false);
+  // Near misses on either half, and a locale-mangled answer, prove nothing.
+  for (const stdout of ['%71 /tmp/tmux-1000/soma', '%7 /tmp/tmux-1000/soma2', '%7 /tmp/tmux-1000/som', '%7_/tmp/tmux-1000/soma', '%7']) {
+    assert.equal(bus.paneOnServer('%7', TMUX, record({ stdout, code: 0 })), false, JSON.stringify(stdout));
+  }
+  // A socket path may hold a space; a pane id never does, so the answer splits at the first one.
+  assert.equal(bus.paneOnServer('%7', '/tmp/a b/tmux-1000/soma,1,0', record({ stdout: '%7 /tmp/a b/tmux-1000/soma\n', code: 0 })), true);
+
+  // Nothing to prove, so no process: no pane, or no $TMUX (a session outside tmux).
+  const spawned = [];
+  const counting = (args) => { spawned.push(args); return { stdout: '%7 /tmp/tmux-1000/soma', code: 0 }; };
+  for (const [pane, tmuxVar] of [[null, TMUX], ['', TMUX], ['%7', undefined], ['%7', ''], ['%7', ',4242,0'], ['%7', 42]]) {
+    assert.equal(bus.paneOnServer(pane, tmuxVar, counting), false, JSON.stringify([pane, tmuxVar]));
+  }
+  assert.deepEqual(spawned, [], 'nothing to prove costs no tmux call');
+});
+
 test('a pane on a server that is not running is a gone pane, and no path reaches the caller', { skip: !tmuxInstalled && 'tmux not installed' }, (t_) => {
   const name = `t12-noserver-${process.pid}`;
   const pane = livePane(name);
@@ -524,13 +560,30 @@ test('SOMA_TMUX_PANE is $TMUX_PANE, and a deliberate value is not clobbered by i
   assert.equal(bus.busEnv({ SOMA_TMUX_PANE: '%1' }).SOMA_TMUX_PANE, '%1');
   assert.equal(bus.busEnv({}).SOMA_TMUX_PANE, undefined);
 
+  // `$TMUX` reaches bus-tools through the spread too: it is what proves the pane is on soma's
+  // server (issue #2), so a busEnv that dropped it would degrade every adopt to notify.
+  assert.equal(bus.busEnv({ TMUX: '/tmp/tmux-1000/soma,4242,0' }).TMUX, '/tmp/tmux-1000/soma,4242,0');
+
+  // The pane becomes the claim once it is proven, and the proof is asked about exactly the
+  // pane and the `$TMUX` this process was started with. The verifier is the one stub here: the
+  // real probe, against two real servers, is in `test/wake-sockets.test.mjs`.
   freshHome();
-  const claimed = bus.buildTools(bus.busEnv({ SOMA_ROLE: 'orchestrator', CLAUDE_CODE_SESSION_ID: 'u', TMUX_PANE: '%9', SOMA_TMUX_SOCKET: TEST_SOCKET }));
-  return claimed.tools.get('soma_adopt')({}).then((r) => {
+  const asked = [];
+  const deps = { ...bus.realDeps(), paneOnServer: (pane, tmuxVar) => { asked.push([pane, tmuxVar]); return true; } };
+  const claimed = bus.buildTools(bus.busEnv({ SOMA_ROLE: 'orchestrator', CLAUDE_CODE_SESSION_ID: 'u', TMUX_PANE: '%9', TMUX: '/tmp/tmux-1000/soma,4242,0', SOMA_TMUX_SOCKET: TEST_SOCKET }), deps);
+  return claimed.tools.get('soma_adopt')({}).then(async (r) => {
     assert.equal(r.adopted, true);
     assert.equal(r.wake, 'tmux');
+    assert.deepEqual(asked, [['%9', '/tmp/tmux-1000/soma,4242,0']]);
     assert.equal(lease.readLease().tmux_pane, '%9');
     assert.equal(lease.readLease().tmux_socket, TEST_SOCKET, 'the claim names the soma tmux server');
+
+    // With the real wiring and no `$TMUX`, nothing can be proven, so the claim is notify.
+    freshHome();
+    const unproven = await bus.buildTools(bus.busEnv({ SOMA_ROLE: 'orchestrator', CLAUDE_CODE_SESSION_ID: 'u', TMUX_PANE: '%9', SOMA_TMUX_SOCKET: TEST_SOCKET })).tools.get('soma_adopt')({});
+    assert.equal(unproven.wake, 'notify');
+    assert.equal(unproven.degraded_wake, true);
+    assert.equal(lease.readLease().tmux_pane, null);
   });
 });
 

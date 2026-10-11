@@ -492,8 +492,9 @@ already running and keep running whoever holds it.
   the refusal proves only that a lease record exists. That is the difference between stealing from
   a live orchestrator and clearing a corpse.
 - `adopted: true` — note `lease_seq` and `unread_count`. `degraded_wake: true` means this session is
-  not in a tmux pane, so pushes arrive as desktop toasts and on your next turn rather than as a
-  live keystroke wake.
+  not in a pane on soma's own tmux server (it is outside tmux, or in another tmux server such as
+  your everyday one), so pushes arrive as desktop toasts and on your next turn rather than as a
+  live keystroke wake. Only a pane on soma's own server gets keystroke wakes.
 
 **Keep the lease warm.** It reads **stale after 10 minutes** without a heartbeat, and a stale lease
 is adoptable by the next session *without* `force` — so a live-but-idle orchestrator loses the fleet
