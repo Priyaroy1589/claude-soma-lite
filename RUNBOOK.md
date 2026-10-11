@@ -1364,6 +1364,21 @@ up`. That risk is not new: `up` would start the second fleet on any unreadable t
 so before this reading existed. `ps` is what tells a server that is really gone from these two
 states: if a tmux server process for soma's socket is still alive, you are in one of them.
 
+### 11.11 A tmux lease can keep a pane its holder no longer has
+
+**Inferred from reading the code, not reproduced.** When `beat()` cannot prove that the holder's
+pane is on soma's tmux server, it offers the heartbeat no pane, so a `wake: tmux` lease keeps the
+pane id it last recorded. That is the case once the holder has moved off soma's server: resumed in
+another tmux server, or outside tmux (the second is unchanged from before). Pane ids are not reused
+while a server lives, but they restart at `%0` when soma's server is recreated. A lead can then be
+handed the recorded id, and a lead's wake would pass the pane gate into that lead's composer.
+
+`beat()` leaves the transport alone on purpose: `lease.heartbeat` repairs a pane and leaves any
+change of transport to `soma_adopt`. **Recovery:** run `/soma-promote` again where the holder now
+is. `soma_adopt` re-proves the pane and rewrites the lease as `wake notify`. The window is narrower
+than it was: before `beat()` proved the pane, a resume into another tmux server re-pointed the
+lease at that server's pane id at once.
+
 ---
 
 ## 12. Troubleshooting
