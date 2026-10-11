@@ -529,11 +529,16 @@ Doctor prints 48 named checks plus one row per configured repo. Each row is `ok 
 (unobserved: the check could not be taken, which is **not** a pass). The verdict is `doctor: PASS`,
 `doctor: INCOMPLETE — …` (exit 0) or `doctor: FAIL — …` (exit 3).
 
-- **On a healthy fresh install, expect `INCOMPLETE` and no `FAIL`.** `PASS` is unreachable on this
-  build: `workflows enabled` and `session id matches hook payload` are always unobserved, and
-  `CLAUDE_CODE_SESSION_ID` is unobserved from a plain shell. Before the first lead exists,
+- **On a healthy install, expect `INCOMPLETE` and no `FAIL`: `PASS` cannot be reached on this
+  build.** Two rows are always unobserved: `workflows enabled`, which doctor hard-wires to
+  unobserved because no local file can answer it, and `session id matches hook payload`, which reads
+  `state/last-hook-payload.json`, a file nothing in this build writes. So the best verdict is
+  `doctor: INCOMPLETE — N of M checks hold, 2 unobserved` when doctor runs inside a Claude Code
+  session (the orchestrator's Bash tool, say), and `…, 3 unobserved` from a plain shell, where
+  `CLAUDE_CODE_SESSION_ID` is unobserved too. Before the first lead exists,
   `every worktree guard file carries rules`, `guard file matches the generator` and
-  `lead mcp single-server` are unobserved too.
+  `lead mcp single-server` are unobserved as well. Every other row can read `ok`. [RUNBOOK §10](RUNBOOK.md#the-rows-soma-doctor-cannot-take-and-how-to-confirm-them-by-hand)
+  says how to confirm the three by hand.
 - **Once a lead exists, `lead mcp single-server` reads `ok`.** Despite its name, it checks that a
   lead's MCP config names exactly the two servers soma writes there: `soma` and the stateless
   sequential-thinking server. Any `FAIL` is real.
@@ -806,7 +811,7 @@ details.
 | admission stopped after a Claude Code upgrade; `VERSION_GATE` event | the new version is outside `tested_claude` | re-prove the invariants on the new build, widen `tested_claude.max` in `soma.json`, then `soma down` and `soma up` |
 | `backpressure: FROZEN … org_level_disabled_until` | the organisation's spend cap was reached | once the cap is lifted, move or kill leads whose transcript still ends on the cap, then `soma thaw` |
 | a promoted session shows an empty fleet | the bus is pinned to the wrong state root | re-run `soma init` from the right shell; check the `SOMA_HOME=` it prints |
-| `soma doctor` says `INCOMPLETE`, never `PASS` | expected: two checks are always unobserved on this build | read the `????` rows against [Reading `soma doctor`](#reading-soma-doctor) |
+| `soma doctor` says `INCOMPLETE`, never `PASS` | expected: two checks are always unobserved on this build, three from a plain shell | read the `????` rows against [Reading `soma doctor`](#reading-soma-doctor), and confirm those by hand ([RUNBOOK §10](RUNBOOK.md#the-rows-soma-doctor-cannot-take-and-how-to-confirm-them-by-hand)) |
 | every lead shows `0` tokens | the wrong Claude Code config root, so no transcript matches. The budget breaker is welded open | doctor's `claude config root` row; use your wrapper |
 | `soma status` shows `LIVE ?` everywhere | tmux could not be read, which is not a dead fleet | `tmux -L soma ls` |
 | `soma kill` or `soma down` exits 3 | soma could not confirm the session stopped, so it changed nothing | `soma status`, then try again |

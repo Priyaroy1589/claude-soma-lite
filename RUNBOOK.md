@@ -374,13 +374,23 @@ to clear it; the FAIL stands until the lead is next resumed, revived or rotated.
 
 | summary | exit | meaning |
 |---|---|---|
-| `doctor: PASS — all 48 checks hold on this machine` | 0 | every check was taken and held |
+| `doctor: PASS — all 48 checks hold on this machine` | 0 | every check was taken and held — **not reachable on this build**: two rows are always unobserved (below, and §10) |
 | `doctor: INCOMPLETE — N of M checks hold, K unobserved` | **0** | nothing failed, but **K assertions did not run** |
 | `doctor: FAIL — N of M checks failed` | 3 | at least one check was taken and did not hold |
 
 > `soma doctor` **exits 0 on `INCOMPLETE`** — `runDoctor` returns `results.every(r => r.ok !== false)`.
 > An unobserved check must not refuse a machine, but it is not a pass either. If you gate a script
 > on `soma doctor`, gate it on the word, not only on `$?`.
+
+**`PASS` is not reachable on this build.** Two rows are always unobserved: `workflows enabled`,
+which doctor hard-wires to unobserved because no local file can answer it, and
+`session id matches hook payload`, which reads `state/last-hook-payload.json`, a file nothing in
+this build writes. So the best verdict is `doctor: INCOMPLETE — N of M checks hold, 2 unobserved`
+from a Claude Code session's Bash tool (the orchestrator's, say), and `…, 3 unobserved` from a plain
+shell, because `CLAUDE_CODE_SESSION_ID` is unobserved there too. Before the first lead and
+worktree exist, `every worktree guard file carries rules`, `guard file matches the generator` and
+`lead mcp single-server` are unobserved as well. Every other row can read `ok`. §10 *The rows
+`soma doctor` cannot take* says how to confirm the three by hand.
 
 ### 5.3 `soma up` — the spend gate
 
@@ -1031,6 +1041,51 @@ never observed that arming happen.** What is measured, and what is not:
   `continuing automatically at <reset>` and the lead resuming with nobody there. Nothing short of
   that. Until then this is **evidenced, not observed** — write it that way in any report, and never
   as a pass.
+
+### The rows `soma doctor` cannot take, and how to confirm them by hand
+
+`soma doctor` cannot print `PASS` on this build (§5.2): two of its rows are always unobserved, and a
+third is unobserved from a plain shell. Each asks a real question that no local file answers, so each
+is a bring-up check like the rest of this section. Confirm them by hand:
+
+- **`workflows enabled`** asks whether dynamic workflows are available to a **spawned** lead (design
+  requirement 5; the lead playbook's Step 4 fans its reads out through them). Doctor hard-wires it
+  to unobserved, because the answer depends on the account's plan and the Claude Code build, not on
+  anything on disk. Check it once per account — each seat, if rotation is configured — and again
+  after a Claude Code upgrade. With a throwaway task at `max_leads: 1`:
+
+  ```bash
+  soma send <lead> "Reply with one word, yes or no: is a tool named Workflow in your tool list?"
+  soma peek <lead>
+  ```
+
+  `yes` means the row would hold.
+
+- **`session id matches hook payload`** compares the `CLAUDE_CODE_SESSION_ID` a session's
+  subprocesses see with the `session_id` Claude Code hands that same session's hooks. It matters
+  because of the inject hook (`bin/hooks/orch-inject.mjs`, which you wire by hand; §5.1 says why
+  `soma init` does not): it treats a prompt as the lease holder's only when the hook payload's
+  `session_id` equals the id the bus recorded in the lease from `CLAUDE_CODE_SESSION_ID`. If the two
+  disagree, a promoted orchestrator silently never gets event headers. Doctor would read the payload
+  from `state/last-hook-payload.json`, which nothing in this build writes. By hand, in a Claude Code
+  session's Bash tool:
+
+  ```bash
+  echo "$CLAUDE_CODE_SESSION_ID"
+  ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$CLAUDE_CODE_SESSION_ID".jsonl
+  ```
+
+  The first prints a uuid. The second must list exactly one file: the transcript of the session you
+  are typing in. Hooks receive the session's `session_id` together with a `transcript_path` named
+  after it, so one file means the two agree. If no file is listed, they do not: `ls` says *No such
+  file or directory*, or, under zsh, the glob itself aborts with *no matches found*. End to end: with
+  the inject hook wired, a promoted session that gets unread event headers on its next prompt has
+  passed this comparison.
+
+- **`CLAUDE_CODE_SESSION_ID`** is unobserved from a plain shell by design: only a Claude Code
+  session's subprocesses carry it. Run `soma doctor` from a Claude Code session's Bash tool (the
+  orchestrator's, say) and it is observed, and should read `ok`; the `echo` above printing a uuid is
+  the same evidence.
 
 ### The measurement run that turns four estimates into numbers
 
