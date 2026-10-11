@@ -900,10 +900,11 @@ function revive(deps, cfg, task, history, now, paneState = null) {
   // kill and the attempt charge, as first planned, that throw landed in `fail('revival', …)`
   // with the pane already destroyed and the attempt already spent, and three such ticks reached
   // GAVE_UP on a config typo. Run here it costs the lead nothing: no death scene, no LEAD_DEAD, no
-  // attempt, no kill, and the next tick tries again with the pane still standing. The seat pick is
-  // the first step of revival that can throw it, not the only one: the relaunch below reads
-  // `soma.json` again and reaches `seats.loadSeats` through `launch` → `launchRoots` →
-  // `seatRoots`, after the kill.
+  // attempt, no kill, and the next tick tries again with the pane still standing. The relaunch
+  // below reads `soma.json` again and reaches `seats.loadSeats` through `launch` → `launchRoots`
+  // → `seatRoots`, after the kill — which is why the pick reads the pool through `loadSeats`
+  // itself, and why `seatsConfigured` counts a `seats` that is not an array as configured: a
+  // `{}` read as "no seats" skipped the pick and threw only at that relaunch.
   const launch = seatForRevival(deps, cfg, task, now);
 
   const tail = String(deps.capturePane(sessionName(id), DEATH_SCENE_LINES) ?? '').slice(-DEATH_SCENE_CHARS);
@@ -1313,7 +1314,9 @@ function admitNext(deps, cfg, fleet, tasks, history, now, frozen) {
           version,
           tested_min: gate?.min ?? null,
           tested_max: gate?.max ?? null,
-          why: 'the canary proves its nine runtime invariants for ONE Claude Code version; admission stays closed until soma up --canary re-proves them',
+          // What the operator can DO, not `soma up --canary`: that cannot pass on this build (its
+          // live driver is not built), so naming it sent the operator to a dead end.
+          why: 'the nine runtime invariants rest on undocumented Claude Code behaviour and are only established for versions inside tested_claude; admission stays closed until this one is inside it — re-establish the invariants on it by hand (RUNBOOK §10) and widen tested_claude in soma.json, or run a Claude Code inside the range and restart the watchdog (soma down, then soma up)',
         },
         lead: null,
       });
@@ -1403,8 +1406,14 @@ function admitNext(deps, cfg, fleet, tasks, history, now, frozen) {
 
 // ══════════════════════════ the limits phase ══════════════════════════
 
-/** Are seats configured at all? `cfg.seats` is tolerated absent: no seats is today's behaviour byte for byte. */
-const seatsConfigured = (cfg) => Array.isArray(cfg?.seats) && cfg.seats.length > 0;
+/**
+ * Are seats configured at all? `cfg.seats` absent (or null) and `[]` are no seats: today's
+ * behaviour byte for byte. Any OTHER value counts as configured, a non-array included — that is
+ * not "no seats", it is a pool `seats.loadSeats` refuses by name, and each caller has to reach
+ * that refusal at its pick, before anything is spent. Read as "no seats", a `{}` sent revival
+ * seat-blind into a spawner that reads the same value, throws, and does so after the kill.
+ */
+const seatsConfigured = (cfg) => cfg?.seats != null && (!Array.isArray(cfg.seats) || cfg.seats.length > 0);
 
 /**
  * Phase 1. For every `spawned` row: read the transcript tail, classify it, act.
@@ -1769,6 +1778,11 @@ function freeze(deps, verdict, now) {
  */
 function seatForRevival(deps, cfg, task, now) {
   if (!seatsConfigured(cfg)) return { seat: null, opts: {} };
+  // The pool is read HERE, before the pick dep, so a `cfg.seats` the relaunch would refuse is
+  // refused at the pick whatever that dep answers: `seats.pick` returns null for an unreadable
+  // state/seats.json without reading `cfg.seats` at all, and a null pick on a row with no seat
+  // label would otherwise carry a malformed pool past the kill.
+  seats.loadSeats(cfg);
   const seat = deps.pickSeat(now, cfg) ?? seatOfRow(cfg, task);
   return seat === null ? { seat: null, opts: {} } : { seat: seat.label, opts: { configDir: seat.config_dir } };
 }
@@ -2035,8 +2049,9 @@ function claudeVersion() {
  * oversight.** A closed gate stops the whole queue; making that the answer to "we could not run
  * `claude --version`" would stall a fleet over a PATH problem, silently, since the only signal
  * is an absence of spawns. A version soma could not read is `soma doctor`'s finding, and the
- * gate's real backstop is the manual `soma up --canary` at bring-up. When the gate DOES close it
- * says so, once per version, which is the half the sketch left out entirely.
+ * gate's real backstop is establishing the invariants by hand at bring-up (RUNBOOK §10; `soma up
+ * --canary` would be it, but its live driver is not built). When the gate DOES close it says so,
+ * once per version, which is the half the sketch left out entirely.
  */
 function versionGate() {
   const version = claudeVersion();

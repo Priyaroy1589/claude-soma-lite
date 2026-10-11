@@ -30,14 +30,17 @@ way: a change that needs a package needs a very good reason, and an issue first.
 ### What `npm test` does
 
 ```json
-"test": "SOMA_HOME=\"${SOMA_TEST_HOME:-$(mktemp -d)}\" node --test \"test/**/*.test.mjs\""
+"test": "node --test \"test/**/*.test.mjs\""
 ```
 
 - It runs Node's built-in test runner (`node:test` with `node:assert/strict`) over every
   `test/**/*.test.mjs`. The suite has 1,300+ tests and takes seconds.
-- It gives the suite a **throwaway state root**: a fresh `mktemp -d` directory as `SOMA_HOME`, or
-  `$SOMA_TEST_HOME` if you set it (useful when you want to inspect what a test left behind). No
-  test can touch a real fleet's `~/.soma`.
+- Every test file gets a **throwaway state root**, however it is started: its first import is
+  `test/soma-home.mjs`, which sets `SOMA_HOME` to a fresh temp directory and removes it when the
+  process exits, or to `$SOMA_TEST_HOME` if you set it (useful when you want to inspect what a test
+  left behind; that directory is never removed). An inherited `SOMA_HOME` is never used, so running
+  one file with `node --test` is as safe as `npm test`. No test can touch a real fleet's `~/.soma`.
+  A new test file needs the same first import, and `test/soma-home.test.mjs` fails without it.
 - Tests that drive a real tmux use their own socket, never the `soma` socket a live fleet runs on.
   They skip themselves when tmux is not installed. The git-dependent tests skip when git is
   missing, and a few permission tests skip when run as root.
@@ -77,8 +80,9 @@ prompts/
   orchestrator.md       the orchestrator contract
   harnesses.json        the six loop harnesses (H1 to H6) a lead chooses from
 skills/soma-promote/    the /soma-promote skill that `soma init` installs
-test/                   the node:test suite, its fixtures, and prose.mjs (helpers for
-                        pinning rules written in prose)
+test/                   the node:test suite, its fixtures, prose.mjs (helpers for pinning
+                        rules written in prose) and soma-home.mjs (the throwaway state root
+                        every test file imports first)
 docs/                   ROADMAP and the design specs
 research/               the research inputs behind v1
 RUNBOOK.md              the operator runbook, written from the shipped code

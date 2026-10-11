@@ -1,3 +1,4 @@
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
@@ -768,7 +769,7 @@ test('a holder whose lock was taken over does not delete its successor on the wa
   const successor = `${execFileSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' })}\n`;
   assert.notEqual(successor, `${process.pid}\n`);
   w.withRepoLock('app', () => {
-    assert.equal(readFileSync(lock, 'utf8'), `${process.pid}\n`, 'the lock names us while we hold it');
+    assert.equal(readFileSync(lock, 'utf8').trim(), String(process.pid), 'the lock names us while we hold it');
     unlinkSync(lock);                 // a waiter decides we are dead and takes it over...
     writeFileSync(lock, successor);   // ...and publishes its own
   });

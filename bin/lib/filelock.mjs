@@ -44,7 +44,9 @@
  *    someone to time out and say so. Measured: 40 of 40 such releases before, 0 after. The
  *    rule is deliberately narrow — leave alone only a `held` lock that is not ours; still
  *    unlink `free`, `corrupt` and `unreadable`, because over-caution here produces a lock
- *    nothing ever clears.
+ *    nothing ever clears. "Ours" is the inode and the bytes we published, and the bytes carry
+ *    a nonce fresh to each acquisition: ext4 hands a freed inode number straight back, so with
+ *    the pid alone a successor carrying our pid read as ours (see `nonce`).
  * 7. **Hard links are a hard requirement, and the failure is named.** On a volume without
  *    them `linkSync` fails and escapes as libuv's `ENOTSUP: operation not supported on
  *    socket, link '…'` — about a file. Reproduced on a real FAT volume, on which the `wx`
@@ -161,6 +163,36 @@ function pidAlive(pid) {
   }
 }
 
+/**
+ * A fresh nonce for one acquisition's lock bytes: 64 random bits, one character per bit, a space
+ * for 0 and a tab for 1. The lock holds `<pid>\n<nonce>\n`.
+ *
+ * **The nonce is the half of the lock's identity the file system cannot recycle.** `takeOver`
+ * and `releaseLock` decide "is this still the file I judged?" by its inode number plus its
+ * bytes, and ext4 hands a freed inode number straight back: on an ext4 Linux VM, a lock-sized
+ * file unlinked and re-created at once got the old number back 2000 times in 2000. While the
+ * bytes were only `<pid>\n`, a successor carrying the same pid — a recycled pid, or this
+ * process's own next acquisition — therefore matched on both halves, and the suite's successor
+ * cases failed on every run there. File times cannot stand in for the nonce: on the same VM, two
+ * files created back to back carried the same mtime, ctime and birth time 2000 times in 2000.
+ *
+ * **Whitespace only, and that is not a style choice.** Every `readLock` soma has shipped parses
+ * the bytes as `Number(raw.trim())`, and `trim()` strips spaces, tabs and newlines, so that parse
+ * still reads these bytes as the pid alone — a `held` lock. A visible token (a hex second line,
+ * say) reads as `corrupt` to an older soma process still running through an upgrade, and
+ * `corrupt` is taken over after one backoff, so the upgrade would steal live locks. Readers and
+ * comparers need no change: `takeOver` and `releaseLock` already compare the bytes whole. A lock
+ * an older soma wrote carries no nonce, so it keeps the pid-only bytes, and the weaker identity
+ * that comes with them, until that process lets it go.
+ */
+function nonce() {
+  let out = '';
+  for (const byte of randomBytes(8)) {
+    for (let bit = 7; bit >= 0; bit--) out += (byte >> bit) & 1 ? '\t' : ' ';
+  }
+  return out;
+}
+
 /** Two states have no file behind them, so they carry no identity to compare. */
 const free = () => ({ state: 'free', pid: null, raw: null, ino: null, ageMs: 0, code: null });
 const opaque = (code) => ({ state: 'unreadable', pid: null, raw: null, ino: null, ageMs: 0, code });
@@ -170,7 +202,8 @@ const opaque = (code) => ({ state: 'unreadable', pid: null, raw: null, ino: null
  * those bytes came from.
  *
  * - `free`       nothing there. Retry the link; there is nothing to clean up.
- * - `held`       a pid. Waited on while it is alive and young; taken over otherwise.
+ * - `held`       a pid, plus the acquisition's nonce in whitespace that `trim()` drops (see
+ *                `nonce`). Waited on while it is alive and young; taken over otherwise.
  * - `corrupt`    bytes that are not a pid. Cannot be a holder caught mid-write, because the
  *                link publishes name and pid in one step — so it is an outside edit.
  * - `unreadable` EACCES, EIO, a directory at the path. No evidence whatever that the holder
@@ -265,15 +298,19 @@ function dropScratch(tmp) {
  *
  * Both halves of the identity are compared, and each catches something the other cannot.
  *
- * The **inode** catches a successor whose bytes happen to match, which is exactly what a recycled
- * pid re-taking its own lock looks like. That half is pinned in-suite — see "a takeover unlinks
- * the file it judged"; dropping it makes a waiter unlink a file it never read.
- *
  * The **bytes** catch a successor that landed on a *reused inode number*: the original was
- * unlinked and the filesystem handed its number to the successor's file. Rare, and not
- * constructible on demand, which is why only one of the two halves has an assertion behind it. Do
- * not delete the bytes compare as redundant on the strength of that asymmetry — it is untested
- * because the case cannot be provoked, not because it cannot happen.
+ * unlinked and the filesystem handed its number to the successor's file. On ext4 that is not rare
+ * but the normal case — measured on an ext4 Linux VM, an immediate successor got the old number
+ * back 2000 times in 2000. The bytes can only tell the two apart because every acquisition writes
+ * a nonce of its own after the pid (see `nonce`): with the pid alone, a successor carrying the
+ * same pid matched on both halves there. Pinned in-suite on every filesystem by "every acquisition
+ * writes bytes of its own", and on ext4 also by the successor cases of the release tests.
+ *
+ * The **inode** catches a successor whose bytes match exactly. Two acquisitions do not write the
+ * same bytes, so the case that arises is a `corrupt` lock — whose bytes are whatever an outside
+ * edit wrote, nonce-free — replaced by an identical one. Pinned in-suite — see "a takeover unlinks
+ * the file it judged", and the exact-bytes case of "a holder whose lock was taken over"; dropping
+ * it makes a waiter unlink a file it never read.
  *
  * The age needs no re-check — the same inode carries the same mtime, because nothing ever
  * rewrites a lock.
@@ -330,11 +367,12 @@ function writeSelfHealing(fp, dirMode, write) {
 }
 
 /**
- * Write the pid to a fresh scratch file and return the inode it landed in.
+ * Write the lock's bytes — the pid and this acquisition's nonce — to a fresh scratch file, and
+ * return the inode it landed in.
  *
- * That inode — not the path, and not the pid — is this acquisition's claim: it is the inode
- * the lock *becomes* if the link lands, so it is what `releaseLock` compares before it
- * unlinks anything.
+ * That inode and those bytes — not the path, and not the pid — are this acquisition's claim: the
+ * inode is the one the lock *becomes* if the link lands, so the pair is what `releaseLock`
+ * compares before it unlinks anything.
  *
  * Unlink-then-`O_EXCL` rather than a plain truncating open, for two reasons that pull the
  * same way. One of these locks lives in a directory soma does not own, so a symlink planted
@@ -570,7 +608,10 @@ export function createFileLock({
         // Minted per attempt, by `tryAcquire`, exactly once — see rule 4. A function rather
         // than a value so the loop cannot accidentally reuse one attempt's name for the next.
         mintTmp: () => `${where}.${process.pid}.${token}.${++scratchSerial}.tmp`,
-        raw: `${process.pid}\n`,
+        // Our pid, then a nonce minted for this call, which is one acquisition, so no successor's
+        // lock matches ours byte for byte, even on an inode number the file system handed back.
+        // See `nonce`, and `takeOver` for what each half of the identity catches.
+        raw: `${process.pid}\n${nonce()}\n`,
         mode,
         dirMode,
         // `deadline` is what bounds the wait; `timeoutMs` is only what the message reports.

@@ -172,22 +172,6 @@ not know yet (*the operator's live transcripts carry no usage field this module 
 That failure is about your Claude Code version, not your install. Tests that need tmux or git skip
 themselves when the tool is missing.
 
-On Linux, `npm test` currently has known failures that come from the test fixtures, not from your
-install. Expect up to four more:
-
-- *the leads root is matched with the state root symlinks resolved, not as configured* assumes
-  macOS's symlinked `$TMPDIR`
-  ([issue 31](https://github.com/techfreakworm/claude-soma-lite/issues/31)).
-- *a holder whose lock was taken over does not delete its successor on the way out*, *the
-  checkpoint lock releases the lock it published, not whatever holds that name* and *a takeover
-  unlinks the file it judged, or nothing at all* assume a deleted file's inode number is not
-  reused at once. ext4 reuses it, so they fail there
-  ([issue 30](https://github.com/techfreakworm/claude-soma-lite/issues/30)).
-
-*the write-idiom scan stays linear on the shapes that made it quadratic* is a timing test and can
-also fail on a busy machine
-([issue 33](https://github.com/techfreakworm/claude-soma-lite/issues/33)).
-
 ## 3. Add the `soma` wrapper
 
 Do not run `soma` bare. Two things must be pinned, and both have caused real failures:
@@ -254,7 +238,8 @@ soma2() {
   the first fleet's watchdog live: `soma2 up` starts nothing, and the second queue never drains.
 - Run `soma2 init` once, so the bus it registers in the second config root pins that socket, and
   drive the second fleet only through `soma2`. Start its orchestrator under the second config root
-  (`CLAUDE_CONFIG_DIR="$HOME/.claude-second" claude`) and outside tmux; the warning in
+  (`CLAUDE_CONFIG_DIR="$HOME/.claude-second" claude`), inside that fleet's own tmux server
+  (`tmux -L soma_second new-session -s orchestrator`); the warning in
   [A first supervised run](#7-a-first-supervised-run) says why.
 
 ## 4. `soma init`
@@ -350,10 +335,9 @@ Before you log in, `claude auth` and `gh auth` read `FAIL`, and a seventh row is
 `claude cd-compound read runs` (*no Bash tool_use in the transcript*), because a Claude Code that
 is not logged in never runs the probe's command. It reads `ok` once `claude` is logged in.
 
-**Once a lead exists, expect one `FAIL`.** `lead mcp single-server` requires a lead's MCP config to
-name exactly one server, `soma`. Leads have also been given the stateless sequential-thinking
-server, and this doctor row was not updated to match. It then reads `FAIL`, and doctor exits 3.
-Treat that row as known. Any other `FAIL` is real.
+**Once a lead exists, `lead mcp single-server` reads `ok`.** Despite its name, it checks that a
+lead's MCP config names exactly the two servers soma writes there: `soma` and the stateless
+sequential-thinking server. Any `FAIL` on it, as on every other row, is real.
 
 Rows that need action if they fail:
 
@@ -412,11 +396,12 @@ Stay at the terminal for this. It is the use RUNBOOK §11 says the project is re
 > [!WARNING]
 > **Other places to run the orchestrator.** Outside tmux also works, but a lead's wake-up then
 > arrives only as a desktop notification, and the events wait for your next turn: safe, only
-> slower. **Never start the orchestrator in your own tmux while leads are running:** the bus
-> records your pane's id without checking which tmux server it is on, and a wake-up is typed into
-> the pane with that id on soma's server, which can be a lead's or a teammate's. For a fleet on
-> another socket, such as `soma2`'s, start the orchestrator outside tmux: on this build, leads
-> send every wake-up to the default `soma` server ([issue #1](https://github.com/techfreakworm/claude-soma-lite/issues/1)).
+> slower. The same holds in your own tmux, on any server that is not soma's: the bus cannot prove
+> your pane is on soma's server, so it adopts with `wake notify` (`degraded_wake: true`). Only a
+> pane on soma's own server gets keystroke wake-ups. For a fleet on another socket, such as
+> `soma2`'s, start the orchestrator inside that fleet's own tmux server
+> (`tmux -L soma_second new-session -s orchestrator`): a lead types its wake-ups only on its own
+> fleet's server.
 
 3. **Check the promotion.** From a second terminal, or after detaching:
 

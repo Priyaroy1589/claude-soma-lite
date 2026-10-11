@@ -1,3 +1,4 @@
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -1265,7 +1266,12 @@ test('writeLeadMcpConfig emits a node-run soma server, absolute and forward-slas
   assert.ok(isAbsolute(busArg) || /^[A-Za-z]:\//.test(busArg), `not absolute: ${busArg}`);
   assert.ok(!busArg.includes('\\'), `not forward-slashed: ${busArg}`);
   assert.ok(busArg.endsWith('/bin/soma-bus.mjs'), busArg);
-  assert.deepEqual(j.mcpServers.soma.env, { SOMA_ROLE: 'lead', SOMA_LEAD_NAME: 'cr-1', SOMA_HOME: home });
+  // SOMA_TMUX_SOCKET rides beside SOMA_HOME for the same reason (issue #1): the lead starts under
+  // `env -i`, and a lead's bus that does not know its fleet's socket falls back to `soma`, where
+  // the orchestrator's pane id can be another fleet's pane. `tmux.socketName()` is the server this
+  // process's own tmux calls, `newSession` among them, use: the same instance settings-gen reads.
+  const { socketName } = await import('../bin/lib/tmux.mjs');
+  assert.deepEqual(j.mcpServers.soma.env, { SOMA_ROLE: 'lead', SOMA_LEAD_NAME: 'cr-1', SOMA_HOME: home, SOMA_TMUX_SOCKET: socketName() });
 });
 
 test('writeLeadMcpConfig absolutizes a relative busPath', async (t) => {

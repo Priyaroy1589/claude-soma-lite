@@ -4,6 +4,7 @@
  * through `process.env.TZ`: Node re-reads it at runtime (verified on v24.14.1), and `node --test`
  * runs each file in its own process, so the pin cannot leak into a sibling suite.
  */
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';

@@ -35,9 +35,10 @@ demotion notice into the old holder's pane, appends a `DEMOTED` event, and cuts 
 the event feed mid-flight.
 
 **`adopted: true`** — the fleet is yours. Note `lease_seq` (your generation) and `unread_count`. If
-`degraded_wake: true`, warn the operator plainly: this session is not in a tmux pane, so pushes
-arrive as desktop toasts and on your next turn rather than as a live keystroke wake. The fleet
-still runs; only the latency changes.
+`degraded_wake: true`, warn the operator plainly: this session is not in a pane on soma's own tmux
+server (it is outside tmux, or in another tmux server such as the operator's everyday one), so
+pushes arrive as desktop toasts and on your next turn rather than as a live keystroke wake. Only a
+pane on soma's own server gets keystroke wakes. The fleet still runs; only the latency changes.
 
 ## 2. Brief the fleet — `soma_status`
 
@@ -117,11 +118,11 @@ Two of those rows are not substitutes, so know what you are short of.
 
 **Draining events (§3):** the user-scope `UserPromptSubmit` inject hook feeds the unread event
 *headers* into the lease-holder's next turn and advances the `orch` cursor itself — when it fires
-for you, that injection, not the tool, is why you are not blind here. Do not assume it does: an
-off-tmux holder (the `degraded_wake: true` case in §1) may not match the hook's holder test, and
-then nothing is injected at all. Either way the payloads are what you lose, and the tail in the row
-above is where they still are: it reads the files directly, so nothing is consumed and re-reading is
-free.
+for you, that injection, not the tool, is why you are not blind here. Do not assume it does: a
+holder with no recorded pane, outside tmux or in a tmux server that is not soma's (the
+`degraded_wake: true` case in §1), may not match the hook's holder test, and then nothing is
+injected at all. Either way the payloads are what you lose, and the tail in the row above is where
+they still are: it reads the files directly, so nothing is consumed and re-reading is free.
 
 **Handing the lease back (§5):** there is no CLI handback in v1, and `soma release <lead>` is the
 other verb. So you cannot give the lease up by typing — it passes to the next session that adopts,

@@ -1,3 +1,4 @@
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -97,6 +98,10 @@ function orch(opts = {}) {
     // drive the demoted path.
     lease: 'lease' in opts ? opts.lease : liveLease({ session_id: 'S1' }),
     panes: new Set(opts.panes ?? ['%1']),
+    // The bus's own tmux server, by the socket path `$TMUX` spells first. The orchestrator's
+    // default `$TMUX` (below) names it: unless a test says otherwise, the session sits in a
+    // pane on soma's server, which is the only place a keystroke wake can be proven to reach.
+    server: SOMA_SERVER,
     sessions: new Set(opts.sessions ?? []),
     events: (opts.events ?? []).map((e, i) => {
       const ts = T0 + 1000 + i;
@@ -118,6 +123,12 @@ function orch(opts = {}) {
     leaseStale: (l, hasPane) => !l || (!!l.tmux_pane && !hasPane(l.tmux_pane))
       || !(Number.isFinite(l.heartbeat_at) && Date.now() - l.heartbeat_at <= STALE_MS),
     hasPane: (p) => s.panes.has(p),
+    // soma-bus.paneOnServer, transcribed (issue #2): proven only when the pane exists on the bus's
+    // server AND the session's `$TMUX` names that server in its first comma field. Pane ids are
+    // small per-server counters, so existence alone proves nothing: the operator's own `%1` is
+    // "present" on soma's server whenever soma also has a `%1`.
+    paneOnServer: (pane, tmuxVar) => typeof pane === 'string' && s.panes.has(pane)
+      && typeof tmuxVar === 'string' && tmuxVar.split(',')[0] === s.server,
     acquireLease: (claim, { force = false } = {}) => {
       if (s.lease && !force) return { ok: false, holder: s.lease };
       const prev = s.lease;
@@ -180,8 +191,14 @@ function orch(opts = {}) {
     },
     ...(opts.deps ?? {}),
   };
-  return { env: { SOMA_ROLE: 'orchestrator', SOMA_SESSION_ID: 'S1', SOMA_TMUX_PANE: '%1', ...(opts.env ?? {}) }, deps, s };
+  return { env: { SOMA_ROLE: 'orchestrator', SOMA_SESSION_ID: 'S1', SOMA_TMUX_PANE: '%1', TMUX: SOMA_TMUX, ...(opts.env ?? {}) }, deps, s };
 }
+
+/** soma's tmux server as `#{socket_path}` names it, and `$TMUX` for a pane on it. */
+const SOMA_SERVER = '/tmp/tmux-1000/soma';
+const SOMA_TMUX = `${SOMA_SERVER},4242,0`;
+/** `$TMUX` in the operator's everyday tmux: the default server, not soma's. */
+const OWN_TMUX = '/tmp/tmux-1000/default,999,0';
 
 /** A live tmux holder: pane present, heartbeat fresh. */
 const liveLease = (over = {}) => ({ session_id: 'S0', tmux_socket: 'soma', tmux_pane: '%1', wake: 'tmux', lease_seq: 7, heartbeat_at: Date.now(), ...over });
@@ -557,6 +574,75 @@ test('a pane that changed across a reattach is refreshed, and identity still hol
   assert.equal(c.s.lease.session_id, real);
   assert.equal(c.s.lease.tmux_pane, '%1');
   assert.deepEqual(c.s.keys, [], 'and nobody is told they were demoted');
+});
+
+// ---------------------------------------------------------------------------
+// soma_adopt: keystroke wakes only for a pane PROVEN to be on soma's own tmux server (issue #2)
+// ---------------------------------------------------------------------------
+
+// `$TMUX_PANE` is a pane id, and a pane id is a small per-server counter. A session promoted in
+// the operator's everyday tmux carries that server's `%1`; soma's server has its own `%1`, a lead
+// or a teammate. Recorded as `wake: 'tmux'`, every urgent wake was typed into that stranger. So
+// the claim asks `paneOnServer(pane, $TMUX)` first, and anything short of a yes is the notify claim.
+
+const NOTIFY_CLAIM = { tmux_socket: null, tmux_pane: null, wake: 'notify' };
+const claimOfLease = (l) => ({ tmux_socket: l?.tmux_socket, tmux_pane: l?.tmux_pane, wake: l?.wake });
+
+test('a session in another tmux server adopts with notify wake, though soma\'s server has a pane with its id', async () => {
+  const bt = await load();
+  const c = orch({ lease: null, env: { TMUX: OWN_TMUX } });
+  assert.ok(c.s.panes.has(c.env.SOMA_TMUX_PANE), 'fixture: the collision, %1 is on soma\'s server too');
+  const r = await bt.orchTools(c).get('soma_adopt')({});
+  assert.equal(r.adopted, true);
+  assert.equal(r.wake, 'notify');
+  assert.equal(r.degraded_wake, true);
+  assert.deepEqual(claimOfLease(c.s.lease), NOTIFY_CLAIM);
+});
+
+test('nothing short of a proof is a tmux claim: a missing pane, no $TMUX, no verifier, or a verifier that fails', async () => {
+  const bt = await load();
+  for (const [label, opts] of [
+    ['a pane soma\'s server does not have', { env: { SOMA_TMUX_PANE: '%3' } }],
+    ['no $TMUX', { env: { TMUX: undefined } }],
+    ['an empty $TMUX', { env: { TMUX: '' } }],
+    ['no verifier wired', { deps: { paneOnServer: undefined } }],
+    ['a verifier that throws', { deps: { paneOnServer: () => { throw new Error('tmux timed out'); } } }],
+    ['a verifier whose promise rejects', { deps: { paneOnServer: async () => { throw new Error('EIO'); } } }],
+    ['a verifier that answers something other than true', { deps: { paneOnServer: () => 'yes' } }],
+  ]) {
+    const c = orch({ lease: null, ...opts });
+    const r = await bt.orchTools(c).get('soma_adopt')({});
+    assert.equal(r.adopted, true, label);
+    assert.equal(r.wake, 'notify', label);
+    assert.equal(r.degraded_wake, true, label);
+    assert.deepEqual(claimOfLease(c.s.lease), NOTIFY_CLAIM, label);
+  }
+});
+
+test('a proven pane is claimed exactly as before, proven once per adopt, about this pane and this $TMUX', async () => {
+  const bt = await load();
+  const asked = [];
+  const c = orch({ lease: null });
+  const real = c.deps.paneOnServer;
+  // Asynchronous on purpose: the handler awaits its deps, so an async yes is still a yes.
+  c.deps.paneOnServer = async (pane, tmuxVar) => { asked.push([pane, tmuxVar]); return real(pane, tmuxVar); };
+  const r = await bt.orchTools(c).get('soma_adopt')({});
+  assert.equal(r.wake, 'tmux');
+  assert.equal(r.degraded_wake, false);
+  assert.deepEqual(claimOfLease(c.s.lease), { tmux_socket: 'soma', tmux_pane: '%1', wake: 'tmux' });
+  assert.deepEqual(asked, [['%1', SOMA_TMUX]], 'one tmux round trip per adopt, not one per use of the claim');
+});
+
+test('a holder that can no longer prove its pane re-adopts into notify, rather than keep a pane it cannot prove', async () => {
+  const bt = await load();
+  // Held with keystroke wakes; the same session has since been resumed into the operator's own tmux.
+  const c = orch({ lease: liveLease({ session_id: 'S1', lease_seq: 4 }), env: { TMUX: OWN_TMUX } });
+  const r = await bt.orchTools(c).get('soma_adopt')({});
+  assert.equal(r.adopted, true);
+  assert.notEqual(r.already_held, true, 'the record names a pane this session cannot prove is its own');
+  assert.equal(r.lease_seq, 5);
+  assert.equal(r.degraded_wake, true);
+  assert.deepEqual(claimOfLease(c.s.lease), NOTIFY_CLAIM);
 });
 
 test('a lease the fleet lock could not hand over is a refusal, and it names no file', async () => {
@@ -2586,15 +2672,17 @@ test('a report filed while the spawner was still finishing is not stranded by th
  * `{ pane: paneOf() }` from the call site reddened NOTHING. Two sides of a seam, each covered,
  * the seam itself blind; the same shape as the defect where soma denied its own bus.
  *
- * The value must be the same expression `claimOf()` writes, or the repair would fight the claim.
+ * The value must be the same proven pane `claimOf()` writes, or the repair would fight the claim.
  */
 
 test('beat() hands the heartbeat this session\'s pane, not just its id', async () => {
   const bt = await load();
   // Holder, inside tmux, whose lease still names the pane of a previous incarnation. This is
-  // the real shape: `claude --resume <id>` keeps the session id and gets a NEW pane.
+  // the real shape: `claude --resume <id>` keeps the session id and gets a NEW pane — on soma's
+  // server, which is what lets the bus prove it (the fixture's verifier needs it there).
   const c = orch({
     lease: liveLease({ session_id: 'S1', tmux_pane: '%OLD', heartbeat_at: 0 }),
+    panes: ['%1', '%NEW'],
     env: { SOMA_TMUX_PANE: '%NEW' },
   });
   await bt.orchTools(c).get('soma_status')({});
@@ -2610,6 +2698,52 @@ test('beat() hands the heartbeat this session\'s pane, not just its id', async (
   });
   await bt.orchTools(n).get('soma_status')({});
   assert.deepEqual(n.s.beatOpts, [{ pane: null }], 'a session outside tmux offers null, not an empty string');
+});
+
+test('beat() offers only a pane it can prove, so a resume into another tmux server cannot re-point the lease', async () => {
+  const bt = await load();
+  // The holder was resumed into the operator's everyday tmux, into a `%3` that soma's server ALSO
+  // has (a lead's, say). Repairing the lease to `%3` would aim every wake at that lead, so the
+  // heartbeat is offered null, and `lease.heartbeat` leaves a null pane alone.
+  const c = orch({
+    lease: liveLease({ session_id: 'S1', tmux_pane: '%1', heartbeat_at: 0 }),
+    panes: ['%1', '%3'],
+    env: { SOMA_TMUX_PANE: '%3', TMUX: OWN_TMUX },
+  });
+  await bt.orchTools(c).get('soma_status')({});
+  assert.deepEqual(c.s.beats, ['S1'], 'the holder still stamped');
+  assert.deepEqual(c.s.beatOpts, [{ pane: null }]);
+});
+
+test('a resumed bus that never adopts takes the proof itself before the heartbeat carries a pane', async () => {
+  const bt = await load();
+  // `claude --resume` keeps the session id, so the lease is still this session's and the NEW bus
+  // process never calls soma_adopt: `beat()` is all that runs there. It has to prove the pane in
+  // this process, every time it would pass one, and can reuse nothing an adopt computed elsewhere.
+  for (const [label, env, want] of [
+    ['resumed into a pane on soma\'s server', { SOMA_TMUX_PANE: '%NEW' }, '%NEW'],
+    ['resumed into a pane on another server', { SOMA_TMUX_PANE: '%NEW', TMUX: OWN_TMUX }, null],
+  ]) {
+    const asked = [];
+    const c = orch({ lease: liveLease({ session_id: 'S1', tmux_pane: '%OLD', heartbeat_at: 0 }), panes: ['%1', '%NEW'], env });
+    const real = c.deps.paneOnServer;
+    c.deps.paneOnServer = (pane, tmuxVar) => { asked.push([pane, tmuxVar]); return real(pane, tmuxVar); };
+    await bt.orchTools(c).get('soma_status')({});
+    assert.deepEqual(asked, [['%NEW', env.TMUX ?? SOMA_TMUX]], `${label}: the proof is taken here, about this pane and this $TMUX`);
+    assert.deepEqual(c.s.beatOpts, [{ pane: want }], label);
+  }
+});
+
+test('the proof costs at most one tmux call a minute: beat\'s floor gates it', async () => {
+  const bt = await load();
+  let proofs = 0;
+  const c = orch({ lease: liveLease({ session_id: 'S1', tmux_pane: '%1', heartbeat_at: 0 }) });
+  const real = c.deps.paneOnServer;
+  c.deps.paneOnServer = (pane, tmuxVar) => { proofs += 1; return real(pane, tmuxVar); };
+  const tools = bt.orchTools(c);
+  for (let i = 0; i < 5; i += 1) await tools.get('soma_status')({});
+  assert.deepEqual(c.s.beatOpts, [{ pane: '%1' }], 'one heartbeat: the first call stamped, the floor held the rest');
+  assert.equal(proofs, 1, 'and so one proof');
 });
 
 // ---------------------------------------------------------------------------
@@ -2749,6 +2883,49 @@ test('soma_spawn with every seat closed refuses before the claim: the row stays 
   assert.deepEqual(c.s.spawns, []);
   assert.equal(c.s.fleet.tasks[0].status, 'queued');
   assert.equal(c.s.updates, 0, 'refused BEFORE the transaction, so no row was claimed and released');
+});
+
+test('soma_spawn and soma_resume refuse a soma.json loadConfig refuses, before the claim or the launch, in a sentence with no path in it', async () => {
+  const bt = await load();
+  // `configOf()` reads a THROW as "no config", which is right for a reader and wrong for a launch:
+  // once loadConfig began refusing a seats that is not an array, soma_spawn skipped its max_leads
+  // gate on such a file, claimed the row, stamped the stagger clock and failed
+  // only at the spawner's own read — and soma_resume went seat-blind into resumeLead's. The loader's
+  // own sentence carries the file's path, which the bus never echoes.
+  const refused = () => { throw new Error('/abs/soma/soma.json: seats must be an array of { "config_dir": …, "label": … } entries, or [] (or no seats key) for no rotation, got an object'); };
+  const fixture = (deps = {}) => orch({ tasks: [{ id: 'cr-1' }, { id: 'cr-2', status: 'failed', lead_session_uuid: 'u2' }], deps });
+  const c = fixture({ loadConfig: refused });
+  const tools = bt.orchTools(c);
+
+  const spawn = await tools.get('soma_spawn')({ task_id: 'cr-1' });
+  assert.equal(spawn.ok, false);
+  assert.match(spawn.error, /soma\.json could not be loaded/);
+  assert.match(spawn.error, /soma doctor/, 'the command that names the fault');
+  assert.ok(!spawn.error.includes('/abs/'), `the refusal echoed a path: ${spawn.error}`);
+  assert.deepEqual(c.s.spawns, []);
+  assert.equal(c.s.updates, 0, 'refused before the transaction: no row was claimed and released');
+  assert.equal(c.s.fleet.tasks[0].status, 'queued');
+  assert.equal(c.s.fleet.last_spawn_at, null, 'and the stagger clock was not stamped');
+
+  const resume = await tools.get('soma_resume')({ lead: 'cr-2' });
+  assert.equal(resume.ok, false);
+  assert.match(resume.error, /soma\.json could not be loaded/);
+  assert.ok(!resume.error.includes('/abs/'), `the refusal echoed a path: ${resume.error}`);
+  assert.deepEqual(c.s.resumes, []);
+  assert.equal(c.s.fleet.tasks[1].status, 'failed');
+
+  // A reader acts on nothing, so it keeps answering on the same file.
+  const status = await tools.get('soma_status')({});
+  assert.notEqual(status.ok, false, `soma_status refused: ${status.error}`);
+  assert.ok(Array.isArray(status.queue), 'soma_status still renders the fleet');
+
+  // The control: a config that loads spawns and resumes exactly as before.
+  const ok = fixture();
+  const okTools = bt.orchTools(ok);
+  assert.equal((await okTools.get('soma_spawn')({ task_id: 'cr-1' })).spawned, true);
+  assert.notEqual((await okTools.get('soma_resume')({ lead: 'cr-2' })).ok, false);
+  assert.deepEqual(ok.s.spawns, ['cr-1']);
+  assert.deepEqual(ok.s.resumes, ['cr-2']);
 });
 
 test('soma_spawn and soma_resume with no seats configured launch as before: {} and seat: null, and the pool is never asked', async () => {

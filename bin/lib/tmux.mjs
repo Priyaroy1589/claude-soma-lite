@@ -10,7 +10,9 @@
  * where `args` follows `tmux -L soma` — so tests record argument vectors
  * without a tmux server, and a future transport (ssh, a remote host) can be
  * dropped in without touching the callers. The default `run` adds a `stderr`
- * field; nothing requires it, and a stub that omits it works everywhere.
+ * field. Two readers look at it — `newSession`'s refusal and `serverAbsent` —
+ * and a stub that omits it still works everywhere: `serverAbsent` then never
+ * reads "no server", which is its safe answer.
  */
 import { execFileSync } from 'node:child_process';
 
@@ -52,8 +54,8 @@ const TIMEOUT_MS = 5000;
  * died is the fleet's main liveness probe — so execFileSync's throw is mapped
  * back to `{ code }`. stderr is captured rather than inherited: the watchdog
  * probes every tick, and tmux's "can't find session" would otherwise scroll
- * past the operator forever. Callers that need the reason (newSession) read it
- * off the returned object.
+ * past the operator forever. Callers that need the reason (newSession,
+ * serverAbsent) read it off the returned object.
  *
  * `timeout` is a parameter only so the tests can prove the hang path cheaply;
  * every caller takes the default.
@@ -175,6 +177,12 @@ export const listSessions = (run = defaultRun) =>
  * no-server message is tmux's, and a predicate that told them apart by wording would be one
  * release away from being wrong in the destructive direction.
  *
+ * The CLI's human reports do tell "no server" apart — a machine that has never run `soma up`
+ * should read as having no watchdog, not as an unreadable tmux — and they do it by asking
+ * `serverAbsent` about this function's `null`. Outside it, on purpose: neither of tmux's two
+ * no-server sentences proves that no server exists (see there), and in here the wrong answer is
+ * the destructive one.
+ *
  * A `Set`, never an object keyed by session name: `reconcile` requires `.has` for exactly the
  * reason its own header gives — an object registry answers truthy for every `Object.prototype`
  * key, and task ids may legally be `constructor`.
@@ -255,6 +263,58 @@ export function paneStates(run = defaultRun) {
     }
   }
   return out;
+}
+
+/**
+ * tmux's own two sentences for "no server answers on this socket", as its client prints them
+ * (measured, tmux 3.6a, both exit 1). A connect to a socket FILE that does not exist is ENOENT:
+ * `error connecting to <path> (No such file or directory)` — the machine that never started the
+ * server. A connect to a socket file nobody accepts on is ECONNREFUSED: `no server running on
+ * <path>` — the server that kill-server or its last session's exit took away, because neither
+ * unlinks the file. Anchored at both ends against the whole trimmed stderr, so a second line, or
+ * any other errno (`(Permission denied)`), is not a match.
+ */
+const NO_SERVER = [/^no server running on .+$/, /^error connecting to .+ \(No such file or directory\)$/];
+
+/**
+ * True when tmux could not be read BECAUSE, in tmux's own words, no server answers on soma's
+ * socket — asked with a probe that cannot start one (`list-sessions`; never `new-session`, which
+ * would bring up the very server it was asked about). False for everything else, a server that
+ * answered included: the timeout `defaultRun` synthesises, the empty stderr of a missing binary, a
+ * permission error, any other text. The words must arrive on stderr, with a non-zero exit.
+ *
+ * **Beside `liveSessions` and `paneStates`, never inside them, and never in reconcile.** Their
+ * `null` is the watchdog's "skip this tick", and that is the right answer to both sentences there,
+ * because neither one proves that no server exists:
+ *
+ * - ENOENT says only that the socket FILE is missing, which is also what a LIVE server looks like
+ *   after a /tmp cleaner has deleted its socket. Measured: the server and its sessions stay alive,
+ *   unreachable, until SIGUSR1 makes it recreate the socket (as tmux(1) documents).
+ * - ECONNREFUSED is also what a LIVE but wedged server answers on macOS once its accept queue
+ *   overflows. Measured: a stopped server and a few hundred timed-out clients, and the next probe
+ *   read `no server running on …` with the server still alive behind it.
+ *
+ * Read as an empty Set, either one makes every live lead dead in one tick: LEAD_DEAD, a respawn
+ * whose `new-session` starts a FRESH server on the same path, and two leads on one worktree.
+ * Skipping the tick costs one tick.
+ *
+ * The CLI's human reports may ask, and only about a `null`: `soma status` reads "no server" as an
+ * absent watchdog and an empty server, and `soma down` as "no session was running", exit 0 — where
+ * a machine that had never run `soma up` used to read `unverified`, and `down` exited 3 on it.
+ * Neither writes anything on the answer, and in either state above both are simply wrong — a
+ * declared residual, RUNBOOK §11.10. `soma kill` does not ask: its answer to an absence is a
+ * `failed` row, and over a live lead in either state that is the destructive case `stopper` in
+ * soma.mjs exists to refuse.
+ *
+ * Matching tmux's wording is what `liveSessions`' header refuses to do, and the refusal stands
+ * there. Here a tmux release that rewords either sentence only turns this answer false, and the
+ * CLI falls back to `unverified`, which is where it was before.
+ */
+export function serverAbsent(run = defaultRun) {
+  const r = run(['list-sessions', '-F', '#{session_name}']);
+  if (r.code === 0) return false;
+  const said = String(r.stderr ?? '').trim();
+  return NO_SERVER.some((re) => re.test(said));
 }
 
 /**

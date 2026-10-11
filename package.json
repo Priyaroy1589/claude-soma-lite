@@ -6,5 +6,5 @@
   "type": "module",
   "engines": { "node": ">=24" },
   "bin": { "soma": "bin/soma.mjs" },
-  "scripts": { "test": "SOMA_HOME=\"${SOMA_TEST_HOME:-$(mktemp -d)}\" node --test \"test/**/*.test.mjs\"" }
+  "scripts": { "test": "node --test \"test/**/*.test.mjs\"" }
 }

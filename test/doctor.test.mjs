@@ -1,3 +1,4 @@
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -63,6 +64,10 @@ const realFiles = async (t) => {
     home,
     guardFile: JSON.parse(readFileSync(s.writeWorktreeGuardrails(wt, { teammateAllow: [] }), 'utf8')),
     leadSettings: JSON.parse(readFileSync(s.writeLeadSettings('cr-1'), 'utf8')),
+    // The server names of the lead mcp.json soma REALLY writes, in the order it writes them.
+    // A hand-written `['soma']` stood here while the generator wrote two servers, so the
+    // healthy-machine test kept certifying a check that FAILed on every fleet with a lead.
+    leadMcpServers: Object.keys(JSON.parse(readFileSync(s.writeLeadMcpConfig('cr-1'), 'utf8')).mcpServers),
     leadArgv: sp.buildLeadArgv({ id: 'cr-1', sessionUuid: 'u1', brief: 'b', settingsPath: '/s', mcpPath: '/m', standingPath: '/d' }),
     mcpServers: s.enumerateUserMcpServers(),
   };
@@ -122,7 +127,7 @@ const healthy = (files, over = {}) => normalize(files, {
   workflowsEnabled: () => true,
   notifier: () => ({ ok: true, detail: 'osascript' }),
   repos: () => ({}),
-  leadMcpServers: () => ['soma'],
+  leadMcpServers: () => files.leadMcpServers,
   // `{servers, read, unreadable}`, not a bare array: the check has to be able to tell "no soma
   // in user scope" from "the file that would say was unreadable", and a bare array cannot.
   userScopeSomaServers: () => ({ servers: [], read: ['/h/.claude.json'], unreadable: [] }),
@@ -1098,6 +1103,52 @@ test('doctor confirms the argv edit-ban is lifted, and fails if it is re-imposed
     'doctor and the spawner disagree about which tools name the edit ban');
 });
 
+/**
+ * The recursion guard judges a lead's mcp.json against the SET of servers soma writes there:
+ * `soma` and the stateless `sequential-thinking`. It used to demand exactly `["soma"]`, so on
+ * every fleet that had spawned a lead it read FAIL and doctor exited 3 (#7). Order is not the
+ * subject — a JSON object's key order is the generator's accident — but every other change is:
+ * a server missing, one added, or one name standing in for the other.
+ */
+test('lead mcp single-server passes on the two servers a lead gets, and fails on any other set', async (t) => {
+  const files = await realFiles(t);
+  const { checks, LEAD_MCP_SERVERS } = await load('mcpset');
+  const NAME = 'lead mcp single-server';
+  const one = (names) => by(checks({}, healthy(files, { leadMcpServers: () => names })), NAME);
+
+  // The mcp.json writeLeadMcpConfig really wrote, then both orders spelled out by hand.
+  assert.equal(one(files.leadMcpServers).ok, true, `the mcp.json soma writes for every lead FAILs: ${one(files.leadMcpServers).detail}`);
+  assert.equal(one(['soma', 'sequential-thinking']).ok, true);
+  assert.equal(one(['sequential-thinking', 'soma']).ok, true, 'the order of the keys is not the guard');
+
+  for (const names of [
+    ['soma'],                                        // the reasoning server missing
+    ['sequential-thinking'],                         // the bus missing
+    [],
+    ['soma', 'sequential-thinking', 'extra_mcp'],    // a third server — the recursion finding
+    ['soma', 'extra_mcp'],                           // the right COUNT, a foreign name
+    ['soma', 'soma'],                                // the right count, a duplicate
+    ['sequential-thinking', 'sequential-thinking'],
+    ['soma', 'sequential-thinking', 'soma'],
+  ]) {
+    assert.equal(one(names).ok, false, `${JSON.stringify(names)} passed the recursion guard`);
+  }
+
+  // A FAIL says what it found, what is allowed, and why the rule exists. `extra_mcp` alone
+  // makes the last two observable: neither allowed name can come from what was found.
+  const foreign = one(['extra_mcp']).detail;
+  assert.match(foreign, /extra_mcp/, 'the detail must name what the file serves');
+  assert.match(foreign, /\bsoma\b/, 'the detail must name the allowed servers');
+  assert.match(foreign, /sequential-thinking/, 'the detail must name the allowed servers');
+  assert.match(foreign, /orchestrator bus/, 'the detail must say why: a lead that reaches an orchestrator bus can spawn leads');
+
+  // The drift pin, the same shape as the one above for LEAD_BANNED_TOOLS: doctor states the
+  // allowed set itself, so this is the one line that says it is the set the generator writes.
+  assert.ok(Array.isArray(LEAD_MCP_SERVERS), 'doctor must state its own list of the servers a lead may hold');
+  assert.deepEqual([...LEAD_MCP_SERVERS].sort(), [...files.leadMcpServers].sort(),
+    'doctor and writeLeadMcpConfig disagree about which servers a lead holds');
+});
+
 /* -------------------------------------------------- the rest of the sketch's checks */
 
 test('the version, auth, notifier, mcp-recursion and per-repo checks each fail alone', async (t) => {
@@ -1117,7 +1168,7 @@ test('the version, auth, notifier, mcp-recursion and per-repo checks each fail a
   // leads, which can spawn leads.
   assert.equal(one({ leadMcpServers: () => ['soma', 'extra_mcp'] }, 'lead mcp single-server').ok, false);
   assert.match(one({ leadMcpServers: () => ['soma', 'extra_mcp'] }, 'lead mcp single-server').detail, /extra_mcp/);
-  assert.equal(one({ leadMcpServers: () => ['extra_mcp'] }, 'lead mcp single-server').ok, false, 'the one server must BE soma');
+  assert.equal(one({ leadMcpServers: () => ['extra_mcp'] }, 'lead mcp single-server').ok, false, 'a lead mcp.json without soma');
   assert.equal(one({ leadMcpServers: () => [] }, 'lead mcp single-server').ok, false);
   assert.equal(one({ leadMcpServers: () => null }, 'lead mcp single-server').ok, null, 'no lead to read is unobserved');
   // A soma-SHAPED server that does not run soma's own bus is still the recursion finding.
