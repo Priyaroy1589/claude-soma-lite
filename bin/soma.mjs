@@ -1692,13 +1692,17 @@ export async function dispatch(argv, deps = {}) {
       // null` on the row, today's launch. Every seat closed or unverified is a refusal, not a
       // launch on this shell's own account, which is a seat too and may be the one that just
       // closed; the watchdog holds silently in the same case, a hand-run resume gets a sentence.
-      // A soma.json that will not load is the spawner's to refuse (it reads it too), so it is read
-      // tolerantly here and the launch stays seat-blind, said out loud.
-      let cfg = null;
+      // A soma.json that will not load is refused HERE, before the kill, with the loader's reason
+      // and `soma up`'s exit for it. It used to be read tolerantly as "the spawner's to refuse" —
+      // and the spawner does read the same file and refuse it, but only after the kill below has
+      // destroyed the death scene. A seats that is not an array is refused at load too, so that
+      // was every resume on such a file.
+      let cfg;
       try {
         cfg = d.loadConfig();
       } catch (e) {
-        d.warn(`soma resume: soma.json could not be read (${reason(e)}); resuming on this shell's own account, not a seat.`);
+        d.warn(`soma resume: ${reason(e)} — nothing was killed or resumed. Fix soma.json (\`soma doctor\` reads it too) and run this again.`);
+        return ENV;
       }
       const seated = Array.isArray(cfg?.seats) && cfg.seats.length > 0;
       let seat = null;

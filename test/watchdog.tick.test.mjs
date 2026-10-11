@@ -3482,6 +3482,67 @@ test('a revival picks its seat BEFORE the kill and before the attempt: a malform
   ranBefore(ok.order, 'pickSeat', 'killSession:lead-a');
 });
 
+test('a revival refuses a seats that is not an array at the pick, even when the pick answers null: no death scene, no attempt, no kill', async () => {
+  const { tick } = await load('lim-revive-nonarray-' + Date.now());
+  // `seatsConfigured` read a non-array `seats` as "no seats", so revival skipped the pick and
+  // launched seat-blind — into a spawner that reads the same soma.json, reaches `seats.loadSeats`
+  // through `launchRoots` → `seatRoots`, and throws AFTER the death scene, the attempt and the
+  // kill. Three ticks of one typo reached GAVE_UP. The row carries no seat label and the pick
+  // answers null without reading `cfg.seats` (the harness default, and what `seats.pick` does for
+  // an unreadable state/seats.json), so the refusal has to be the watchdog's own read of the pool:
+  // a fix that relied on the pick dep throwing would still kill this lead.
+  for (const seatsCfg of [{}, 'a', 5, true]) {
+    const name = `seats ${JSON.stringify(seatsCfg)}`;
+    const c = ctx({
+      cfg: cfgOf({ seats: seatsCfg }),
+      fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u', attempts: 1 })] },
+      alive: new Set(),                                                       // dead -> revival
+    });
+    await tick(c.deps);
+    assert.deepEqual(eventsOf(c, 'LEAD_DEAD'), [], `${name}: no death scene was captured`);
+    assert.equal(c.task().attempts, 1, `${name}: the attempt was not spent`);
+    assert.deepEqual(c.calls.killSession, [], `${name}: the dead pane is still standing`);
+    assert.deepEqual(c.calls.spawnLead, [], name);
+    assert.deepEqual(c.calls.resumeLead, [], name);
+    const err = oneEvent(c, 'WATCHDOG_ERROR');
+    assert.equal(err.payload.where, 'revival', name);
+    assert.equal(err.lead, 'a', name);
+    assert.match(err.payload.error, /cfg\.seats must be an array/, `${name}: reported by name, for the operator to fix`);
+  }
+  // The control: the same dead row with `seats: []` — no rotation — is killed, charged and
+  // relaunched, so the assertions above are the refusal and not a revival that never runs here.
+  const ok = ctx({
+    cfg: cfgOf({ seats: [] }),
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u', attempts: 1 })] },
+    alive: new Set(),
+  });
+  await tick(ok.deps);
+  assert.deepEqual(ok.calls.killSession, ['lead-a']);
+  assert.equal(ok.task().attempts, 2);
+  assert.equal(eventsOf(ok, 'LEAD_DEAD').length, 1);
+});
+
+test('admission with a seats that is not an array claims nothing: the pool is asked before the row is spawned', async () => {
+  const { tick } = await load('adm-nonarray-' + Date.now());
+  const { loadSeats } = await import('../bin/lib/seats.mjs');
+  // The pick as `seats.pick` makes it on a readable state file: through `loadSeats`, which refuses
+  // a non-array by name. Read as "no seats", `{}` let admission claim the row and launch into a
+  // spawner that throws on the same value — an attempt charged per tick until GAVE_UP failed the task.
+  const c = ctx({
+    cfg: cfgOf({ seats: {} }),
+    fleet: { tasks: [row({ id: 'b', status: 'queued' })] },
+    pickSeat: (now, cfg) => { loadSeats(cfg); return null; },
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.spawnLead, [], 'nothing was launched');
+  assert.deepEqual(c.calls.setTaskStatus, [], 'the row was never claimed');
+  assert.equal(c.task('b').status, 'queued');
+  assert.equal(c.task('b').attempts, 0, 'and no attempt was charged');
+  const err = oneEvent(c, 'WATCHDOG_ERROR');
+  assert.equal(err.payload.where, 'admission');
+  assert.match(err.payload.error, /cfg\.seats must be an array/);
+});
+
 test('cfg.seats [] — the value production actually passes — is no seats at all: no pool read, no reopen, no lock, today\'s launch', async () => {
   const { tick } = await load('lim-empty-' + Date.now());
   // A soma.json with no `seats` key — every config written before seats existed — makes
@@ -3662,7 +3723,7 @@ test('a row whose seat is not a usable label rotates FROM nowhere nameable, rath
   }
 });
 
-test('a reopen that answers with no array, and a cfg.seats that is not an array, are silent skips rather than a tick-ending throw', async () => {
+test('a reopen that answers with no array is a silent skip, and a cfg.seats that is not an array is one named error, never a tick-ending throw', async () => {
   const { tick } = await load('lim-guards-' + Date.now());
   // Two guards nothing could fail. `reopenSeats` is an injected dep and `for (const row of
   // undefined)` is a TypeError that costs the whole reopen pass — and, being reported against
@@ -3673,11 +3734,12 @@ test('a reopen that answers with no array, and a cfg.seats that is not an array,
     assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), [], `reopenSeats -> ${JSON.stringify(answer) ?? 'undefined'}`);
     assert.deepEqual(eventsOf(c, 'SEAT_REOPENED'), []);
   }
-  // `soma.json` is not validated for `seats` on purpose (`config.mjs`: "nothing here validates the
-  // entries, because loadConfig() runs on every tick and must not throw for a typo that soma
-  // doctor can name"), so a hand-written `"seats": "seat-a"` reaches the tick as a string.
-  // `seatOfRow`'s `!seatsConfigured(cfg)` half is what keeps `seats.loadSeats` — which refuses a
-  // non-array by name — from turning that typo into a WATCHDOG_ERROR every 30 s per limit-hit lead.
+  // A hand-written `"seats": "seat-a"` no longer reaches a tick from soma.json: `loadConfig`
+  // refuses a non-array `seats` (`config.mjs` `validated`), and the tick ends at its first line.
+  // An INJECTED one still can, and it is not "no seats" — that reading is what sent a dead lead
+  // seat-blind past the kill into a spawner that refuses the same value. It is a pool
+  // `seats.loadSeats` refuses by name, so the limit-hit lead's close throws before anything is
+  // closed or killed, and the phase files that sentence against the lead, once, without ending the tick.
   const typo = ctx({
     cfg: cfgOf({ seats: 'seat-a' }),
     fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u', seat: 'seat-a' })] },
@@ -3686,9 +3748,12 @@ test('a reopen that answers with no array, and a cfg.seats that is not an array,
     readTail: tail(FIVE_HOUR_ROW),
   });
   await tick(typo.deps);
-  assert.deepEqual(eventsOf(typo, 'WATCHDOG_ERROR'), [], 'a soma.json typo is soma doctor\'s to name, not a per-tick error');
+  const err = oneEvent(typo, 'WATCHDOG_ERROR');
+  assert.equal(err.payload.where, 'limits');
+  assert.equal(err.lead, 'a');
+  assert.match(err.payload.error, /cfg\.seats must be an array, got string/, 'named, so the operator can fix it');
   assert.deepEqual(typo.calls.closeSeat, [], 'and it closes nothing, because there is no readable pool to close in');
-  assert.equal(typo.calls.reopenSeats, 0);
+  assert.deepEqual(typo.calls.killSession, [], 'nor kills the lead it could not place');
 });
 
 // ═══════════════ The revert — ROTATION_FAILED restores the original seat ═══════════════

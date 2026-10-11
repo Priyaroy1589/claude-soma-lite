@@ -528,6 +528,32 @@ test('a seats overlay replaces the default wholesale, so a seat is removed by ed
   assert.deepEqual(c.loadConfig().seats.map((s) => s.label), ['seat-b']);
 });
 
+test('loadConfig refuses a seats that is not an array, naming the file, the key and the shape it wants', async (t) => {
+  const { c, p } = await fresh(t, 'seats-shape');
+  // A non-array `seats` used to load fine and be read as "no seats" by the watchdog's seat pick,
+  // while the spawner read the same value through `seats.loadSeats` and threw — after a dead
+  // lead's pane was killed and its revival attempt charged. Refused here, it never reaches either.
+  for (const value of [{}, 'a', 5, null, true]) {
+    seed(p, { seats: value });
+    assert.throws(() => c.loadConfig(), (e) => {
+      assert.match(e.message, /soma\.json/, `${JSON.stringify(value)}: the refusal must name the file`);
+      assert.match(e.message, /\bseats\b/, `${JSON.stringify(value)}: the refusal must name the key`);
+      assert.match(e.message, /config_dir/, `${JSON.stringify(value)}: the refusal must say what an entry looks like`);
+      return true;
+    }, `seats ${JSON.stringify(value)} was accepted`);
+  }
+  // What stays accepted: an empty pool, the key absent, a real pool — and an array whose ENTRY is
+  // malformed. Entries are `seats.loadSeats`' to judge and `soma doctor`'s to name, not this loader's.
+  seed(p, { seats: [] });
+  assert.deepEqual(c.loadConfig().seats, []);
+  seed(p, { max_leads: 2 });
+  assert.deepEqual(c.loadConfig().seats, [], 'absent, the default applies');
+  seed(p, { seats: [{ config_dir: '~/.claude-seat-a', label: 'seat-a' }] });
+  assert.deepEqual(c.loadConfig().seats.map((s) => s.label), ['seat-a']);
+  seed(p, { seats: ['not-an-entry'] });
+  assert.deepEqual(c.loadConfig().seats, ['not-an-entry'], 'a malformed entry is not this loader\'s to refuse');
+});
+
 test('the seats DEFAULTS array is frozen like every other allowlist', async (t) => {
   const { c } = await fresh(t, 'seats-frozen');
   // `/not extensible/`, not a bare TypeError: against a DEFAULTS with no `seats` at all,

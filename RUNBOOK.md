@@ -136,8 +136,11 @@ forever.
 ## 4. `soma.json`
 
 Optional. `loadConfig()` is `DEFAULTS` with your file layered over it, key by key, and unknown keys
-are preserved. Minimum useful file — **`repos` is the one you must fill in**, because a task naming
-an unconfigured repo cannot spawn:
+are preserved. A file that does not parse is refused, never read as the defaults, and so is a
+`seats` that is not an array. `soma up` then exits 2 with a message naming the key; a watchdog
+already running logs `WATCHDOG_ERROR` on every tick and acts on nothing until the file is fixed,
+exactly as it does for an unparseable file. Minimum useful file — **`repos` is the one you must fill
+in**, because a task naming an unconfigured repo cannot spawn:
 
 ```json
 {
@@ -161,7 +164,7 @@ an unconfigured repo cannot spawn:
 | `budgets` | see below | Per-lead token/turn/wall caps by class. |
 | `repos` | `{}` | `{ "<key>": { path, base_branch } }`. `base_branch` falls back to `develop`. |
 | `teammate_mcp_allow` | `[]` | Hands specific MCP servers back to teammates. Read `README.md` for its two measured limits before using it. |
-| `seats` | `[]` | The account pool (design 2026-09-15 §2): `[{ "config_dir": "~/.claude-seat-b", "label": "seat-b" }]`, one entry per Claude Code config dir that holds a separate `claude auth login` and whose `projects/` is a symlink to the fleet's shared transcript tree. Empty = one account, no rotation. An array, so an edit **replaces** the pool, and its ORDER is the priority order — every launch takes the first entry that is open and not `unverified`, so the account you watch goes LAST (§7 step 4). `~` expands against your home when the pool loads; a `config_dir` must be **absolute or `~`-prefixed** — a relative one is `resolve()`d against the cwd of whichever process read the pool, so a watchdog started from your home and a `soma` command run inside a repo name two different directories for the same entry, and the one that does not exist simply contributes nothing to the worktree MCP deny list without saying so; an empty `config_dir` is refused with a sentence; a missing `label` defaults to the dir's basename. `lib/seats.mjs` reads it; closures land in `state/seats.json` (`closed_until` is epoch ms, `0` = open) and are never shorter than five minutes nor longer than 32 days. A corrupt `state/seats.json` is never overwritten — fix or delete it by hand. |
+| `seats` | `[]` | The account pool (design 2026-09-15 §2): `[{ "config_dir": "~/.claude-seat-b", "label": "seat-b" }]`, one entry per Claude Code config dir that holds a separate `claude auth login` and whose `projects/` is a symlink to the fleet's shared transcript tree. Empty = one account, no rotation. It must be an array: `{}`, a string, a number or `null` is refused (above). A malformed *entry* inside the array is not refused at load; doctor's `seats readable` row names it. An array, so an edit **replaces** the pool, and its ORDER is the priority order — every launch takes the first entry that is open and not `unverified`, so the account you watch goes LAST (§7 step 4). `~` expands against your home when the pool loads; a `config_dir` must be **absolute or `~`-prefixed** — a relative one is `resolve()`d against the cwd of whichever process read the pool, so a watchdog started from your home and a `soma` command run inside a repo name two different directories for the same entry, and the one that does not exist simply contributes nothing to the worktree MCP deny list without saying so; an empty `config_dir` is refused with a sentence; a missing `label` defaults to the dir's basename. `lib/seats.mjs` reads it; closures land in `state/seats.json` (`closed_until` is epoch ms, `0` = open) and are never shorter than five minutes nor longer than 32 days. A corrupt `state/seats.json` is never overwritten — fix or delete it by hand. |
 | `resume_context_fraction` | `0.7` | Revival guard as a fraction of the context window, not an absolute. |
 | `tested_claude` | `2.1.178`–`2.1.999` | **Enforced, and this row used to say it was not.** The watchdog reads `claude --version` once per process and closes admission fleet-wide while it sits outside this range, emitting `VERSION_GATE`. Measured: `2.1.220` in range; `2.1.177`, `2.2.0` and `3.0.0` all out. It fails **open** only when the version or a bound will not parse. **The first Claude Code minor bump stops your queue** — widen `max` or re-run bring-up. |
 
@@ -391,7 +394,8 @@ Order of operations, and every step can stop it:
 2. **Already-live short-circuit.** If tmux reports `soma-watchdog` live, nothing is started, no new
    spend is authorised, and the **pause flag is still read and reported** — a live watchdog is *not*
    an open queue. Exit 0.
-3. `loadConfig()` → **exit 2** if it throws.
+3. `loadConfig()` → **exit 2** if it throws: a `soma.json` that does not parse, or a value §4 says
+   is refused. Nothing is projected, asked or started.
 4. **Print the worst-case spend projection.**
 5. **Ask, on the terminal.**
 6. `--canary`, if you passed it (§5.4) → **exit 3** unless it reports a pass.
@@ -626,7 +630,7 @@ Confirmed against the `switch` in `bin/soma.mjs`. Nothing below is aspirational.
 | `soma peek <lead> [--lines N]` | read-only pane tail (default 60, max 2000) |
 | `soma send <lead> "<msg>"` | type one line into the lead's composer and submit |
 | `soma kill <lead> ["reason"]` | kill the session, mark the row `failed` |
-| `soma resume <lead> [--force]` | restart a dead lead from its recorded claude session, on the seat `pick()` chooses — written to the row's `seat`; with no pool configured, this process's own `CLAUDE_CONFIG_DIR` and `seat: null`. The seat is picked **before** the kill, and every seat closed or unverified is a refusal (exit 3), not a launch on this shell's own account |
+| `soma resume <lead> [--force]` | restart a dead lead from its recorded claude session, on the seat `pick()` chooses — written to the row's `seat`; with no pool configured, this process's own `CLAUDE_CONFIG_DIR` and `seat: null`. The seat is picked **before** the kill, and every seat closed or unverified is a refusal (exit 3), not a launch on this shell's own account. A `soma.json` that `loadConfig()` refuses (§4) is refused before the kill too, with the loader's reason (exit 2) |
 | `soma retry <lead>` | re-queue a `failed` or `skipped` row |
 | `soma digest [--lines N]` | recent events, oldest first, **consuming nothing** |
 | `soma enqueue --file <f>` | add tasks from a JSON array |
@@ -755,7 +759,7 @@ The org spend cap is the one limit that does not rotate: it freezes admission th
 ```
 0  ok
 1  usage, or you declined
-2  this machine cannot run soma   (relative SOMA_HOME, no hard links, unreadable config)
+2  this machine cannot run soma   (relative SOMA_HOME, no hard links, a soma.json §4 refuses)
 3  soma refused                    (a fleet state, not an environment fault)
 ```
 

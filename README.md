@@ -388,7 +388,9 @@ soma2() {
 `$SOMA_HOME/soma.json` is optional. soma loads its defaults and layers your file over them key by
 key (objects merge; arrays such as `seats` replace). Unknown keys are kept. The file is re-read on
 every watchdog tick, so most edits apply on the next tick. An unreadable file is an error, never a
-silent fall-back to the defaults. soma never writes this file.
+silent fall-back to the defaults, and so is a `seats` that is not an array: `soma up` exits 2 naming
+the key, and a running watchdog logs `WATCHDOG_ERROR` every tick and does nothing until the file is
+fixed. soma never writes this file.
 
 **`repos` is the key you must fill in.** A task's `repo` field is a key into this map, not a path.
 With `repos` empty, a task cannot spawn: the watchdog retries it three times and then marks it
@@ -420,7 +422,7 @@ With `repos` empty, a task cannot spawn: the watchdog retries it three times and
 | `budgets` | see below | Per-class token, turn and wall-clock caps. |
 | `repos` | `{}` | `{ "<key>": { "path": "<absolute>", "base_branch": "<branch>" } }`. Doctor fails an entry that lacks either. When `base_branch` is missing, a spawn falls back to `develop`. A repo-level `verify_hint` is read by nothing. |
 | `teammate_mcp_allow` | `[]` | Personal MCP servers handed back to teammates, by exact name. See below. |
-| `seats` | `[]` | The account-rotation pool, in priority order: `[{ "config_dir": "~/.claude-seat-2", "label": "seat-2" }]`. `config_dir` must be absolute or `~`-prefixed. Empty means one account and no rotation. |
+| `seats` | `[]` | The account-rotation pool, in priority order: `[{ "config_dir": "~/.claude-seat-2", "label": "seat-2" }]`. `config_dir` must be absolute or `~`-prefixed. Empty means one account and no rotation. It must be an array: anything else is refused. |
 | `linger_minutes` | `45` | **Read by nothing.** The reaper that would use it is not built. |
 | `stall_minutes` | `20` | **Read by nothing.** There is no stall detector. |
 | `team_size_max` | `3` | **Read by nothing.** The lead's playbook limits team size, not the code. |
@@ -577,7 +579,7 @@ soma retry my-task-1            # put a failed or skipped row back on the queue
 | `soma peek <lead> [--lines N]` | Read-only tail of the lead's pane (default 60 lines, at most 2000). |
 | `soma send <lead> "<message>" [--force]` | Type one line into the lead's composer and submit it. Refused while the pane shows a dialog, a shell, a dead pane or nothing readable, unless `--force`. |
 | `soma kill <lead> ["<reason>"]` | Kill the lead's tmux session, read tmux back, then mark the row `failed`. Exit 3 means the lead may still be running and the row was left alone. |
-| `soma resume <lead> [--force]` | Restart a dead lead from its recorded Claude Code session, on the seat soma picks. Refuses while the session may still be live, unless `--force`. |
+| `soma resume <lead> [--force]` | Restart a dead lead from its recorded Claude Code session, on the seat soma picks. Refuses while the session may still be live, unless `--force`, and refuses a `soma.json` soma cannot load before it kills anything (exit 2). |
 | `soma retry <lead>` | Put a `failed` or `skipped` row back on the queue. A `done` row is refused: enqueue a new id instead. |
 | `soma digest [--lines N]` | The fleet's recent events across every stream, oldest first (default 40, at most 2000). Moves no cursor. |
 | `soma thaw` | Lift an organisation spend-cap freeze by clearing `state/backpressure.json`. Refuses a live rate-limit storm and an unreadable record. |
