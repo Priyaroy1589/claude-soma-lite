@@ -557,7 +557,9 @@ The watchdog tick (default 30 s) does seven things:
    `LEAD_PANE_RECOVERED`. `unobservable` (the screen could not be read) is **not a verdict**: it
    never alarms, never revives, and never overwrites a verdict already held. `soma status` shows
    the same reading in its `PANE` column (`working` / `idle` / `draft` / `prompt` / `shell` /
-   `exited` / `gone` / `other`, `?` when tmux could not be read, `-` for a row with no session).
+   `exited` / `gone` / `other`, `?` when tmux could not be read, `-` for a row with no session;
+   when no tmux server answers on soma's socket at all there are no panes to list, so a row with a
+   session reads `gone`).
    `draft` is text sitting unsent in the composer (a long `soma send` can land there without its
    Enter firing, and the delivery is not fixed yet); the composer is located under
    the `──── lead-<id> ─` rule a `--name`d session draws, so it fires on this fleet's leads.
@@ -771,9 +773,19 @@ read-back through `liveSessions`, which answers `null` for "not measured", givin
 | outcome | `kill` | `down` |
 |---|---|---|
 | `killed` — tmux exited 0 | row → `failed`, `KILLED` event, **exit 0** | `watchdog: stopped`, **exit 0** |
-| `absent` — tmux read back, nothing by that name | row → `failed`, **exit 0** (`not found (tmux read back)`) | `no session named soma-watchdog was running`, **exit 0** |
+| `absent` — tmux read back, nothing by that name | row → `failed`, **exit 0** (`not found (tmux read back)`) | `no session named soma-watchdog was running`, **exit 0** — also when no tmux server answers on soma's socket, and the line then names the socket (below, and §11.10) |
 | `live` — tmux answered, session still there | **row left untouched**, `KILL_REFUSED` event, **exit 3** | `the watchdog was NOT stopped`, **exit 3** |
 | `unmeasured` — tmux would not answer | **row left untouched**, `KILL_REFUSED` event, **exit 3** | `UNVERIFIED`, **exit 3** |
+
+**When no tmux server answers on soma's socket** (every machine before its first `soma up`, and
+after the fleet's last session has exited), tmux says so in one of two sentences: `error connecting
+to <path> (No such file or directory)` or `no server running on <path>`. Only `down` and `status`
+read them. `down` prints `no session named soma-watchdog was running (no tmux server answers on
+socket soma)` and exits 0, and `status` prints `watchdog: absent — no tmux server answers on socket
+soma, …`. `kill` does not, so it still refuses with exit 3, and neither does the watchdog, which
+skips the tick. Neither sentence proves that no server exists, and on that reading `kill` would
+write a `failed` row over a live lead and the watchdog would read every live lead as dead. §11.10
+names the two states in which a live server gives those sentences, and how to recover from each.
 
 **Read exit 3 from `kill` as: the lead may still be running, and soma refused to write a `failed`
 row over a possibly-live lead.** A `failed` row beside a live lead is the destructive case — you
@@ -822,9 +834,15 @@ soma retry task-42               # put a failed/skipped row back on the queue
 Three things worth knowing before you use them:
 
 - **`status` reports `?`, not `dead`, when tmux cannot be read.** A 5 s timeout on a wedged server
-  is byte-identical to a healthy server with nothing on it. Same three-state discipline on the
-  queue (`open` / `PAUSED` / `unreadable`) and the lease (holder / `none` / `UNREADABLE`) — an
-  unreadable state root is *not* evidence that admission is open.
+  is byte-identical to a healthy server with nothing on it. No tmux server answering on soma's
+  socket at all is a different answer, because tmux says so, and it reads as an empty server:
+  `watchdog: absent — no tmux server answers on socket soma`, spawned rows `dead` (§7, *Exit 3 on
+  `kill` and `down`*; §11.10). Same three-state discipline on the queue (`open` / `PAUSED` /
+  `unreadable`) and the lease (holder / `none` / `UNREADABLE`) — an unreadable state root is *not*
+  evidence that admission is open. And `open` is the flag's reading alone: it stands bare only
+  beside a live watchdog, and otherwise reads
+  ``open (no watchdog is running, so nothing is admitted until `soma up`)``, or says that whether
+  anything is admitting work is unknown.
 - **`attach`: press `Esc` before typing** if the lead is mid-turn, or your keystrokes interleave
   with its own output. Detach with `C-b d`. Attaching always works, even when the checkpoint is
   the thing that is broken.
@@ -1302,6 +1320,42 @@ closed.**
 
 `teammateCanEdit` is the canary invariant that would have caught this, and the canary driver does
 not exist on this build (§5.4) — which is why it reached you through a runbook section instead.
+
+### 11.10 A live tmux server can say "no server", and `status` and `down` then believe it
+
+`soma status` and `soma down` read tmux's two no-server sentences, `error connecting to <path> (No
+such file or directory)` and `no server running on <path>`, as an empty server (§7): `status`
+reports `watchdog: absent — no tmux server answers on socket soma` with every spawned lead `dead`,
+and `down` reports that no watchdog was running and exits 0. Both sentences were measured on tmux
+3.6a. Before the first `soma up`, and after the fleet's last session has exited, they are true. In
+two states a LIVE server gives them too, and then both reports are wrong while the server, its
+watchdog and its leads keep running:
+
+- **Its socket file was deleted while it runs** — a `/tmp` cleaner is the usual way. Measured in a
+  throwaway sandbox on tmux 3.6a, with a stand-in `soma-watchdog` session on a private socket rather
+  than a real fleet: once the live server's socket file was removed, tmux printed `error connecting
+  to <path> (No such file or directory)`, `soma status` reported the watchdog absent, and `soma
+  down` exited 0 saying none was running, while the server and that session stayed alive.
+  `SIGUSR1` to the server process recreated the socket, and `soma status` read the watchdog live
+  again (tmux(1) documents that signal for this). **Inferred, not reproduced:** that `soma up` would
+  then start a second server and a second watchdog on the same path. `up` needs a terminal to
+  confirm, so it was not run there; the inference is that a client that finds no socket file starts
+  a server there, which is what every first `soma up` does. **Recovery:** send `SIGUSR1` to the
+  orphaned server's process (`ps` lists it as `tmux -L <socket> …`) before anything else, and do not
+  run `soma up` until `soma status` reads the fleet again.
+- **It is wedged, and its accept queue has overflowed.** Measured on macOS, tmux 3.6a: a server
+  stopped with `SIGSTOP`, 300 clients started against it and killed, and the next client printed
+  `no server running on <path>` while the server was alive; a `new-session` then started a fresh
+  server on the same path and left the stopped one orphaned. So `status` and `down` misreport as
+  above, and `soma up` would start a second server and a second watchdog. **Recovery:** `SIGCONT`
+  resumes a stopped server. One that stays wedged has to be killed, which ends every session in it,
+  leads included, and from there it is the reboot path (§7, *Reboot contract*).
+
+Nothing is written on the wrong reading. `soma kill` does not take it (it refuses with exit 3, as
+for any unreadable tmux), and the watchdog never does (it skips the tick). The damage is a report
+that says the fleet is down when it is not, and a second fleet if you answer that report with `soma
+up`. `ps` is what tells a server that is really gone from these two states: if a tmux server process
+for soma's socket is still alive, you are in one of them.
 
 ---
 

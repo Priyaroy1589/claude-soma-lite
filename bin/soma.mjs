@@ -174,7 +174,7 @@ const REFUSED = 3;
  * the operator's Claude Code config, or block on a terminal. See the module header.
  */
 export const GUARDED_DEPS = Object.freeze([
-  'liveSessions', 'paneStates', 'newSession', 'killSession', 'sendKeys', 'capturePane', 'resumeLead',
+  'liveSessions', 'serverAbsent', 'paneStates', 'newSession', 'killSession', 'sendKeys', 'capturePane', 'resumeLead',
   'exec', 'capture', 'doctor', 'canary', 'confirm', 'linkProbe', 'installSkill',
 ]);
 
@@ -529,6 +529,8 @@ const confirm = (question) => {
  */
 export const realDeps = () => ({
   liveSessions: () => tmux.liveSessions(),
+  // Asked only about a `null` from `liveSessions`, and only by `status` and `down` — see `stopper`.
+  serverAbsent: () => tmux.serverAbsent(),
   paneStates: () => tmux.paneStates(),
   newSession: (spec) => tmux.newSession(spec),
   killSession: (name) => tmux.killSession(name),
@@ -765,15 +767,27 @@ export async function dispatch(argv, deps = {}) {
    *
    *   `killed`      tmux exited 0 on kill-session: the session existed and is gone.
    *   `absent`      no kill was needed, and tmux was READ BACK and reports nothing by that
-   *                 name — the state the caller asked for, verified rather than assumed.
+   *                 name — the state the caller asked for, verified rather than assumed. For a
+   *                 caller that opts in (below), also: tmux could list nothing because, in its
+   *                 own words, no server answers on the socket at all (`noServer: true`).
    *   `live`        the kill did not take: tmux answered and the session is STILL there.
-   *   `unmeasured`  tmux would not answer, so NEITHER claim can be made.
+   *   `unmeasured`  tmux would not answer, so NEITHER claim can be made. Without the opt-in,
+   *                 that includes "no server answers on the socket".
    *
-   * Both deps are resolved before anything runs, for the reason every arm resolves early:
-   * `need`'s TypeError is a wiring bug in the caller, and a caller that had already printed or
-   * written something would be reporting it as a fleet state.
+   * The opt-in is `serverAbsent`, and only `down` passes it. A machine that has never run `soma up`
+   * has no tmux server, so no watchdog session, and `down` writes nothing on that reading: it
+   * reports, and `soma down && …` must not break on the most ordinary machine there is. `kill`
+   * stays out, because its answer to `absent` is a `failed` row — and tmux's no-server sentences
+   * are also what a LIVE server answers once its socket file has been deleted, or, on macOS, once
+   * a wedged server's accept queue has overflowed (`tmux.serverAbsent`; RUNBOOK §11.10). A
+   * `failed` row over a live lead is exactly the destructive case above.
+   *
+   * Both deps are resolved before anything runs — and `down` resolves `serverAbsent` before it
+   * calls this — for the reason every arm resolves early: `need`'s TypeError is a wiring bug in
+   * the caller, and a caller that had already printed or written something would be reporting it
+   * as a fleet state.
    */
-  const stopper = () => {
+  const stopper = ({ serverAbsent = null } = {}) => {
     const killSession = N('killSession');
     const liveSessions = N('liveSessions');
     return (name) => {
@@ -789,7 +803,12 @@ export async function dispatch(argv, deps = {}) {
       // SESSION — none — so both go on to ask the server what is actually there.
       const after = liveSessions();
       const why = threw ? `the kill-session call threw: ${reason(threw)}` : null;
-      if (after === null) return { state: 'unmeasured', why: why ?? 'tmux could not be read back' };
+      if (after === null) {
+        // Asked only about a `null`, and only when the caller opted in: a listing tmux answered
+        // is never second-guessed by the probe.
+        if (serverAbsent !== null && serverAbsent() === true) return { state: 'absent', why, noServer: true };
+        return { state: 'unmeasured', why: why ?? 'tmux could not be read back' };
+      }
       if (after.has(name)) return { state: 'live', why };
       return { state: 'absent', why };
     };
@@ -813,10 +832,22 @@ export async function dispatch(argv, deps = {}) {
       const got = fleetOf();
       if (got.code) return got.code;
       const { fleet } = got;
-      const live = N('liveSessions')();
+      const serverAbsent = N('serverAbsent');
+      const listed = N('liveSessions')();
       // Three states, never two. `liveSessions` answers `null` when tmux could not be read at
       // all — a 5 s timeout on a wedged server is byte-identical to a healthy server with
       // nothing on it — and rendering that as "dead" would report ten working leads as gone.
+      //
+      // ONE kind of `null` is asked about again, here and in `down` only: tmux's own words for "no
+      // server answers on this socket" (`tmux.serverAbsent`), which is what a machine that has
+      // never run `soma up` answers. No server answering, no sessions to list — so that reading is
+      // an EMPTY server, not an unmeasured one: the watchdog absent, a spawned row `dead`, every
+      // pane `gone`. Every other `null` (a timeout, a missing binary, a permission error) stays
+      // `?`. This report writes nothing on the answer, and reconcile never asks:
+      // `tmux.serverAbsent` says why, and RUNBOOK §11.10 declares the two states in which a live
+      // server gives the same answer.
+      const noServer = listed === null && serverAbsent() === true;
+      const live = noServer ? new Set() : listed;
       const liveOf = (name) => (live === null ? '?' : live.has(name) ? 'yes' : 'dead');
 
       // The pane census (added after leads were found stalled on prompts nobody saw), for every
@@ -826,7 +857,9 @@ export async function dispatch(argv, deps = {}) {
       // printed, like every guarded dep in this arm.
       const paneStates = N('paneStates');
       const capturePane = N('capturePane');
-      const panes = paneStates();
+      // No server answering, no panes to list: the census takes an empty listing instead of asking
+      // tmux again, so the PANE column and the LIVE column describe one reading.
+      const panes = noServer ? new Map() : paneStates();
       const withSession = fleet.tasks.filter((t) => nonEmpty(t?.id) && t.status !== 'queued');
       const census = panes === null || panes === undefined
         ? null
@@ -839,14 +872,27 @@ export async function dispatch(argv, deps = {}) {
       };
 
       d.print(`state root: ${SOMA_HOME()}`);
+      // Read once, above the queue line, because that line needs it too.
+      const wd = liveOf(WATCHDOG);
       // Three states through the flag's one reader. An unreadable flag used to render as
       // `queue: open` — a two-state collapse in the file that insists on three everywhere else,
       // and the collapse fell on the side of the reassuring answer.
+      //
+      // And `open` is the FLAG's reading, which is not the whole answer to "is anything being
+      // admitted?": admission is the watchdog's tick. A bare `open` before `soma up` had ever run
+      // contradicted the help line that says `up` opens the queue — each right by its own lights —
+      // so `open` stands alone only beside a live watchdog, and otherwise says what is, or is not
+      // known to be, acting on it. PAUSED and unreadable describe the flag and are unchanged.
       const q = pausedFlag();
+      const openNote = wd === 'yes'
+        ? ''
+        : wd === '?'
+          ? ' (tmux could not be read, so whether any watchdog is admitting work is unknown)'
+          : ' (no watchdog is running, so nothing is admitted until `soma up`)';
       d.print(`queue: ${q.paused === true
         ? 'PAUSED — admission is frozen (soma_queue resume re-opens it)'
         : q.paused === false
-          ? 'open'
+          ? `open${openNote}`
           : `unreadable — the pause flag under ${p('state')} could not be read (${q.why}), so this`
             + ' is NOT a claim that admission is open. `soma doctor` diagnoses the state root.'}`);
 
@@ -899,12 +945,15 @@ export async function dispatch(argv, deps = {}) {
         d.print('orchestrator: none — no session holds the lease, so nothing is dispatching work');
       }
 
-      const wd = liveOf(WATCHDOG);
+      // An absence for want of a server says so, naming the socket by its one spelling: on a
+      // machine that runs two fleets, "no server on soma_pers" and "no server on soma" are
+      // different facts.
       d.print(wd === 'yes'
         ? `watchdog: live (tmux session ${WATCHDOG})`
         : wd === '?'
           ? `watchdog: unverified — tmux could not be read, so its state is unknown here`
-          : `watchdog: absent — nothing spawns, revives, meters or drains without it. Run \`soma up\`.`);
+          : `watchdog: absent — ${noServer ? `no tmux server answers on socket ${tmux.socketName()}, so ` : ''}`
+            + 'nothing spawns, revives, meters or drains without it. Run `soma up`.');
 
       // The seat pool (account rotation, spec §3.6): ONE line, three states, through the one
       // reader the bus also uses. The catch is the third state, not a fallback to "open".
@@ -1137,7 +1186,8 @@ export async function dispatch(argv, deps = {}) {
     }
 
     case 'down': {
-      const stop = stopper();
+      // The one caller that opts into the no-server reading — `stopper` says why `kill` does not.
+      const stop = stopper({ serverAbsent: N('serverAbsent') });
       const r = stop(WATCHDOG);
       // FOUR outcomes, and never a claim over the boolean alone — see `stopper`. A bare
       // `killSession(...) === true` reports a tmux that could not be reached as "no session was
@@ -1149,10 +1199,14 @@ export async function dispatch(argv, deps = {}) {
         d.print(`watchdog: stopped (tmux session ${WATCHDOG}).`);
       } else if (r.state === 'absent') {
         // VERIFIED absent, not inferred from a `false`: tmux answered, and nothing by that name
-        // is live. Zero here, symmetrically with `up`'s already-running path — an already-stopped
-        // watchdog is the state the operator asked for, and `soma down && …` must not break on
-        // a second run.
-        d.print(`watchdog: no session named ${WATCHDOG} was running (tmux was read back and reports none).`);
+        // is live — or it said, in its own words, that no server answers on the socket at all,
+        // which is where every machine that has not run `soma up` stands. Zero here,
+        // symmetrically with `up`'s already-running path — an already-stopped watchdog is the
+        // state the operator asked for, and `soma down && …` must not break on a second run, nor
+        // on a first run before any `up`.
+        d.print(`watchdog: no session named ${WATCHDOG} was running (${r.noServer
+          ? `no tmux server answers on socket ${tmux.socketName()}`
+          : 'tmux was read back and reports none'}).`);
       } else if (r.state === 'live') {
         d.warn(`soma down: the watchdog was NOT stopped — tmux answered and still reports`
           + ` ${WATCHDOG} as live${r.why ? ` (${r.why})` : ''}. It is therefore still supervising:`

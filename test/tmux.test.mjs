@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -422,6 +422,52 @@ test('paneStates keeps tabs inside a title, collapses a session to its ACTIVE pa
   assert.equal(proto.has('toString'), false, 'membership is Map membership, not property lookup');
 });
 
+test('serverAbsent is true only for tmux\'s own two "no server answers on this socket" sentences', async () => {
+  const t = await load('server-absent');
+  // A machine that has never started soma's server: no socket FILE, so the connect is ENOENT.
+  const never = recorder({ stdout: '', stderr: 'error connecting to /tmp/tmux-501/soma (No such file or directory)\n', code: 1 });
+  assert.equal(t.serverAbsent(never.run), true, 'never started: no socket file at all');
+  // One probe, against the whole server, and one that cannot start a server: `list-sessions`, never
+  // `new-session`, which would bring up the very server it was asked about.
+  assert.deepEqual(never.calls, [['list-sessions', '-F', '#{session_name}']]);
+  // kill-server and a last-session exit both LEAVE the socket file behind, and a connect to a socket
+  // file nobody listens on is ECONNREFUSED — tmux's other sentence for the same fact.
+  assert.equal(t.serverAbsent(() => ({ stdout: '', stderr: 'no server running on /tmp/tmux-501/soma\n', code: 1 })), true, 'stale socket file');
+  // Everything else is NOT a reading of "no server". False only means the caller keeps its
+  // `unverified` third state, which is the safe direction for every one of these.
+  for (const [what, r] of [
+    ['a server that answered', { stdout: 'soma-watchdog\n', stderr: '', code: 0 }],
+    ['the no-server words on an exit 0', { stdout: '', stderr: 'no server running on /tmp/x', code: 0 }],
+    ["defaultRun's own timeout", { stdout: '', stderr: 'tmux killed by SIGKILL after 5000ms', code: 1 }],
+    ['an empty stderr, which is what a missing binary leaves', { stdout: '', stderr: '', code: 1 }],
+    ['a stub that reports no stderr at all', { stdout: '', code: 1 }],
+    ['the words on stdout rather than stderr', { stdout: 'no server running on /tmp/x', code: 1 }],
+    ['a socket it may not open', { stdout: '', stderr: 'error connecting to /tmp/tmux-501/soma (Permission denied)', code: 1 }],
+    ['an unsafe socket directory', { stdout: '', stderr: 'directory /tmp/tmux-501 has unsafe permissions', code: 1 }],
+    ['a server that died under the client', { stdout: '', stderr: 'server exited unexpectedly', code: 1 }],
+    ['the words with another line after them', { stdout: '', stderr: 'no server running on /tmp/x\nlost server', code: 1 }],
+    ['the words with another line before them', { stdout: '', stderr: 'warning\nerror connecting to /tmp/x (No such file or directory)', code: 1 }],
+  ]) {
+    assert.equal(t.serverAbsent(() => r), false, what);
+  }
+});
+
+test('the no-server reading is serverAbsent\'s alone: liveSessions and paneStates still answer null for it', async () => {
+  const t = await load('server-absent-split');
+  // THE SPLIT IS BY CALLER, NOT BY STDERR. The watchdog's reconcile reads `liveSessions` and the
+  // census reads `paneStates`, and "error connecting … (No such file or directory)" says only that
+  // the socket FILE is missing — which is also what a LIVE server looks like after a /tmp cleaner
+  // deletes its socket. An empty Set there reads every live lead as dead: LEAD_DEAD, a respawn whose
+  // new-session starts a FRESH server, and two leads on one worktree. So both keep `null` ("skip
+  // this tick") for both sentences, and only the CLI's human reports ask `serverAbsent`.
+  for (const said of ['no server running on /tmp/tmux-501/soma', 'error connecting to /tmp/tmux-501/soma (No such file or directory)']) {
+    const run = () => ({ stdout: '', stderr: `${said}\n`, code: 1 });
+    assert.equal(t.liveSessions(run), null, `liveSessions on "${said}"`);
+    assert.equal(t.paneStates(run), null, `paneStates on "${said}"`);
+    assert.equal(t.serverAbsent(run), true, `serverAbsent on "${said}"`);
+  }
+});
+
 test('listPanes keeps tabs inside a pane title and tolerates an empty listing', async () => {
   const t = await load('panes');
   const { calls, run } = recorder({ stdout: '0\t0\tteam\tlead\n', code: 0 });
@@ -542,4 +588,45 @@ test('against a real tmux: the transcript path, the wake, and a wedged server', 
 
   assert.equal(t.killSession(name), true);
   assert.equal(t.hasSession(name), false);
+});
+
+test('against a real tmux: serverAbsent reads a never-started and a killed server as absent, a running one as present', { skip: !tmuxInstalled && 'tmux not installed' }, async (t_) => {
+  // A sandbox of its own, not only a socket name: TMUX_TMPDIR moves the directory tmux keeps every
+  // socket in, so not even a mistyped name could reach a live fleet's server. Both are set BEFORE the
+  // import — tmux.mjs reads SOMA_TMUX_SOCKET at load — and both reach the tmux child through the
+  // inherited environment.
+  const dir = mkdtempSync(join(tmpdir(), 'st-'));
+  const sock = `soma-absent-${process.pid}`;
+  const saved = { SOMA_TMUX_SOCKET: process.env.SOMA_TMUX_SOCKET, TMUX_TMPDIR: process.env.TMUX_TMPDIR };
+  process.env.SOMA_TMUX_SOCKET = sock;
+  process.env.TMUX_TMPDIR = dir;
+  // The cleanup names the sandbox itself rather than going through the module, so it cannot reach
+  // any other server whatever state the module ended up in.
+  const sandbox = (args) => spawnSync('tmux', ['-L', sock, ...args], { encoding: 'utf8', env: { ...process.env, TMUX_TMPDIR: dir } });
+  t_.after(() => {
+    sandbox(['kill-server']);
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const t = await load('server-absent-real');
+  assert.equal(t.tmuxArgs([])[1], sock, 'this test must not run on the production socket');
+  const said = () => t.defaultRun(['list-sessions', '-F', '#{session_name}']).stderr.trim();
+
+  // Never started: no socket file, so tmux says "error connecting to … (No such file or directory)".
+  assert.equal(t.serverAbsent(), true, `never started — tmux said: ${said()}`);
+  // ...while the watchdog's own reading of the very same thing stays "not measured".
+  assert.equal(t.liveSessions(), null);
+
+  const up = t.defaultRun(['new-session', '-d', '-s', `soma-absent-probe-${process.pid}`, 'cat']);
+  // A pty-exhausted host is an OS limit, not a regression (the same allowance as the test above).
+  if (up.code !== 0) return t_.skip(`tmux could not start a session here: ${up.stderr.trim()}`);
+  assert.equal(t.serverAbsent(), false, 'a running server is not absent');
+  const socketPath = t.defaultRun(['display-message', '-p', '#{socket_path}']).stdout.trim();
+  assert.ok(socketPath.startsWith(realpathSync(dir)), `expected a socket inside the sandbox, got ${socketPath}`);
+
+  // kill-server: the server is gone, its socket file stays behind (measured on 3.6a), and a connect
+  // to it is refused — tmux's OTHER sentence, "no server running on …".
+  assert.equal(t.defaultRun(['kill-server']).code, 0);
+  assert.equal(t.serverAbsent(), true, `after kill-server — tmux said: ${said()}`);
+  if (existsSync(socketPath)) assert.match(said(), /^no server running on /, 'a stale socket file must be the path this exercised');
 });
