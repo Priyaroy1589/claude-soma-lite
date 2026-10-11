@@ -1380,52 +1380,99 @@ test('the write-idiom scan stays linear on the shapes that made it quadratic', a
   // start position, the class runs to the end of the command, and the engine then
   // backtracks over every space hunting for `-i`. 200 KB of `'sed '` took **12 s** here
   // before the gap was bounded, and a heredoc quoting a shell script that mentions sed
-  // took 2.4 s. Both are now single-digit-to-20 ms.
+  // took 2.4 s. That rule has since left the gate (`WRITE_IDIOMS` stays only for its
+  // measurements), but the shapes stay: the tokenizer, the heredoc mask, the cd tracking and
+  // the live push/merge rule all run over them, and giving that live rule the same unbounded
+  // gap brings the 12 s straight back — "many git tokens" measured 11.6 s, against 0.75 s for
+  // a quarter of it.
   //
-  // The budget is deliberately fifty times the measured cost: this asserts "not
-  // quadratic", not "fast". A regression to the old shape blows a 1 s budget by an
-  // order of magnitude, so the test fails loudly without being a stopwatch.
+  // So this asserts GROWTH, not speed. It used to fail any shape above 3 s, and the slowest
+  // shape measures 0.36 s on macOS and 0.7 s on an idle 8-core ext4 Linux VM — where it still
+  // failed at 4.5 s once, and at 3.8 s on a loaded run, and passed on the rerun: `npm test` runs
+  // the test files in parallel, and the machine may be busy besides, so a stopwatch here
+  // measured the machine as much as the scan. Each shape is timed at today's size and at a
+  // quarter of it, alternately, and the fastest run of each is compared, which drops the runs a
+  // scheduler or a collection stretched: linear reads ~4 and quadratic ~16. The worst any shape
+  // read was 4.5 on macOS idle, 6.0 there with every core busy and 5.1 on the Linux VM, against
+  // a limit of 8; the unbounded gap above reads 15.5 to 16.7.
+  //
+  // Four details are measured, not decoration. Every shape runs once at a quarter size before
+  // anything is timed, and once at full size before its own rounds: in a fresh process the
+  // first shape timed otherwise read 6.8–7.4 on the Linux VM, its code still cold. A cheap
+  // shape gets more than five rounds, up to twenty or a quarter of a second of its own time:
+  // with every core busy, five rounds left one cheap shape reading 6.9. A shape whose first
+  // round reads under 2 stops there. The three cd shapes whose cost is a fixed budget did in
+  // every measured run (cd tracking gives up past `CWD_MAX` characters, and target resolution
+  // past 256 targets), and they cost about a second per call on the Linux VM: timing them five
+  // times like the rest made this test take 32–36 s there, against 14–18 s. A linear shape does
+  // now and then, when its first quarter-size run was the one stretched, and passes that run on
+  // less evidence. The exit cannot let superlinear growth through: under 2 is half of linear and
+  // an eighth of quadratic, so a quadratic shape would need its quarter-size run stretched about
+  // eight times more than its full-size run in the same round; noise on the full-size run only
+  // raises the ratio, which sends a shape into the full rounds, not out of them. And one
+  // absolute limit stays, at 30 s per call, as a backstop only: it is for a scan gone
+  // pathological outright, and sits over twenty times above the slowest call measured anywhere.
   const shapes = {
-    'many sed tokens, no separator': 'sed '.repeat(51_200),                       // 200 KB
-    'a heredoc that mentions sed': `cat <<'EOF'\n${'  # normalise with sed and awk\n'.repeat(5000)}EOF\n`,
-    'many git tokens': 'git '.repeat(51_200),
-    'git with 20000 option tokens': `git ${'-C '.repeat(20_000)}`,               // the option run
-    'git with 20000 option+value pairs': `git ${'-C x '.repeat(20_000)}`,
-    'an option run that never reaches a verb': `git ${'-a '.repeat(20_000)}commitX`,
-    'one enormous token': `git ${'a'.repeat(200 * 1024)}`,
-    'a slash storm': '/'.repeat(200 * 1024),
-    'an unterminated quote': `"${'a'.repeat(200 * 1024)}`,
-    'ten thousand redirects': 'x > f '.repeat(10_000),
+    'many sed tokens, no separator': (q) => 'sed '.repeat(51_200 * q),            // 200 KB at q = 1
+    'a heredoc that mentions sed': (q) => `cat <<'EOF'\n${'  # normalise with sed and awk\n'.repeat(5000 * q)}EOF\n`,
+    'many git tokens': (q) => 'git '.repeat(51_200 * q),
+    'git with 20000 option tokens': (q) => `git ${'-C '.repeat(20_000 * q)}`,  // the option run
+    'git with 20000 option+value pairs': (q) => `git ${'-C x '.repeat(20_000 * q)}`,
+    'an option run that never reaches a verb': (q) => `git ${'-a '.repeat(20_000 * q)}commitX`,
+    'one enormous token': (q) => `git ${'a'.repeat(200 * 1024 * q)}`,
+    'a slash storm': (q) => '/'.repeat(200 * 1024 * q),
+    'an unterminated quote': (q) => `"${'a'.repeat(200 * 1024 * q)}`,
+    'ten thousand redirects': (q) => 'x > f '.repeat(10_000 * q),
     // Shapes the newline separator and the `cd` tracking are what make reachable. Without
     // the length bound in `cdDestination`, `cd a` repeated normalizes a path that grows by
     // two characters each iteration — quadratic, and 80 000 of them is a 1 MB command.
-    'fifty thousand newline segments': 'echo x\n'.repeat(50_000),
-    'fifty thousand cds down': 'cd a\n'.repeat(50_000),
-    'fifty thousand cds up': 'cd ..\n'.repeat(50_000),
-    'fifty thousand unfollowable cds': 'cd $X\n'.repeat(50_000),
-    'twenty thousand cd-and-delete pairs': 'cd a && rm b\n'.repeat(20_000),
-    'twenty thousand subshell cds': '(cd a)'.repeat(20_000),
-    'two hundred thousand semicolons': ';'.repeat(200 * 1024),
-    'a hundred thousand newlines': '\n'.repeat(100 * 1024),
-    'a hundred thousand line continuations': `tee ${'\\\n'.repeat(100_000)}f`,
-    'fifty thousand wrapper words': `${'nice '.repeat(50_000)}tee f`,
-    'fifty thousand flags behind a wrapper': `nice ${'-n '.repeat(50_000)}tee f`,
-    'a one-megabyte single cd path': `cd ${'a/'.repeat(500_000)} && rm settings.local.json`,
+    'fifty thousand newline segments': (q) => 'echo x\n'.repeat(50_000 * q),
+    'fifty thousand cds down': (q) => 'cd a\n'.repeat(50_000 * q),
+    'fifty thousand cds up': (q) => 'cd ..\n'.repeat(50_000 * q),
+    'fifty thousand unfollowable cds': (q) => 'cd $X\n'.repeat(50_000 * q),
+    'twenty thousand cd-and-delete pairs': (q) => 'cd a && rm b\n'.repeat(20_000 * q),
+    'twenty thousand subshell cds': (q) => '(cd a)'.repeat(20_000 * q),
+    'two hundred thousand semicolons': (q) => ';'.repeat(200 * 1024 * q),
+    'a hundred thousand newlines': (q) => '\n'.repeat(100 * 1024 * q),
+    'a hundred thousand line continuations': (q) => `tee ${'\\\n'.repeat(100_000 * q)}f`,
+    'fifty thousand wrapper words': (q) => `${'nice '.repeat(50_000 * q)}tee f`,
+    'fifty thousand flags behind a wrapper': (q) => `nice ${'-n '.repeat(50_000 * q)}tee f`,
+    'a one-megabyte single cd path': (q) => `cd ${'a/'.repeat(500_000 * q)} && rm settings.local.json`,
   };
-  for (const [what, cmd] of Object.entries(shapes)) {
+  const time = (cmd) => {
     const started = process.hrtime.bigint();
     evaluateGate(bash(cmd), LEAD_ENV, () => false);
-    const ms = Number(process.hrtime.bigint() - started) / 1e6;
-    assert.ok(ms < 3000, `${what} (${(cmd.length / 1024).toFixed(0)} KB) took ${ms.toFixed(0)}ms — the scan went superlinear again`);
+    return Number(process.hrtime.bigint() - started) / 1e6;
+  };
+  for (const shape of Object.values(shapes)) time(shape(1 / 4));   // warms every quarter size
+  for (const [what, shape] of Object.entries(shapes)) {
+    const full = shape(1), quarter = shape(1 / 4);
+    const kb = (full.length / 1024).toFixed(0);
+    time(full);                                                    // and this the full one
+    let fullMs = Infinity, quarterMs = Infinity, spent = 0;
+    for (let round = 1; round <= 5 || (round <= 20 && spent < 250); round++) {
+      const q = time(quarter), ms = time(full);
+      assert.ok(ms < 30_000, `${what} (${kb} KB) took ${ms.toFixed(0)}ms — past the backstop, so the scan is pathological, not merely slow`);
+      quarterMs = Math.min(quarterMs, q);
+      fullMs = Math.min(fullMs, ms);
+      spent += q + ms;
+      if (round === 1 && fullMs / quarterMs < 2) break;   // a fixed budget, not growth: see above
+    }
+    const growth = fullMs / quarterMs;
+    assert.ok(growth < 8,
+      `${what}: ${kb} KB took ${fullMs.toFixed(1)}ms and a quarter of it ${quarterMs.toFixed(1)}ms — `
+      + `${growth.toFixed(1)}x the time for 4x the input, so the scan went superlinear again`);
   }
 
   // The syscall ceiling: both target budgets saturated with 64-deep paths that do not exist,
   // so every `resolveTarget` spends its whole ancestor budget failing — 2 × 256 targets ×
   // 64 levels ≈ 32 000 failing `realpath` calls, the most expensive shape there is.
   //
-  // The budget here is deliberately much looser than the loop above, and for a different
-  // reason: this shape is **syscall**-bound rather than CPU-bound, so it is the one assertion
-  // in this file whose cost depends on the machine's filesystem under load. Measured 621 ms;
+  // This one stays a stopwatch, and a deliberately loose one. It is **syscall**-bound rather
+  // than CPU-bound (profiled on macOS: 88% of it is `lstat` and `realpathSync`), so its cost
+  // depends on the machine's filesystem under load. But it measures 0.32 s on macOS and 0.39 s
+  // on the ext4 Linux VM, so 10 s leaves it 25 times its cost, where the old 3 s limit above
+  // left the slowest shape about 4 and flaked.
   // 10 s asserts "still bounded" — which is what would break if the 64-level ancestor cap or
   // the two target caps were removed *and* resolution went superlinear — without becoming the
   // suite's flake. Cap *removal* on its own is pinned by the pair in the per-generator test

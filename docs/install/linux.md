@@ -172,10 +172,6 @@ not know yet (*the operator's live transcripts carry no usage field this module 
 That failure is about your Claude Code version, not your install. Tests that need tmux or git skip
 themselves when the tool is missing.
 
-*the write-idiom scan stays linear on the shapes that made it quadratic* is a timing test and can
-also fail on a busy machine
-([issue 33](https://github.com/techfreakworm/claude-soma-lite/issues/33)).
-
 ## 3. Add the `soma` wrapper
 
 Do not run `soma` bare. Two things must be pinned, and both have caused real failures:

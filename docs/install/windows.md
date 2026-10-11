@@ -201,10 +201,6 @@ Code transcripts and can fail on a machine whose Claude Code writes a token-usag
 not know yet (*the operator's live transcripts carry no usage field this module does not know*).
 That failure is about your Claude Code version, not your install.
 
-*the write-idiom scan stays linear on the shapes that made it quadratic* is a timing test and can
-also fail on a busy machine
-([issue 33](https://github.com/techfreakworm/claude-soma-lite/issues/33)).
-
 ## 4. Add the `soma` wrapper
 
 Do not run `soma` bare. Two things must be pinned, and both have caused real failures:
