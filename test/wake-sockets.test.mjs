@@ -31,6 +31,7 @@
  * can fall back to the server the suite happens to run inside. `after` kills both servers and
  * deletes the directory.
  */
+import './soma-home.mjs';
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
