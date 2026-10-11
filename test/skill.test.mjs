@@ -489,11 +489,14 @@ test('the CLI fallback is present, triggered by a missing control tool, and conc
   // satisfied the naming pin above while never spelling `off-tmux`. So the window is doubled — one
   // sentence of this paragraph is ~118 characters, so 80 stays inside it — and the field name is an
   // alternative to the prose name, since either one identifies the excluded population.
-  assert.doesNotMatch(
-    injection,
-    /((off-?tmux|degraded_wake)[^.]{0,80}(included|\btoo\b|as\s+well|\balso\b)|(all|every|any)\s+holders?\b)/i,
-    'the injection claim must not be extended back to the holders it does not cover',
-  );
+  const OVERCLAIM = /((off-?tmux|degraded_wake)[^.]{0,80}(included|\btoo\b|as\s+well|\balso\b)|(all|every|any)\s+holders?\b)/i;
+  assert.doesNotMatch(injection, OVERCLAIM, 'the injection claim must not be extended back to the holders it does not cover');
+  // ...and the ban has to stay ABLE to fail on today's wording. It went blind once more: a
+  // parenthetical put `degraded_wake` ~85 characters before where an overclaim lands, past the
+  // window, and the overclaim below stayed GREEN. So it is applied here, in memory, and must be caught.
+  const overclaimed = injection.replace(/may\s+not\s+match\s+the\s+hook's\s+holder\s+test,\s+and\s+then\s+nothing\s+is\s+injected\s+at\s+all\./, 'is covered as well, and the injection reaches it.');
+  assert.notEqual(overclaimed, injection, 'could not observe: the hedged sentence this mutates is gone — re-anchor the mutation, do not delete it');
+  assert.match(overclaimed, OVERCLAIM, 'the overclaim ban cannot fail on this wording: keep `degraded_wake` or `off-tmux` within 80 characters of the claim');
   assert.match(fb, /soma_release/, 'the handback has no subcommand either; say so rather than implying one');
   // The §5 counterpart of the injection paragraph, and the other half of "two of those rows are not
   // substitutes". Also deletable-GREEN before this: the section-wide `/soma_release/` above is
