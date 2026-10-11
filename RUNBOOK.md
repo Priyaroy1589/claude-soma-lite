@@ -118,7 +118,9 @@ $SOMA_HOME/
   events/                <stream>.ndjson — one per lead, plus orch.ndjson
   heartbeats/            <lead> — touched by the lead's PostToolUse hook
   leads/<id>/            brief.md, mcp.json, settings.json, settings.launch.json,
-                         BUDGET_TRIPPED     (meta.json is in the design and in
+                         BUDGET_TRIPPED, BUDGET_WARNED (BUDGET_WARNED.delivered once
+                         the gate has handed the lead its 80% note)
+                         (meta.json is in the design and in
                          docs/ROADMAP.md, and NOTHING WRITES IT — see §9)
   logs/                  watchdog.log, <lead>.log (tmux pipe-pane transcripts)
   worktrees/<repo>/<id>/ the lead's checkout, on branch soma/<id>
@@ -176,9 +178,12 @@ an unconfigured repo cannot spawn:
 | `babysit` | 8,000,000 | 0 (disabled) | 0 (unbounded) |
 
 `tokens_cap` meters **the lead and its whole team** (teammate turns go to their own transcripts).
-`turn_cap` is calibrated per lead and is a backstop, not a budget. Warn at 80 %, hard trip at 100 %;
-a trip writes `leads/<id>/BUDGET_TRIPPED`, which the PreToolUse gate reads to deny every tool except
-the soma bus — so a tripped lead can still file `COMPLETED` or `ERROR`, and nothing else.
+`turn_cap` is calibrated per lead and is a backstop, not a budget. Warn at 80 %, hard trip at 100 %.
+A warning logs `BUDGET` on the orchestrator's stream and writes `leads/<id>/BUDGET_WARNED`; the
+PreToolUse gate attaches a one-time `soma:` note to the lead's next allowed tool call and renames the
+flag to `BUDGET_WARNED.delivered`, and teammates never get it. A trip writes
+`leads/<id>/BUDGET_TRIPPED`, which the PreToolUse gate reads to deny every tool except the soma bus —
+so a tripped lead can still file `COMPLETED` or `ERROR`, and nothing else.
 A lead is priced at the class pinned at enqueue when soma.json defines it, else at the class its
 newest `HARNESS` report reserves, else at `standard`; README's budget section has the exact rule
 and when `HARNESS_DEFAULTED` fires.

@@ -443,11 +443,13 @@ The retired key `resume_token_guard` is stripped with a warning if your file sti
   cache-creation tokens, plus a tenth of cache-read tokens, summed over every transcript Claude Code
   keeps for the lead's worktree (the lead's and its teammates'). `turn_cap` counts the lead's own
   turns and is a runaway-loop backstop, not a budget.
-- At 80% the watchdog logs a `BUDGET` event on the orchestrator's stream; nothing is sent to the
-  lead. At 100% it writes `leads/<id>/BUDGET_TRIPPED`, after which the gate denies the lead and its
-  teammates every tool except the soma bus: a tripped lead can still call its bus tools, and the
-  denial tells it to file `COMPLETED` or `ERROR` with what exists. **No verb clears a trip**: delete
-  the file by hand, or kill the lead.
+- At 80% the watchdog logs a `BUDGET` event on the orchestrator's stream and writes
+  `leads/<id>/BUDGET_WARNED`. The lead hears about it once: the gate attaches a short `soma:` note
+  to the lead's next tool call that it allows, then renames the flag to `BUDGET_WARNED.delivered`.
+  Teammates never get the note. At 100% the watchdog writes `leads/<id>/BUDGET_TRIPPED`, after
+  which the gate denies the lead and its teammates every tool except the soma bus: a tripped lead
+  can still call its bus tools, and the denial tells it to file `COMPLETED` or `ERROR` with what
+  exists. **No verb clears a trip**: delete the file by hand, or kill the lead.
 - The breaker prices a lead at the first class that resolves. A `budget_class` given at enqueue
   comes first, when soma.json's `budgets` defines it. Next is the class of the harness the lead
   declares (H1 standard, H2 and H3 iterate, H4 review, H5 babysit, H6 research), read from the

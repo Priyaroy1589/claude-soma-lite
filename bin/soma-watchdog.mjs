@@ -95,7 +95,7 @@ import * as tmux from './lib/tmux.mjs';
 import { modelDeviation, readDirUsage, readTailRows, readUsage } from './lib/tokens.mjs';
 import { nextAdmission } from './lib/wd/admission.mjs';
 import { MIN_EPOCH_MS, STORM_REASON, clearBackpressure, detectStorm, readBackpressure, writeBackpressure } from './lib/wd/backpressure.mjs';
-import { checkBudget, tripPath } from './lib/wd/budget.mjs';
+import { checkBudget, tripPath, warnPath } from './lib/wd/budget.mjs';
 import { classifyLimit } from './lib/wd/limit-state.mjs';
 import { CAPTURE_TIMEOUT_MS, CENSUS_LINES, takeCensus } from './lib/wd/pane-state.mjs';
 import { reconcile } from './lib/wd/reconcile.mjs';
@@ -168,7 +168,7 @@ const TAIL_ROWS = 40;
 export const REQUIRED_DEPS = Object.freeze([
   'loadConfig', 'readFleet', 'updateFleet', 'setTaskStatus',
   'aliveSessions', 'paneStates', 'readDirUsage', 'readUsage', 'budgetClassFor',
-  'appendEvent', 'notify', 'tripBudget', 'tripped',
+  'appendEvent', 'notify', 'tripBudget', 'warnBudget', 'tripped',
   'spawnLead', 'resumeLead', 'killSession', 'capturePane',
   'leadCwd', 'leadEvents', 'orchEvents', 'lastEventTs',
   'now', 'paneSignals', 'versionOk', 'queuePaused',
@@ -1187,7 +1187,14 @@ function meter(deps, cfg, task, history, now) {
     }
   } else if (verdict === 'warn' && !history.budget.has(task.id)) {
     // No toast: `prompts/orchestrator.md` says a BUDGET at 80 % is usually nothing to do, and
-    // the once-per-lead dedupe comes off the durable log rather than a second flag file.
+    // the once-per-lead dedupe comes off the durable log. `BUDGET_WARNED` is not a dedupe: the
+    // BUDGET event lands on the orchestrator's stream, which the lead never reads, so this flag is
+    // the lead's copy — the PreToolUse gate hands the lead a note on its next allowed tool call
+    // and renames the flag to `.delivered`. The flag goes FIRST because the logged BUDGET is the
+    // dedupe: a write that throws here logs nothing, the throw becomes this lead's WATCHDOG_ERROR,
+    // and the next tick tries both again. Logged first, a failed write would be deduped away and
+    // the lead never told.
+    deps.warnBudget(task.id);
     deps.appendEvent(ORCH, { type: 'BUDGET', payload: { pct: WARN_PCT, ...usage, ...caps }, lead: task.id });
   }
 
@@ -2090,7 +2097,19 @@ function leadCwd(task) {
  * only symptom is a lead that keeps spending.
  */
 function tripBudget(id) {
-  const fp = tripPath(id);
+  writeFlag(tripPath(id));
+}
+
+/**
+ * Write the BUDGET_WARNED flag the gate hands the lead as its 80% note, with the same self-heal:
+ * a warning that failed on a missing directory would leave the lead untold just as silently.
+ */
+function warnBudget(id) {
+  writeFlag(warnPath(id));
+}
+
+/** One breaker flag, stamped with the time: one write, and one mkdir first if `leads/<id>/` is gone. */
+function writeFlag(fp) {
   const body = `${Date.now()}\n`;
   try {
     writeFileSync(fp, body);
@@ -2118,6 +2137,7 @@ export function realDeps() {
     appendEvent,
     notify,
     tripBudget,
+    warnBudget,
     tripped: (id) => existsSync(tripPath(id)),
     // `undefined` for the spawner's own dep set so its default (`SPAWN_DEPS`/`RESUME_DEPS`) applies,
     // and the options object third: `resumeLead(task, {configDir})` would hand `{configDir}` over

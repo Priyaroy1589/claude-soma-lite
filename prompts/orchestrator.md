@@ -57,7 +57,7 @@ A wake means `soma_inbox`. Read it, mark it read, and act by type:
 | `MILESTONE` / `STARTED` | Read, do nothing. |
 | `COMPLETED` | Writeback (below), then let the lead go. Never merge, never mark ready. |
 | `ERROR` / `GAVE_UP` | Decide: `soma_resume(lead)`, re-queue with a sharper brief, or escalate. Say which in a `soma_send` or a digest line. |
-| `BUDGET` at 80% | Usually nothing — the lead is told to wind down. At 100% decide: clear the trip with a smaller scope, or let it end. |
+| `BUDGET` at 80% | Usually nothing — soma tells the lead to wind down, in a note on its next tool call. At 100% decide: clear the trip with a smaller scope, or let it end. |
 | `BACKPRESSURE` | Admission is frozen fleet-wide; `reason` says by what. `storm`: the watchdog corroborated a rate-limit storm across the fleet and lifts the freeze itself when the storm ends — wait for the watchdog. `org_level_disabled_until`: the organisation's spend cap is reached, every seat is closed at once, and the freeze holds in `state/backpressure.json` until a human clears it; nothing inside the fleet lifts it, so tell the operator (`soma thaw`, once the organisation raises the cap). Read it, and spawn nothing while it stands. |
 | `MODEL_DEVIATION` | Note it in the digest. It is detected, not prevented. |
 | `LEAD_DEAD` / `REVIVED` | The watchdog captured the death screen and relaunched the lead itself. Read them. Three attempts and then `GAVE_UP`, and the three land inside about 90 seconds, because no cooldown separates the ticks. |

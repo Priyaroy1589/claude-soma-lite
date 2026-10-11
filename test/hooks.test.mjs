@@ -2201,7 +2201,7 @@ test('arm (e): the cd-compound lever denies the asking shape only while its flag
     assert.deepEqual(probes.filter((p) => p.endsWith('CD_COMPOUND_ASKS')), [CD_FLAG],
       `the lever consulted the wrong flag path for ${JSON.stringify(cmd)}: ${probes.join(', ')}`);
   }
-  // …and a shape that does not ask never costs the syscall: the gate's I/O budget is one
+  // …and a shape that does not ask never costs the syscall: evaluateGate's I/O budget is one
   // existsSync per call, and the flag is read only once the predicate has matched.
   for (const cmd of runs) {
     const probes = [];
@@ -2285,6 +2285,328 @@ test('lead-gate the process: the cd-compound lever reads leads/<id>/CD_COMPOUND_
   const after = await runHook('lead-gate.mjs', { stdin: bash(cmd), env });
   assert.equal(after.code, 0);
   assert.equal(after.out, '', 'disarmed, the lever must fall silent again');
+});
+
+// ---------------------------------------------------------------------------
+// The 80% warning: delivered to the LEAD, once, as context, and never as an allow.
+//
+// At 80% of its class the watchdog writes `leads/<id>/BUDGET_WARNED` beside `BUDGET_TRIPPED`.
+// The gate is the one process that runs on every tool call and can also tell the lead from its
+// teammates, so it carries the note: the first time the lead makes a call the gate does not deny,
+// it renames the flag to `BUDGET_WARNED.delivered` and, only if that rename won, prints the note as
+// `additionalContext` with no `permissionDecision` key. Measured on Claude Code 2.1.296: that output
+// reaches the model, and it still does when the same call is then refused by a `permissions.deny`
+// rule under --dangerously-skip-permissions, the lead's launch mode.
+// ---------------------------------------------------------------------------
+
+const WARN_FLAG = join('/state', 'leads', 'cr-1', 'BUDGET_WARNED');
+const TRIP_FLAG = join('/state', 'leads', 'cr-1', 'BUDGET_TRIPPED');
+/** The 80% flag for cr-1 and nothing else: in particular the budget is NOT tripped. */
+const warned = (fp) => fp === WARN_FLAG;
+
+test('budgetWarning claims the 80% note for the lead alone, and only while the flag waits', async () => {
+  const { budgetWarning, evaluateGate, BUDGET_WARNING } = await gate();
+  const claim = { flag: WARN_FLAG, note: BUDGET_WARNING };
+
+  // The lead, the flag, no trip: the claim, meaning the flag the runner renames and the note it
+  // prints. Any tool carries it, the bus included: the note rides whichever allowed call is next.
+  assert.deepEqual(budgetWarning(bash('git status'), LEAD_ENV, warned), claim);
+  for (const tool of ['Read', 'Edit', 'Task', 'mcp__soma__soma_report']) {
+    assert.deepEqual(budgetWarning({ tool_name: tool, session_id: 'LEAD', tool_input: {} }, LEAD_ENV, warned), claim,
+      `${tool} did not carry the note`);
+  }
+
+  // No flag, no note, and the one probe was the flag the watchdog writes: the lead's ordinary call
+  // pays one existsSync for this arm, and the trip flag is only consulted once a warning waits.
+  const probes = [];
+  assert.equal(budgetWarning(bash('ls'), LEAD_ENV, (fp) => { probes.push(fp); return false; }), null);
+  assert.deepEqual(probes, [WARN_FLAG], 'the warning read the wrong flag path, or paid for a probe it did not need');
+
+  // Tripped outranks warned. The breaker's own reason already tells a lead past 100%, an 80% note
+  // after it would only confuse, and the flag stays where it is.
+  assert.equal(budgetWarning(bash('ls'), LEAD_ENV, (fp) => fp === WARN_FLAG || fp === TRIP_FLAG), null);
+  // A truthy trip reading counts as tripped, the same truthiness arm (a) denies on.
+  assert.equal(budgetWarning(bash('ls'), LEAD_ENV, (fp) => (fp === WARN_FLAG ? true : fp === TRIP_FLAG ? 1 : false)), null);
+  // And it holds on the bus, where a tripped lead's calls are ALLOWED (arm a's carve-out), so the
+  // gate's decision for them is `{}`: a claim keyed on that decision alone would hand a tripped lead
+  // the note on its soma_report call and consume the flag.
+  const both = (fp) => fp === WARN_FLAG || fp === TRIP_FLAG;
+  const report = { tool_name: 'mcp__soma__soma_report', session_id: 'LEAD', tool_input: {} };
+  assert.deepEqual(evaluateGate(report, LEAD_ENV, both), {}, 'precondition: the tripped bus call is allowed');
+  assert.equal(budgetWarning(report, LEAD_ENV, both), null, 'a tripped lead was handed the 80% note on its bus call');
+
+  // A teammate gets nothing and costs nothing: no probe at all, so the flag waits for the lead.
+  const mateProbes = [];
+  assert.equal(budgetWarning(mateBash('ls'), LEAD_ENV, (fp) => { mateProbes.push(fp); return true; }), null);
+  assert.deepEqual(mateProbes, [], 'a teammate call probed the state root');
+
+  // An unusable lead id never reaches the filesystem, exactly as in the breaker.
+  for (const bad of ['../../etc', 'cr 1', 'CR-1', '', undefined, null, 42, 'a/b']) {
+    const seen = [];
+    assert.equal(budgetWarning(bash('ls'), { ...LEAD_ENV, SOMA_LEAD_NAME: bad }, (fp) => { seen.push(fp); return true; }), null);
+    assert.deepEqual(seen, [], `SOMA_LEAD_NAME ${JSON.stringify(bad)} reached the filesystem`);
+  }
+
+  // Everything else fails toward silence: a warn reading that is truthy but not `true` (existsSync
+  // answers a boolean, anything else is a mistyped predicate), and a probe that throws. A note
+  // nobody earned is noise, and a missed one leaves the lead exactly where it was before this arm.
+  for (const truthy of ['yes', 1, {}, []]) {
+    assert.equal(budgetWarning(bash('ls'), LEAD_ENV, (fp) => (fp === WARN_FLAG ? truthy : false)), null,
+      `claimed on ${JSON.stringify(truthy)} instead of true`);
+  }
+  assert.equal(budgetWarning(bash('ls'), LEAD_ENV, () => { throw new Error('EIO'); }), null);
+
+  // Total over junk, loud about a missing predicate: the same contract as evaluateGate.
+  for (const junk of [undefined, null, {}, [], 'Bash', 42, { session_id: {} }]) {
+    assert.equal(budgetWarning(junk, LEAD_ENV, warned), null, `input ${JSON.stringify(junk)}`);
+    assert.equal(budgetWarning(bash('ls'), junk, warned), null, `env ${JSON.stringify(junk)}`);
+  }
+  for (const notAPredicate of [undefined, null, true, 'yes', {}]) {
+    assert.throws(() => budgetWarning(bash('ls'), LEAD_ENV, notAPredicate), TypeError);
+  }
+
+  // The note itself is rendered into the lead's context verbatim: short, no path, and it says
+  // where the lead stands, what to do now, and what happens at 100%.
+  assert.ok(typeof BUDGET_WARNING === 'string' && BUDGET_WARNING.length > 0 && BUDGET_WARNING.length < 400,
+    `the note is ${BUDGET_WARNING?.length} chars`);
+  assert.match(BUDGET_WARNING, /^soma: /);
+  assert.match(BUDGET_WARNING, /80%/);
+  assert.match(BUDGET_WARNING, /COMPLETED/);
+  assert.match(BUDGET_WARNING, /NEEDS_INPUT/);
+  assert.match(BUDGET_WARNING, /100%/);
+  assert.ok(!/[/\\]|leads|BUDGET_WARNED/.test(BUDGET_WARNING), `the note names a path or the flag: ${BUDGET_WARNING}`);
+});
+
+test('budgetWarning and evaluateGate agree on who the lead is, over every id shape', async () => {
+  const { budgetWarning, evaluateGate } = await gate();
+  // Two arms asking "is this the lead?" must never answer differently. Arm (b2) is the cleanest
+  // window onto the gate's own answer: untripped, it allows the bus exactly when isLead holds.
+  const shapes = [undefined, null, 42, '', ' ', 'LEAD', 'OTHER', 0, false, {}, []];
+  let leads = 0;
+  for (const sid of shapes) {
+    for (const uuid of shapes) {
+      const input = { tool_name: 'mcp__soma__soma_report', session_id: sid, tool_input: {} };
+      const env = { ...LEAD_ENV, SOMA_LEAD_SESSION_UUID: uuid };
+      const gateSays = allowed(evaluateGate(input, env, () => false));
+      assert.equal(budgetWarning(input, env, warned) !== null, gateSays,
+        `session_id ${JSON.stringify(sid)} vs uuid ${JSON.stringify(uuid)}: the two arms disagree on who the lead is`);
+      if (gateSays) leads++;
+    }
+  }
+  // Exactly the equal, non-empty string pairs: ' ', 'LEAD' and 'OTHER'. Never ['', ''].
+  assert.equal(leads, 3);
+});
+
+test('lead-gate the process: the 80% note reaches the lead once, as context and never as an allow', async (t) => {
+  const { BUDGET_WARNING } = await gate();
+  assert.ok(typeof BUDGET_WARNING === 'string' && BUDGET_WARNING !== '', 'no note exported to expect');
+  const home = await freshHome(t);
+  mkdirSync(join(home, 'leads', 'cr-1'), { recursive: true });
+  const env = { SOMA_HOME: home, SOMA_LEAD_NAME: 'cr-1', SOMA_LEAD_SESSION_UUID: 'LEAD' };
+  const flag = join(home, 'leads', 'cr-1', 'BUDGET_WARNED');
+  const delivered = `${flag}.delivered`;
+  const untouched = (why) => {
+    assert.equal(existsSync(flag), true, `${why}: the flag was consumed`);
+    assert.equal(existsSync(delivered), false, `${why}: the flag was marked delivered`);
+  };
+  const run = async (stdin) => {
+    const r = await runHook('lead-gate.mjs', { stdin, env });
+    assert.equal(r.code, 0);
+    assert.equal(r.err, '', 'the hook wrote to stderr');
+    // Whatever the gate prints is rendered into a model's context: never the state root.
+    assert.ok(!r.out.includes(home), `the output leaked the state root: ${r.out}`);
+    return r;
+  };
+  const note = { hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: BUDGET_WARNING } };
+
+  // No flag: today's output exactly, silence for an allowed call and the bare deny for a denied one.
+  assert.equal((await run(bash('git status'))).out, '');
+  const deniedBefore = await run(bash('git push'));
+  assert.equal(deniedBefore.json?.hookSpecificOutput?.permissionDecision, 'deny');
+
+  writeFileSync(flag, `${Date.now()}\n`);
+
+  // A teammate, same worktree, same env, same flag: nothing, and the note keeps waiting.
+  assert.equal((await run(mateBash('git status'))).out, '', "a teammate was handed the lead's note");
+  untouched('a teammate call');
+
+  // Unknowable is not the lead: a call with no session_id, and a lead id with no uuid to match.
+  assert.equal((await run({ tool_name: 'Bash', tool_input: { command: 'git status' } })).out, '', 'a call with no session_id was handed the note');
+  untouched('a call with no session_id');
+  const noUuid = await runHook('lead-gate.mjs', { stdin: bash('git status'), env: { SOMA_HOME: home, SOMA_LEAD_NAME: 'cr-1' } });
+  assert.equal(noUuid.code, 0);
+  assert.equal(noUuid.out, '', 'with no SOMA_LEAD_SESSION_UUID nobody is the lead, so nobody gets the note');
+  untouched('a session with no SOMA_LEAD_SESSION_UUID to match');
+
+  // A lead call another arm denies: that deny, byte for byte as before, with no note riding on it.
+  const denied = await run(bash('git push'));
+  assert.equal(denied.out, deniedBefore.out, 'a denied call changed shape because a warning was waiting');
+  untouched('a denied lead call');
+
+  // The lead's first allowed call: exactly one additionalContext and NO permissionDecision. An
+  // explicit allow would bypass the operator's own permission rules for this call.
+  const first = await run(bash('git status'));
+  assert.deepEqual(first.json, note, `the first allowed lead call did not carry the note: ${JSON.stringify(first.out)}`);
+  assert.deepEqual(Object.keys(first.json), ['hookSpecificOutput']);
+  assert.deepEqual(Object.keys(first.json.hookSpecificOutput).sort(), ['additionalContext', 'hookEventName'],
+    'the note path must print exactly these two keys: no permissionDecision of any kind');
+  assert.equal(existsSync(flag), false, 'the flag was not claimed');
+  assert.equal(existsSync(delivered), true, 'the claim left no record of the delivery');
+
+  // Once: the next lead call is silence again.
+  assert.equal((await run(bash('git status'))).out, '', 'the note was delivered twice');
+
+  // Presence is the protocol, and `.delivered` is only a record: a flag written again (the
+  // watchdog's retry after a lost BUDGET event) is one more note, over the old record.
+  writeFileSync(flag, `${Date.now()}\n`);
+  assert.deepEqual((await run({ tool_name: 'Read', session_id: 'LEAD', tool_input: {} })).json, note);
+  assert.equal(existsSync(flag), false);
+  assert.equal((await run(bash('git status'))).out, '');
+});
+
+test('lead-gate the process: a tripped lead gets the trip, never the 80% note, and the flag stays put', async (t) => {
+  const home = await freshHome(t);
+  const dir = join(home, 'leads', 'cr-1');
+  mkdirSync(dir, { recursive: true });
+  const env = { SOMA_HOME: home, SOMA_LEAD_NAME: 'cr-1', SOMA_LEAD_SESSION_UUID: 'LEAD' };
+  writeFileSync(join(dir, 'BUDGET_WARNED'), 'written at 80%\n');
+  writeFileSync(join(dir, 'BUDGET_TRIPPED'), 'written at 100%\n');
+
+  const r = await runHook('lead-gate.mjs', { stdin: bash('git status'), env });
+  assert.equal(r.code, 0);
+  assert.deepEqual(Object.keys(r.json?.hookSpecificOutput ?? {}).sort(), ['hookEventName', 'permissionDecision', 'permissionDecisionReason']);
+  assert.equal(r.json.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(r.json.hookSpecificOutput.permissionDecisionReason, /BUDGET_TRIPPED/);
+  assert.ok(!r.out.includes(home), 'the trip deny leaked the state root');
+
+  // The bus stays open to a tripped lead (arm a's carve-out). That call is allowed, and it must not
+  // carry the 80% note either.
+  const bus = await runHook('lead-gate.mjs', { stdin: { tool_name: 'mcp__soma__soma_report', session_id: 'LEAD', tool_input: {} }, env });
+  assert.equal(bus.code, 0);
+  assert.equal(bus.out, '', 'a tripped lead was handed the 80% note on its bus call');
+
+  assert.equal(existsSync(join(dir, 'BUDGET_WARNED')), true, 'a tripped lead consumed the warning');
+  assert.equal(existsSync(join(dir, 'BUDGET_WARNED.delivered')), false);
+});
+
+test('lead-gate the process: no deny, from any arm, carries the note or consumes the flag', async (t) => {
+  // The claim is made only once the decision is final. Every arm that can deny, each with a warning
+  // waiting: the deny comes out exactly as a deny always does, and the flag stays where it is.
+  const { BUDGET_WARNING } = await gate();
+  assert.ok(typeof BUDGET_WARNING === 'string' && BUDGET_WARNING !== '', 'no note exported to expect');
+  const home = await freshHome(t);
+  const dir = join(home, 'leads', 'cr-1');
+  mkdirSync(dir, { recursive: true });
+  const flag = join(dir, 'BUDGET_WARNED');
+  writeFileSync(flag, 'written at 80%\n');
+  writeFileSync(join(dir, 'CD_COMPOUND_ASKS'), 'armed, so arm (e) has something to deny\n');
+  const fx = claudeFixture(t);
+  const env = { SOMA_HOME: home, SOMA_LEAD_NAME: 'cr-1', SOMA_LEAD_SESSION_UUID: 'LEAD' };
+  const denies = [
+    ["arm (b2): a teammate's bus call", { tool_name: 'mcp__soma__soma_report', session_id: 'TEAMMATE', tool_input: {} }, /bus belongs to the lead/],
+    ['arm (c): the lead writing .claude/', { tool_name: 'Bash', session_id: 'LEAD', cwd: fx.wt, tool_input: { command: `tee ${fx.G}` } }, /credentials/],
+    ['arm (c): the lead deleting the warning itself', bash(`rm ${flag}`), /per-lead control directory/],
+    ['arm (d): the lead pushing', bash('git push'), /push or merge/],
+    ['arm (e): the lead on a cd-compound', { ...bash('cd /w/cr-1\necho probe\ngrep -n TODO src/app.ts'), cwd: '/w/cr-1' }, /`cd`/],
+  ];
+  for (const [what, stdin, reason] of denies) {
+    const r = await runHook('lead-gate.mjs', { stdin, env });
+    assert.equal(r.code, 0, what);
+    assert.deepEqual(Object.keys(r.json?.hookSpecificOutput ?? {}).sort(), ['hookEventName', 'permissionDecision', 'permissionDecisionReason'],
+      `${what}: not a bare deny: ${r.out}`);
+    assert.equal(r.json.hookSpecificOutput.permissionDecision, 'deny', what);
+    assert.match(r.json.hookSpecificOutput.permissionDecisionReason, reason, what);
+    assert.ok(!r.out.includes(home), `${what}: the deny leaked the state root`);
+    assert.equal(existsSync(flag), true, `${what}: a denied call consumed the flag`);
+    assert.equal(existsSync(`${flag}.delivered`), false, `${what}: a denied call marked the note delivered`);
+  }
+  // The flag those denies left alone is still the lead's to receive, on its next allowed call.
+  const ok = await runHook('lead-gate.mjs', { stdin: bash('git status'), env });
+  assert.equal(ok.json?.hookSpecificOutput?.additionalContext, BUDGET_WARNING);
+  assert.equal(existsSync(flag), false);
+});
+
+test('lead-gate the process: a claim that cannot complete is silence, and leaves every deny as it was', async (t) => {
+  const home = await freshHome(t);
+  const dir = join(home, 'leads', 'cr-1');
+  mkdirSync(dir, { recursive: true });
+  const env = { SOMA_HOME: home, SOMA_LEAD_NAME: 'cr-1', SOMA_LEAD_SESSION_UUID: 'LEAD' };
+  const flag = join(dir, 'BUDGET_WARNED');
+  // The deny as it is with no warning anywhere, to compare against byte for byte.
+  const plain = await runHook('lead-gate.mjs', { stdin: bash('git push'), env });
+  assert.equal(plain.json?.hookSpecificOutput?.permissionDecision, 'deny');
+
+  // A directory where the record goes makes the rename throw (EISDIR), so no claim can win.
+  writeFileSync(flag, 'written at 80%\n');
+  mkdirSync(`${flag}.delivered`);
+  writeFileSync(join(`${flag}.delivered`, 'occupied'), '');
+  for (let i = 0; i < 2; i++) {
+    const r = await runHook('lead-gate.mjs', { stdin: bash('git status'), env });
+    assert.equal(r.code, 0);
+    assert.equal(r.out, '', 'a claim that did not win must print nothing, never the note');
+    assert.equal(r.err, '', 'a failed claim must not surface as an error either');
+  }
+  assert.equal(existsSync(flag), true, 'a failed claim must leave the flag where it was');
+  const denied = await runHook('lead-gate.mjs', { stdin: bash('git push'), env });
+  assert.equal(denied.out, plain.out, 'a deny changed because a claim could not complete');
+});
+
+test("the watchdog's warnPath and the gate's probe name the same file, and the real gate consumes it", async (t) => {
+  // Writer and reader derive the path separately (the gate imports nothing), so agreement is
+  // measured, the way doctor measures it for BUDGET_TRIPPED: under each spelling of one root an
+  // operator might export, the file the watchdog writes is exactly the file the gate probes.
+  const { budgetWarning, BUDGET_WARNING } = await gate();
+  assert.ok(typeof BUDGET_WARNING === 'string' && BUDGET_WARNING !== '', 'no note exported to expect');
+  const home = await freshHome(t);
+  const { warnPath } = await import('../bin/lib/wd/budget.mjs');
+  const lead = { SOMA_LEAD_NAME: 'cr-1', SOMA_LEAD_SESSION_UUID: 'LEAD' };
+  try {
+    for (const spelling of [home, `${home}/`, `${home}/x/..`, `${home}/./`]) {
+      process.env.SOMA_HOME = spelling;
+      const writer = warnPath('cr-1');
+      const claim = budgetWarning(bash('ls'), { ...lead, SOMA_HOME: spelling }, (fp) => fp === writer);
+      assert.equal(claim?.flag, writer, `SOMA_HOME=${spelling}: the gate probes a different file from the one the watchdog writes`);
+    }
+  } finally {
+    process.env.SOMA_HOME = home;
+  }
+
+  // End to end: the real gate process, and the flag exactly where the writer puts it.
+  const writer = warnPath('cr-1');
+  mkdirSync(join(home, 'leads', 'cr-1'), { recursive: true });
+  writeFileSync(writer, 'written by the watchdog at 80%\n');
+  const r = await runHook('lead-gate.mjs', { stdin: bash('git status'), env: { ...lead, SOMA_HOME: home } });
+  assert.equal(r.json?.hookSpecificOutput?.additionalContext, BUDGET_WARNING, 'the real gate did not find the flag the writer wrote');
+  assert.equal(existsSync(writer), false, 'the real gate did not claim the file the writer wrote');
+  assert.equal(existsSync(`${writer}.delivered`), true);
+});
+
+test('lead-gate the process: gate registrations racing on one call deliver the note once', async (t) => {
+  // More than one registration of this gate can fire on the same call (the launch file and the
+  // worktree guard file each carry one), and matching hooks run in parallel. The rename is the
+  // claim: the process that moves the flag prints the note, and every other one finds it gone and
+  // prints nothing, exactly as today.
+  const { BUDGET_WARNING } = await gate();
+  assert.ok(typeof BUDGET_WARNING === 'string' && BUDGET_WARNING !== '', 'no note exported to count');
+  const home = await freshHome(t);
+  mkdirSync(join(home, 'leads', 'cr-1'), { recursive: true });
+  const env = { SOMA_HOME: home, SOMA_LEAD_NAME: 'cr-1', SOMA_LEAD_SESSION_UUID: 'LEAD' };
+  const flag = join(home, 'leads', 'cr-1', 'BUDGET_WARNED');
+
+  // Three rounds of eight: from the second round on, each winner also renames over the record the
+  // last winner left, so the claim is raced against an existing `.delivered` too.
+  for (let round = 1; round <= 3; round++) {
+    writeFileSync(flag, `written at 80%, round ${round}\n`);
+    const runs = await Promise.all(Array.from({ length: 8 }, () => runHook('lead-gate.mjs', { stdin: bash('git status'), env })));
+    const notes = runs.filter((r) => r.json?.hookSpecificOutput?.additionalContext === BUDGET_WARNING);
+    assert.equal(notes.length, 1, `round ${round}: ${notes.length} of ${runs.length} racing gates printed the note`);
+    for (const r of runs) {
+      assert.equal(r.code, 0);
+      assert.ok(r.out === '' || r.json?.hookSpecificOutput?.additionalContext === BUDGET_WARNING, `round ${round}: unexpected output: ${r.out}`);
+    }
+    assert.equal(existsSync(flag), false, `round ${round}: the flag survived the race`);
+    assert.equal(readFileSync(`${flag}.delivered`, 'utf8'), `written at 80%, round ${round}\n`, `round ${round}: the record is not this round's flag`);
+  }
 });
 
 // ---------------------------------------------------------------------------

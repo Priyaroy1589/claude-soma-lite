@@ -384,6 +384,32 @@ test('tripPath names <SOMA_HOME>/leads/<id>/BUDGET_TRIPPED and refuses an id tha
   }
 });
 
+test('warnPath names <SOMA_HOME>/leads/<id>/BUDGET_WARNED, beside the trip flag, and refuses the same ids', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'soma-wd-'));
+  const saved = process.env.SOMA_HOME;
+  t.after(() => {
+    rmSync(home, { recursive: true, force: true });
+    if (saved === undefined) delete process.env.SOMA_HOME;
+    else process.env.SOMA_HOME = saved;
+  });
+  process.env.SOMA_HOME = home;
+  const { warnPath } = await import('../bin/lib/wd/budget.mjs?warn-' + Date.now());
+  // The watchdog writes this at the 80% verdict and the gate hook renames it to
+  // BUDGET_WARNED.delivered on the lead's next allowed tool call. The gate derives the path on
+  // its own (it imports nothing), so a flag written anywhere else is a warning nobody delivers.
+  assert.equal(warnPath('task-1'), join(home, 'leads', 'task-1', 'BUDGET_WARNED'));
+  assert.equal(warnPath('constructor'), join(home, 'leads', 'constructor', 'BUDGET_WARNED'));
+  // The refusal names its own function, so an operator reading WATCHDOG_ERROR can tell the two
+  // flags apart.
+  const refused = { name: 'TypeError', message: /^warnPath: .* is not a legal task id/ };
+  for (const id of PROTO_KEYS.filter((k) => k !== 'constructor')) {
+    assert.throws(() => warnPath(id), refused, `${id} is not a legal task id`);
+  }
+  for (const id of ['../../etc', 'a/b', 'a.b', '', 'CR-1', null, undefined, 42]) {
+    assert.throws(() => warnPath(id), refused, `${JSON.stringify(id)} must never name a path`);
+  }
+});
+
 // ─────────────────────────── backpressure ───────────────────────────
 
 test('detectStorm needs two DISTINCT leads, not two signals from one', async () => {

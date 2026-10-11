@@ -129,7 +129,7 @@ const SHELL_FRAME = 'host% Operator: hello, this is your brief\nzsh: command not
 const ctx = (over = {}) => {
   const calls = {
     appendEvent: [], notify: [], spawnLead: [], resumeLead: [], killSession: [], capturePane: [],
-    tripBudget: [], setTaskStatus: [], readUsage: [], readDirUsage: [], budgetClassFor: [],
+    tripBudget: [], warnBudget: [], setTaskStatus: [], readUsage: [], readDirUsage: [], budgetClassFor: [],
     checkBudgetClocks: [], updateFleet: 0, aliveSessions: 0, paneStates: 0, queuePaused: 0, versionOk: 0,
     writeBackpressure: [], clearBackpressure: 0, readBackpressure: 0,
     // The limits phase, plus the options object each launch now carries.
@@ -186,6 +186,9 @@ const ctx = (over = {}) => {
     },
     notify: (title, body) => { calls.notify.push([title, body]); },
     tripBudget: (id) => { calls.tripBudget.push(id); order.push(`tripBudget:${id}`); },
+    // The 80% flag the gate hands the lead. `over.warnBudget` runs after the call is recorded, so a
+    // fixture can make the write throw and still see that it was attempted.
+    warnBudget: (id) => { calls.warnBudget.push(id); order.push(`warnBudget:${id}`); (over.warnBudget ?? (() => {}))(id); },
     tripped: (id) => (over.tripped ?? (() => false))(id),
     // `opts` is the seat: `{configDir}` or `{}`. Recorded beside the id, so the existing
     // `deepEqual(calls.spawnLead, ['a'])` assertions keep their shape.
@@ -841,6 +844,90 @@ test('a lead already warned in the log is not warned again', async () => {
   });
   await tick(c.deps);
   assert.deepEqual(eventsOf(c, 'BUDGET'), []);
+  assert.deepEqual(c.calls.warnBudget, [], 'the flag goes with the event: a lead warned once is not written a second note');
+});
+
+// ════════════════════ The 80% warning reaches the lead ════════════════════
+//
+// The BUDGET event lands on the orchestrator's stream, which the lead never reads. So at the 80%
+// verdict the watchdog also writes `leads/<id>/BUDGET_WARNED`, and the PreToolUse gate hands the lead
+// a note on its next allowed tool call (`bin/hooks/lead-gate.mjs`, job 5). The flag goes FIRST: the
+// logged BUDGET is the once-per-lead dedupe, so a write that failed after it landed would never be
+// retried and the lead would never be told.
+
+test('at 80% the watchdog writes the lead its flag, then logs the BUDGET', async () => {
+  const { tick } = await load('warnflag-' + Date.now());
+  const c = ctx({
+    cfg: cfgOf({ budgets: { standard: { tokens_cap: 1000, turn_cap: 0, wall_ms: 0 } } }),
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u' })] },
+    alive: new Set(['lead-a']),
+    readDirUsage: () => dirUsage({ est_tokens: 850, sessions: [usage({ uuid: 'u' })] }),
+  });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'BUDGET').payload.pct, 80);
+  assert.deepEqual(c.calls.warnBudget, ['a'], 'the lead was not written its 80% flag');
+  assert.deepEqual(c.calls.tripBudget, [], 'a warning is not a trip');
+  ranBefore(c.order, 'warnBudget:a', 'event:BUDGET');
+});
+
+test('at 100% the watchdog trips the lead and writes no 80% flag', async () => {
+  const { tick } = await load('tripnowarn-' + Date.now());
+  const c = ctx({
+    cfg: cfgOf({ budgets: { standard: { tokens_cap: 1000, turn_cap: 0, wall_ms: 0 } } }),
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u' })] },
+    alive: new Set(['lead-a']),
+    readDirUsage: () => dirUsage({ est_tokens: 1000, sessions: [usage({ uuid: 'u' })] }),
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.tripBudget, ['a']);
+  assert.equal(oneEvent(c, 'BUDGET').payload.pct, 100);
+  assert.deepEqual(c.calls.warnBudget, [], "a trip is not a warning: the gate's deny tells a tripped lead");
+});
+
+test('an 80% flag that cannot be written is a WATCHDOG_ERROR and no BUDGET, so the next tick retries both', async () => {
+  const { tick } = await load('warnfail-' + Date.now());
+  const fixture = (over = {}) => ctx({
+    cfg: cfgOf({ budgets: { standard: { tokens_cap: 1000, turn_cap: 0, wall_ms: 0 } } }),
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u' })] },
+    alive: new Set(['lead-a']),
+    readDirUsage: () => dirUsage({ est_tokens: 850, sessions: [usage({ uuid: 'u' })] }),
+    ...over,
+  });
+
+  const failed = fixture({ warnBudget: () => { throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }); } });
+  await tick(failed.deps);
+  assert.deepEqual(failed.calls.warnBudget, ['a'], 'the write was not even attempted');
+  const errs = eventsOf(failed, 'WATCHDOG_ERROR').filter((e) => e.payload?.where === 'budget');
+  assert.equal(errs.length, 1, `expected one budget WATCHDOG_ERROR: ${JSON.stringify(failed.calls.appendEvent.map((e) => e.type))}`);
+  assert.equal(errs[0].lead, 'a');
+  assert.deepEqual(eventsOf(failed, 'BUDGET'), [], 'a BUDGET logged over a failed write would dedupe the warning away for good');
+
+  // The next tick: the log still holds no BUDGET for this lead, so both are attempted again.
+  const next = fixture();
+  await tick(next.deps);
+  assert.deepEqual(next.calls.warnBudget, ['a']);
+  assert.equal(oneEvent(next, 'BUDGET').payload.pct, 80);
+});
+
+test('the real warnBudget writes the flag at warnPath, and heals a thinned state root to do it', async () => {
+  // The writer's half of the path agreement that hooks.test.mjs measures from the reader's side
+  // (the file at warnPath is the file the real gate claims). Real bytes under a throwaway
+  // $SOMA_HOME with no `leads/` at all: the write creates the directory instead of leaving the lead
+  // untold, the same self-heal `tripBudget` carries.
+  const home = mkdtempSync(join(tmpdir(), 'soma-wd-warn-'));
+  const savedHome = process.env.SOMA_HOME;
+  process.env.SOMA_HOME = home;
+  try {
+    const real = (await load('real-warn-' + Date.now())).realDeps();
+    const { warnPath } = await import('../bin/lib/wd/budget.mjs');
+    assert.equal(warnPath('a'), join(home, 'leads', 'a', 'BUDGET_WARNED'));
+    real.warnBudget('a');
+    assert.match(readFileSync(warnPath('a'), 'utf8'), /^\d+\n$/, 'the flag was not written, or not where warnPath says');
+  } finally {
+    if (savedHome === undefined) delete process.env.SOMA_HOME;
+    else process.env.SOMA_HOME = savedHome;
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 // ════════════════════════ Which class prices a lead ════════════════════════
@@ -2232,6 +2319,9 @@ test('REQUIRED_DEPS cannot be shortened at runtime, because a name dropped from 
   assert.throws(() => { mod.REQUIRED_DEPS[0] = 'x'; }, TypeError);
   assert.equal(mod.REQUIRED_DEPS.includes('queuePaused'), true);
   assert.equal(mod.REQUIRED_DEPS.includes('tripped'), true);
+  // The 80% flag. Optional-chained, a tick would log the BUDGET and never write the one thing the
+  // lead hears, and every injected test would still pass.
+  assert.equal(mod.REQUIRED_DEPS.includes('warnBudget'), true);
   // The pane census's listing. A tick that optional-chained it would skip the census silently
   // and every dead shell in the fleet would stay invisible, exactly as before the census.
   assert.equal(mod.REQUIRED_DEPS.includes('paneStates'), true);

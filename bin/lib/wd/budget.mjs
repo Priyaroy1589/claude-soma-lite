@@ -1,9 +1,9 @@
 /**
- * The circuit breaker's verdict, and the flag file that enforces it.
+ * The circuit breaker's verdict, and the two flag files that carry it to the lead.
  *
  * `checkBudget` is the whole of the judgement: usage in, `null | 'warn' | 'trip'` out,
- * no clock of its own and no I/O. The tick emits BUDGET at 80%, and at 100% writes
- * `tripPath(id)` — the file that turns enforcement on.
+ * no clock of its own and no I/O. At 80% the tick writes `warnPath(id)` and emits BUDGET;
+ * at 100% it writes `tripPath(id)` — the file that turns enforcement on.
  *
  * **Who consumes `tripPath`.** `bin/hooks/lead-gate.mjs`, the PreToolUse hook installed
  * in the lead's `--settings`: while `leads/<id>/BUDGET_TRIPPED` exists it denies every
@@ -13,6 +13,18 @@
  * spend goes, so a lead-only trip would be a breaker with no teeth. Presence is the
  * whole protocol; the contents are a debugging courtesy. Clearing a trip is an explicit
  * operator/orchestrator action (unlink), never a tick's decision.
+ *
+ * **Who writes and who consumes `warnPath`.** The BUDGET event at 80% lands on the
+ * orchestrator's stream, which the lead never reads; `leads/<id>/BUDGET_WARNED` is how the
+ * lead hears. The watchdog writes it once, at the 80% verdict, and BEFORE it logs that
+ * BUDGET event, because the logged event is the once-per-lead dedupe: a write that failed
+ * after the event landed would never be retried. The same gate hook consumes it: the first
+ * time the LEAD itself makes a tool call the gate allows, the gate renames the flag to
+ * `BUDGET_WARNED.delivered` and hands the lead a short wind-down note as context. Teammates
+ * never see or consume it, and neither does a tripped lead, which the trip already told.
+ * Presence is the protocol here too: the rename is the claim, so one flag is one note even
+ * when two registrations of the gate race on the same call, and `.delivered` is a record
+ * that nothing reads.
  *
  * **Governance is validated; evidence is tolerated — but only when it is wholly absent.**
  * A budget *class* that cannot be read is fatal and refused, because a class resolving to
@@ -71,24 +83,36 @@ const CAPS = ['tokens_cap', 'turn_cap', 'wall_ms'];
 /**
  * Legal task id, deliberately a copy of `fleet.mjs`'s `ID_RE` (which is not exported).
  *
- * `enqueue` is the one door into the fleet and the real path-traversal guard, but this
- * function names the only file the breaker has, and the gate hook only ever probes
- * `leads/<id>/BUDGET_TRIPPED`. An id that could resolve anywhere else would produce a
- * trip nobody enforces — a silently breakerless lead — so the cheap re-check stays.
+ * `enqueue` is the one door into the fleet and the real path-traversal guard, but these
+ * functions name the only two files the breaker has, and the gate hook only ever probes
+ * `leads/<id>/BUDGET_TRIPPED` and `leads/<id>/BUDGET_WARNED`. An id that could resolve
+ * anywhere else would produce a trip nobody enforces — a silently breakerless lead — or a
+ * warning nobody delivers, so the cheap re-check stays.
  */
 const ID_RE = /^[a-z][a-z0-9-]{0,63}$/;
 
 /**
- * The BUDGET_TRIPPED flag file for lead `id`: `<SOMA_HOME>/leads/<id>/BUDGET_TRIPPED`.
+ * One of the breaker's flag files for lead `id`: `<SOMA_HOME>/leads/<id>/<name>`.
  *
  * Built through `paths.leadDir` so the state root is resolved exactly once, in one
- * place, for every process that has to agree on this path.
+ * place, for every process that has to agree on this path. One validator for both flags,
+ * so they cannot drift; `fn` is only there so the refusal names the caller.
  */
-export function tripPath(id) {
+function flagPath(fn, id, name) {
   if (typeof id !== 'string' || !ID_RE.test(id)) {
-    throw new TypeError(`tripPath: ${show(id)} is not a legal task id (^[a-z][a-z0-9-]{0,63}$)`);
+    throw new TypeError(`${fn}: ${show(id)} is not a legal task id (^[a-z][a-z0-9-]{0,63}$)`);
   }
-  return join(leadDir(id), 'BUDGET_TRIPPED');
+  return join(leadDir(id), name);
+}
+
+/** The BUDGET_TRIPPED flag file for lead `id`: `<SOMA_HOME>/leads/<id>/BUDGET_TRIPPED`. */
+export function tripPath(id) {
+  return flagPath('tripPath', id, 'BUDGET_TRIPPED');
+}
+
+/** The BUDGET_WARNED flag file for lead `id`: `<SOMA_HOME>/leads/<id>/BUDGET_WARNED`. */
+export function warnPath(id) {
+  return flagPath('warnPath', id, 'BUDGET_WARNED');
 }
 
 /**
