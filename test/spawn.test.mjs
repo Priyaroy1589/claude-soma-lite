@@ -5,8 +5,9 @@
  *
  * Nothing in this file touches the repo working tree, spawns tmux, or runs `claude`. The
  * one test that exercises a real implementation (`withRepoLock`) writes only under the
- * throwaway `$SOMA_HOME` the test script mints.
+ * throwaway `$SOMA_HOME` that `soma-home.mjs` sets.
  */
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -15,6 +16,7 @@ import { dirname, join } from 'node:path';
 import { leadDir, logPath, worktreeDir, SOMA_HOME } from '../bin/lib/paths.mjs';
 import { enumerateUserMcpServers, writeWorktreeGuardrails } from '../bin/lib/settings-gen.mjs';
 import { withRepoLock } from '../bin/lib/worktree.mjs';
+import { socketName, tmuxArgs } from '../bin/lib/tmux.mjs';
 import * as s from '../bin/lib/spawn.mjs';
 
 // --- helpers -----------------------------------------------------------------
@@ -435,6 +437,28 @@ test('SOMA_HOME reaches the lead resolved and identical to what the bus config r
   const env = s.buildLeadEnv({ id: 'cr-1', env: { ...SPAWNER_ENV, SOMA_HOME: `${SOMA_HOME()}/` } });
   assert.equal(env.SOMA_HOME, SOMA_HOME(),
     'settings-gen writes SOMA_HOME() into mcp.json; two spellings of one root make the bus and the lead disagree about where state lives');
+});
+
+/**
+ * Issue #1. `env -i` dropped the socket and nothing put it back, so every lead's bus fell back to
+ * `soma` and typed its wakes into whatever pane held the orchestrator's pane id THERE: in the
+ * field, another fleet's orchestrator. Injected like SOMA_HOME, from the spawner's own module,
+ * because that is the server `tmux.newSession` creates the lead on: equal by construction.
+ */
+test('SOMA_TMUX_SOCKET reaches the lead as the server the spawner creates it on, injected and never copied', () => {
+  const env = s.buildLeadEnv({ id: 'cr-1', env: SPAWNER_ENV });
+  assert.equal(env.SOMA_TMUX_SOCKET, socketName());
+  assert.deepEqual(tmuxArgs([]), ['-L', env.SOMA_TMUX_SOCKET], 'the socket every tmux call from this process, newSession included, runs under');
+  const copied = s.buildLeadEnv({ id: 'cr-1', env: { ...SPAWNER_ENV, SOMA_TMUX_SOCKET: 'not-the-spawners-server' } });
+  assert.equal(copied.SOMA_TMUX_SOCKET, socketName(),
+    'a copied value can name a server the lead was not created on; the injected one cannot');
+  assert.ok(!s.ENV_ALLOW.includes('SOMA_TMUX_SOCKET'), 'injected, so it must not also ride the copy');
+});
+
+test('the env tmux starts the lead with names the server it is started on', () => {
+  const { deps, calls } = harness();
+  s.spawnLead({ id: 'cr-1', repo: 'r', brief: 'do x' }, deps);
+  assert.equal(calls.newSession[0].env.SOMA_TMUX_SOCKET, socketName());
 });
 
 test('an allow-listed variable set to empty is dropped, so "" cannot read as set', () => {
@@ -939,9 +963,10 @@ test('the worktree registration is kept as well, so both copies fire', () => {
  * If this test reds, nothing is broken — the two generators drifted and the fleet just got
  * slower. Re-sync them; do not delete the pin.
  */
-test('the external guard is byte-identical to the in-worktree one, so claude runs one hook', () => {
+test('the external guard is byte-identical to the in-worktree one, so claude runs one hook', (t) => {
   mkdirSync(SOMA_HOME(), { recursive: true });
   const dir = mkdtempSync(join(SOMA_HOME(), 'guardpin-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
   // Options passed explicitly so nothing reads soma.json or this machine's real MCP servers.
   const fp = writeWorktreeGuardrails(dir, { mcpDenies: ['probe'], teammateAllow: [], home: join(dir, 'nohome'), env: {} });
   const inWorktree = JSON.parse(readFileSync(fp, 'utf8')).hooks.PreToolUse;
@@ -1442,10 +1467,11 @@ test('preTrust is handed the SEAT\'s environment, so the mark lands in the file 
   }
 });
 
-test('AGAINST THE REAL preTrust: the mark lands in <configDir>/.claude.json and the spawner\'s own file is untouched', async () => {
+test('AGAINST THE REAL preTrust: the mark lands in <configDir>/.claude.json and the spawner\'s own file is untouched', async (t) => {
   const { preTrust } = await import('../bin/lib/pretrust.mjs');
   mkdirSync(SOMA_HOME(), { recursive: true });
   const root = mkdtempSync(join(SOMA_HOME(), 'seats-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
   const own = join(root, 'orch');                      // the spawner's own config dir, seeded so "untouched" is observable
   mkdirSync(own);
   writeFileSync(join(own, '.claude.json'), JSON.stringify({ projects: {} }));

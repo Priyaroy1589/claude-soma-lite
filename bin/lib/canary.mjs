@@ -597,8 +597,9 @@ export function formatCanary(result) {
  *
  * This function exists because that hand-rolled version has a trap in it, and the
  * trap is reachable from the most obvious code a caller would write. `soma up
- * --canary` wants to exit 2 on ERROR and 1 on FAIL, so it needs the result object
- * rather than `runCanary`'s boolean, and the natural spelling is
+ * --canary` does not need it: it exits 3 on any verdict that is not a pass, through
+ * `runCanary`'s boolean. A caller that wants an exit code per outcome — ERROR apart
+ * from FAIL — needs the result object instead, and the natural spelling is
  * `try { r = evaluateCanary(await drive()) } catch (e) { r = { reason: e.message } }`.
  * A driver that rejects with a non-Error — `Promise.reject(null)`, which this
  * module's own tests cover — makes `e.message` a TypeError inside the guard, and the

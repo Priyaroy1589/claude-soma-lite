@@ -91,11 +91,12 @@ soma_report("HARNESS", {
 
 The bus validates `harness_id` and `budget_class` before the event is stored, and each harness
 reserves exactly one class (H1→standard, H2→iterate, H3→iterate, H4→review, H5→babysit,
-H6→research) — that is the direction that binds, because the watchdog prices your harness, not your
-declaration. If it refuses, read the refusal and fix the field — never route around it.
-Once stored, the watchdog binds your circuit breaker to that class and the orchestrator holds a
-**one-turn veto**. Spend that turn on cheap, reversible setup (task list, roster, reading the gate
-script), not on dispatching work.
+H6→research) — that is the direction that binds, because the watchdog prices your harness (or a
+class the operator pinned for this task at enqueue), not your declaration. If it refuses, read the
+refusal and fix the field — never route around it.
+Once stored, the watchdog binds your circuit breaker to that class (or to the class the operator
+pinned) and the orchestrator holds a **one-turn veto**. Spend that turn on cheap, reversible setup
+(task list, roster, reading the gate script), not on dispatching work.
 
 Autonomy levels, and what each one forbids:
 
@@ -162,8 +163,9 @@ where one owner and one DEFAULT-REJECT verifier apply.
   draft PR exists. Not "the code is written". Not "tests pass locally, PR next turn".
 - `ERROR` — on hard failure, with the traceback and what you already tried.
 
-Budgets are mechanical. At 80% of your class you get a warning; at 100% the fleet trips a breaker
-and every tool but talking and reporting is denied. When you see the warning, stop starting work:
+Budgets are mechanical. At 80% of your class you get a warning, once: a `soma:` note attached to
+your next tool call, which your teammates do not see. At 100% the fleet trips a breaker and every
+tool but talking and reporting is denied. When you see the warning, stop starting work:
 land what is verifiable, file `NEEDS_INPUT` or `COMPLETED`, and say plainly what is unfinished.
 If context was compacted, call `soma_task()` and re-read your HARNESS contract before acting.
 

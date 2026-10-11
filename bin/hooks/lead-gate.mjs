@@ -2,9 +2,9 @@
 /**
  * `lead-gate.mjs` — the PreToolUse gate: the runtime half of "leads never code".
  *
- * Four bans, one process, and it is launched once per tool call. Two of them bind the
- * lead only; the `.claude/` / `$SOMA_HOME/leads/` family binds every session in the
- * worktree, teammates included:
+ * Four bans and one delivery, one process, and it is launched once per tool call. Two of
+ * the bans bind the lead only; the `.claude/` / `$SOMA_HOME/leads/` family binds every
+ * session in the worktree, teammates included; the delivery is for the lead alone:
  *
  *   1. **The budget breaker.** Once `leads/<id>/BUDGET_TRIPPED` exists the lead may
  *      no longer act. That flag is written by the watchdog when the declared budget
@@ -36,9 +36,10 @@
  *      arrives as an option's value. See the `.claude/` section below for the measured A/B
  *      and the verb-by-verb evidence.
  *   4b. **Writes under `$SOMA_HOME/leads/`, from anyone.** The per-lead control directory
- *      holds `BUDGET_TRIPPED` and `HOLD` — the flags rule 1 reads — plus the brief, the
- *      identity, and `settings.launch.json`, the `--settings` file whose registration is
- *      the only teammate enforcement that survives the worktree guard file being emptied.
+ *      holds `BUDGET_TRIPPED` and `HOLD` — the flags rule 1 reads — and `BUDGET_WARNED`, the
+ *      one job 5 renames, plus the brief, the identity, and `settings.launch.json`, the
+ *      `--settings` file whose registration is the only teammate enforcement that survives
+ *      the worktree guard file being emptied.
  *      Measured before this rule existed: **all 12 vectors ALLOW as a teammate**, 10 of 12
  *      as a lead. Denied **by path prefix, never by filename**, and it binds every session
  *      because a teammate that empties the launch file disarms the gate for every teammate
@@ -46,28 +47,42 @@
  *      not be a write target** (exact match, never a prefix — `worktrees/` lives under it), because
  *      `chmod 000 $SOMA_HOME` disarms the breaker by the identical mechanism. See the `leads/`
  *      section below for the ruling and its edge cases.
+ *   5. **The 80% warning, delivered to the lead.** At 80% of the budget class the watchdog
+ *      writes `leads/<id>/BUDGET_WARNED` beside `BUDGET_TRIPPED`; the BUDGET event it also
+ *      logs goes to the orchestrator's stream, which the lead never reads. This process runs
+ *      on every tool call and is the one place that can tell the lead from a teammate, so it
+ *      carries the note: on the lead's first call that nothing here denies, and only while
+ *      the budget is not tripped, it claims the flag with one atomic `renameSync` to
+ *      `BUDGET_WARNED.delivered` and, only if that rename won, prints the note as
+ *      `additionalContext`. **That rename is the gate's one write, of a flag the watchdog
+ *      wrote for it**; everything else here only reads. Teammates never see or consume the
+ *      note. `budgetWarning` has the rules.
  *
  * **Fail-open is the design, not a concession.** Every path that is not a decided
  * deny exits 0 with nothing on stdout, which Claude Code reads as "this hook has no
- * opinion". A gate that crashes, times out, or cannot parse its input lets the tool
- * through, because an over-eager gate wedges a lead — it cannot report, cannot wind
- * down, and burns a slot until an operator notices — while a missed idiom costs one
- * stray write that the worktree's deny list, the draft-only PR wrapper and the
- * verifier all still stand behind. The residual hole is declared in the spec: a lead
- * can still write through a subprocess (`python -c 'open(...,"w")'`); regexes narrow
- * that, sealing it needs OS sandboxing.
+ * opinion" — except the one call that delivers the 80% note (job 5), which still states
+ * no opinion on the call and only adds context. A gate that crashes, times out, or
+ * cannot parse its input lets the tool through, because an over-eager gate wedges a
+ * lead — it cannot report, cannot wind down, and burns a slot until an operator
+ * notices — while a missed idiom costs one stray write that the worktree's deny list,
+ * the draft-only PR wrapper and the verifier all still stand behind. The residual hole
+ * is declared in the spec: a lead can still write through a subprocess
+ * (`python -c 'open(...,"w")'`); regexes narrow that, sealing it needs OS sandboxing.
  *
  * Allow is silence, never `permissionDecision: "allow"`. An explicit allow *bypasses*
  * the operator's own permission rules for that call, so a hook that answered "allow"
  * to everything it did not recognise would quietly promote the lead past every deny
- * in `settings.local.json`.
+ * in `settings.local.json`. The 80% note keeps that rule: its output carries
+ * `additionalContext` and no `permissionDecision` key at all, so the call goes on to the
+ * permission system exactly as it would after silence.
  *
  * Nothing is imported from `../lib/`. This is the most safety-critical of the four
  * hooks and the one that runs most often, so it depends on `node:` only: a typo in a
  * shared module cannot disarm the breaker, and the process does no I/O beyond one
- * `existsSync`.
+ * `existsSync` (a lead's own calls pay a second, for `BUDGET_WARNED`; while a warning
+ * waits, a third re-checks the trip, and the call that delivers it pays one `renameSync`).
  */
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, realpathSync, renameSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path';
 import process from 'node:process';
@@ -564,8 +579,10 @@ const CLAUDE_DIR = '.claude';
 // **Denying the whole subtree costs the fleet nothing, and that is why the trade is cheap.**
 // Its three legitimate writers are separate processes this gate never hooks: the spawner, the
 // watchdog and the lead's Stop/PostToolUse hooks all write with Node's `fs`, not through a Bash
-// tool call. The heartbeat lands in `$SOMA_HOME/heartbeats/`, a sibling of `leads/`, not inside
-// it. And `soma doctor`, which really does write `leads/doctor-probe/`, reaches this hook as the
+// tool call. So does the one write this gate makes itself, the rename of `BUDGET_WARNED` (job 5
+// in the header), which is never a Bash command at all. The heartbeat lands in
+// `$SOMA_HOME/heartbeats/`, a sibling of `leads/`, not inside it. And `soma doctor`, which
+// really does write `leads/doctor-probe/`, reaches this hook as the
 // command string `soma doctor` — no writer verb, no path — so a verb-and-path-keyed rule cannot
 // see it. Every one of those is pinned as an ALLOW in the tests.
 //
@@ -693,9 +710,10 @@ const WRITES_EVERY_ARG = new Set([
  *
  * **Resolving the program instead of the token is the fix this cannot have.** It would mean a
  * `$PATH` search plus a `realpath` per verb per tool call, in a hook that runs on every tool
- * call and whose whole budget is one `existsSync`; and the answer would be machine-specific,
- * so the gate would be stricter on this laptop than in CI. The token list is the cheap
- * approximation, and the residual is stated where it belongs — under `WRITES_WITH_IN_PLACE`.
+ * call and whose whole budget is an `existsSync` or two, plus one `renameSync` per 80%
+ * warning delivered; and the answer would be machine-specific, so the gate would be stricter
+ * on this laptop than in CI. The token list is the cheap approximation, and the residual is
+ * stated where it belongs — under `WRITES_WITH_IN_PLACE`.
  */
 const VIM_FAMILY = [
   'vi', 'vim', 'ex', 'view', 'gvim', 'gview', 'evim', 'eview',
@@ -1758,40 +1776,12 @@ const CD_COMPOUND_DENY = 'soma: this Claude Code build stops on an unanswerable 
 const CLAUDE_DENY = 'soma: .claude/ configures the agent harness itself — the settings, hooks and permissions every session in this worktree runs under. Changing it changes the rules you are running under, so it is not yours to write. If your task genuinely needs a change there, ask the orchestrator. (If you were cleaning the worktree: .claude/ is git-ignored, so `git clean -fd` does what you want and `-x`/`-X` would delete the harness config with it.)';
 
 /**
- * The gate's whole decision, as data: `{}` to stay out of the way, or a deny with a
- * reason the model will read verbatim.
- *
- * Two injected windows onto the filesystem and no others: `flagExists`, which is the
- * only way it can learn that a budget is tripped, and `realpath`, which the `.claude/`
- * rule needs to see through a symlink. `flagExists` is **required** on the same grounds
- * as `leaseStale`'s `hasPane` — a caller that forgets it gets a TypeError (which the
- * runner turns into fail-open) rather than a gate that silently has no breaker —
- * while `realpath` is defaulted, because its default *is* the production behaviour and
- * forgetting it disables nothing.
- *
- * Reasons never carry a path. They are rendered into the lead's context exactly as
- * written, and `$SOMA_HOME` is the operator's home directory more often than not.
+ * Is this call the lead's own? The one discriminator between a lead and its teammates, asked by
+ * `evaluateGate` (arms b2 and d) and by `budgetWarning` through this one function, so no two arms
+ * can ever disagree about who the lead is. Its shape is argued in full by the comment inside, which
+ * stays with the expression it explains.
  */
-export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
-  if (typeof flagExists !== 'function') {
-    throw new TypeError('evaluateGate: flagExists must be a (path) => boolean predicate');
-  }
-  const tool = typeof input?.tool_name === 'string' ? input.tool_name : '';
-  const home = stateRoot(env);
-  const id = env?.SOMA_LEAD_NAME;
-
-  // (a) The breaker, first and above every other rule — including the session
-  // discriminator. In a worktree this reaches teammates too, and that is deliberate:
-  // a lead's three teammates are most of what the budget was spent on, so a trip that
-  // stopped only the lead would be a breaker with no teeth. The orchestrator can
-  // clear the flag; the model cannot.
-  if (typeof id === 'string' && LEAD_RE.test(id) && flagExists(join(home, 'leads', id, 'BUDGET_TRIPPED'))) {
-    if (!BUS_TOOL.test(tool)) {
-      return deny('soma: this task\'s budget is spent (BUDGET_TRIPPED). You may still talk and call soma_report — wind down now and file COMPLETED or ERROR with what exists. Ask the orchestrator to clear the trip if you need more.');
-    }
-    return {};
-  }
-
+function isLeadSession(input, env) {
   // Who is calling. **The session id is the only answer, under either registration.**
   //
   // ⚠ THIS LINE USED TO READ `!sessionGuard || (…)`, AND THAT WAS THE BUILD'S SECOND
@@ -1847,7 +1837,47 @@ export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
   // they stay as a pair — if you ever have a reason to touch one, the other is not optional.
   const uuid = env?.SOMA_LEAD_SESSION_UUID;
   const sid = input?.session_id;
-  const isLead = typeof sid === 'string' && sid !== '' && typeof uuid === 'string' && uuid !== '' && sid === uuid;
+  return typeof sid === 'string' && sid !== '' && typeof uuid === 'string' && uuid !== '' && sid === uuid;
+}
+
+/**
+ * The gate's whole decision, as data: `{}` to stay out of the way, or a deny with a
+ * reason the model will read verbatim.
+ *
+ * Two injected windows onto the filesystem and no others: `flagExists`, which is the
+ * only way it can learn that a budget is tripped, and `realpath`, which the `.claude/`
+ * rule needs to see through a symlink. `flagExists` is **required** on the same grounds
+ * as `leaseStale`'s `hasPane` — a caller that forgets it gets a TypeError (which the
+ * runner turns into fail-open) rather than a gate that silently has no breaker —
+ * while `realpath` is defaulted, because its default *is* the production behaviour and
+ * forgetting it disables nothing.
+ *
+ * Reasons never carry a path. They are rendered into the lead's context exactly as
+ * written, and `$SOMA_HOME` is the operator's home directory more often than not.
+ */
+export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
+  if (typeof flagExists !== 'function') {
+    throw new TypeError('evaluateGate: flagExists must be a (path) => boolean predicate');
+  }
+  const tool = typeof input?.tool_name === 'string' ? input.tool_name : '';
+  const home = stateRoot(env);
+  const id = env?.SOMA_LEAD_NAME;
+
+  // (a) The breaker, first and above every other rule — including the session
+  // discriminator. In a worktree this reaches teammates too, and that is deliberate:
+  // a lead's three teammates are most of what the budget was spent on, so a trip that
+  // stopped only the lead would be a breaker with no teeth. The orchestrator can
+  // clear the flag; the model cannot.
+  if (typeof id === 'string' && LEAD_RE.test(id) && flagExists(join(home, 'leads', id, 'BUDGET_TRIPPED'))) {
+    if (!BUS_TOOL.test(tool)) {
+      return deny('soma: this task\'s budget is spent (BUDGET_TRIPPED). You may still talk and call soma_report — wind down now and file COMPLETED or ERROR with what exists. Ask the orchestrator to clear the trip if you need more.');
+    }
+    return {};
+  }
+
+  // Who is calling: `isLeadSession`, above, whose comment is the whole argument for its shape.
+  // `budgetWarning` asks the same function, so the two can never disagree about the lead.
+  const isLead = isLeadSession(input, env);
 
   // (b) — RETIRED. The session-discriminated edit ban lived here, switched on by a
   // `--session-guard` argument on the worktree registration. When the lead's edit surface
@@ -1962,6 +1992,55 @@ export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
   return {};
 }
 
+/**
+ * The 80% note, exactly as the lead will read it. Exported so the tests assert on the string
+ * the lead sees rather than a paraphrase of it, as `lead-postcompact.mjs` does with `REORIENT`.
+ *
+ * It repeats the lead playbook's own instruction for this moment (stop starting work, land what
+ * is verifiable, file NEEDS_INPUT or COMPLETED, say plainly what is unfinished), so the warning
+ * and the rule it points at use the same words. No path, like every reason in this file.
+ */
+export const BUDGET_WARNING = 'soma: this task has used 80% of its budget (BUDGET at 80%). Stop starting new work: land what is verifiable, then file COMPLETED, or NEEDS_INPUT for what remains, and say plainly what is unfinished. At 100% the breaker trips and every tool except the soma bus is denied.';
+
+/** The flag the watchdog writes at 80% (`wd/budget.mjs`'s `warnPath`), beside `BUDGET_TRIPPED`. */
+const WARN_FLAG = 'BUDGET_WARNED';
+
+/**
+ * Job 5's decision: should this call carry the 80% note? `null`, or `{ flag, note }`, meaning
+ * the flag the runner must claim and the note it prints only if that claim wins.
+ *
+ * Asked only about a call `evaluateGate` did not deny. A deny is emitted exactly as it always
+ * was and carries no note, so the note never rides a refusal and a refused call never consumes
+ * it. Beyond that it claims for one caller only: the LEAD, by the same `isLeadSession` the arms
+ * above use (teammates never see or consume it), while `leads/<id>/BUDGET_WARNED` exists and
+ * `BUDGET_TRIPPED` does not. A tripped lead's bus calls are allowed, so the trip is checked
+ * again here: the breaker's reason has already told that lead more than this note would.
+ *
+ * The gate's discipline holds. `flagExists` is injected and required, a usable lead id is the
+ * only thing that reaches the filesystem, and the note carries no path. Everything else fails
+ * toward silence: a teammate is never probed, a warn reading that is truthy but not `true` is
+ * no flag (`existsSync` answers a boolean), a truthy trip reading is a trip (arm a's own test),
+ * and a probe that throws is no note. A missed note leaves the lead where it was before this
+ * existed; a note nobody earned is noise. The warn flag is probed first because it is almost
+ * always absent, so a lead's ordinary call pays one extra `existsSync` and a teammate's none.
+ */
+export function budgetWarning(input, env, flagExists) {
+  if (typeof flagExists !== 'function') {
+    throw new TypeError('budgetWarning: flagExists must be a (path) => boolean predicate');
+  }
+  const id = env?.SOMA_LEAD_NAME;
+  if (typeof id !== 'string' || !LEAD_RE.test(id) || !isLeadSession(input, env)) return null;
+  const dir = join(stateRoot(env), 'leads', id);
+  const flag = join(dir, WARN_FLAG);
+  try {
+    if (flagExists(flag) !== true) return null;
+    if (flagExists(join(dir, 'BUDGET_TRIPPED'))) return null;
+  } catch {
+    return null;
+  }
+  return { flag, note: BUDGET_WARNING };
+}
+
 // ---------------------------------------------------------------------------
 // The standalone hook. Everything below is I/O; everything above is the decision.
 // ---------------------------------------------------------------------------
@@ -2039,11 +2118,35 @@ function runHook(handle) {
   });
 }
 
+/**
+ * Claim the 80% flag: true for the one process whose rename moved it, false for every other.
+ *
+ * The rename IS the claim, and it is atomic. More than one registration of this gate can fire
+ * on the same call, and only one of them can move a file that exists once; the others get
+ * ENOENT and print nothing, as today. It is renamed rather than unlinked so the delivery leaves
+ * a record, `BUDGET_WARNED.delivered`, for whoever reads `leads/<id>/` later. Any other error
+ * is the same silence: the gate never fails a call over a note.
+ */
+function claimWarning(flag) {
+  try {
+    renameSync(flag, `${flag}.delivered`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 if (isMain(import.meta.url)) {
   runHook((input) => {
     const decision = evaluateGate(input, process.env, existsSync);
-    return decision?.permissionDecision === 'deny'
-      ? { hookSpecificOutput: { hookEventName: 'PreToolUse', ...decision } }
+    if (decision?.permissionDecision === 'deny') {
+      return { hookSpecificOutput: { hookEventName: 'PreToolUse', ...decision } };
+    }
+    // Not denied, so this call may carry the 80% note: `additionalContext` alone, and NO
+    // `permissionDecision` key, because an allow would bypass the operator's permission rules.
+    const claim = budgetWarning(input, process.env, existsSync);
+    return claim && claimWarning(claim.flag)
+      ? { hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: claim.note } }
       : null;
   });
 }

@@ -24,8 +24,9 @@
  *                    arm) plus the draft-only PR route through soma-pr; the worktree deny
  *                    list binds lead and teammate alike. See `writeLaunchSettings` for why
  *                    no settings file may ever carry the old bare-name ban again.
- *   no personal MCP  `--strict-mcp-config` with a one-server `--mcp-config` for the lead,
- *                    and the worktree guard file's deny list for its teammates.
+ *   no personal MCP  `--strict-mcp-config` with a `--mcp-config` naming only `soma` and the
+ *                    stateless `sequential-thinking` for the lead, and the worktree guard
+ *                    file's deny list for its teammates.
  *   scrubbed env     `env -i` plus ENV_ALLOW (applied by `tmux.newSession`). The operator's
  *                    exported API keys never reach a lead, a teammate, or a workflow agent.
  *   its own cwd      the lead's worktree, which is what keeps ten leads in ten
@@ -92,8 +93,11 @@ import * as worktree from './worktree.mjs';
  *
  * Deliberately absent: `SOMA_HOME`, which is injected from `paths.SOMA_HOME()` rather than
  * copied, so the lead and the bus config `settings-gen` writes for it cannot end up with
- * two spellings of one root. And `CLAUDE_CODE_EFFORT_LEVEL`, which is *set* below — copying
- * the operator's own `low` through would be the deviation this module exists to prevent.
+ * two spellings of one root. `SOMA_TMUX_SOCKET`, injected from `tmux.socketName()` by the same
+ * rule: that is the server `tmux.newSession` creates the lead on, so the lead's socket is its real
+ * server by construction, where a copied value could name a server it was never created on. And
+ * `CLAUDE_CODE_EFFORT_LEVEL`, which is *set* below — copying the operator's own `low` through
+ * would be the deviation this module exists to prevent.
  */
 export const ENV_ALLOW = Object.freeze(['HOME', 'PATH', 'SHELL', 'TERM', 'LANG', 'TMPDIR', 'CLAUDE_CONFIG_DIR', 'USER']);
 
@@ -730,6 +734,11 @@ export function buildLeadEnv({ id, sessionUuid, teammateEffort, env = process.en
   // onto one root and refuses a relative one outright, which is the only thing that stops a
   // lead and its watchdog silently disagreeing about where the fleet's state lives.
   out.SOMA_HOME = SOMA_HOME();
+  // The tmux server, injected by the same rule: the socket this process's own tmux calls use, which
+  // is the one `tmux.newSession` creates the lead on. Without it `env -i` left every lead's bus on
+  // `soma`, typing its wakes into whatever pane held the orchestrator's pane id THERE — in the
+  // field, another fleet's orchestrator (issue #1).
+  out.SOMA_TMUX_SOCKET = tmux.socketName();
   if (typeof sessionUuid === 'string' && sessionUuid !== '') out.SOMA_LEAD_SESSION_UUID = sessionUuid;
   out.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = '1';
   out.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION = '0';

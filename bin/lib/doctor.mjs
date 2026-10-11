@@ -379,6 +379,19 @@ export const PROTECTED_CONTROLS = Object.freeze([
 export const LEAD_BANNED_TOOLS = Object.freeze(['Edit', 'NotebookEdit', 'Write']);
 
 /**
+ * The servers a lead's `mcp.json` may name — **doctor's own spelling of them**, for the
+ * reason `LEAD_BANNED_TOOLS` is one: a re-export of what `settings-gen.writeLeadMcpConfig`
+ * writes would let a third server join both sides of `lead mcp single-server` at once.
+ * `test/doctor.test.mjs` pins this list equal to the servers the generator really writes,
+ * which is where adding one is declared. `soma` is the lead's own bus; `sequential-thinking`
+ * is stateless and carries no credential (`writeLeadMcpConfig` says why that clears the
+ * recursion guard).
+ *
+ * Sorted, because the check compares a sorted copy of what it read against it.
+ */
+export const LEAD_MCP_SERVERS = Object.freeze(['sequential-thinking', 'soma']);
+
+/**
  * The published check names, in report order.
  *
  * A contract, like `canary.INVARIANTS`: the runbook and `soma up` quote them, and renaming
@@ -799,11 +812,15 @@ export function checks(env, probe) {
   };
 
   // --- the recursion guard -------------------------------------------------------------
+  // The row's name predates the second server and stays, because CHECKS is a published
+  // contract. What it judges is the SET of names: exactly LEAD_MCP_SERVERS in any order, so a
+  // server missing, added or duplicated FAILs. Names only — what a server runs is not read here.
   check('lead mcp single-server', 'leadMcpServers', "the lead's whole MCP surface", (names) => {
     if (names === null) return [null, "the lead's MCP surface — no lead exists yet, so there is nothing to read"];
     if (!Array.isArray(names)) return [false, `the lead's MCP surface — got ${shown(names)}`];
-    const ok = names.length === 1 && names[0] === 'soma';
-    return [ok, `lead mcp.json serves ${names.length ? names.join(', ') : '(nothing)'} — must be exactly "soma", or a lead can reach an orchestrator bus and spawn leads`];
+    const got = [...names].sort();
+    const ok = got.length === LEAD_MCP_SERVERS.length && got.every((n, i) => n === LEAD_MCP_SERVERS[i]);
+    return [ok, `lead mcp.json serves ${names.length ? names.join(', ') : '(nothing)'} — must be exactly ${LEAD_MCP_SERVERS.map((n) => `"${n}"`).join(' and ')}, in any order: another server could reach an orchestrator bus, and a lead that reaches one can spawn leads`];
   });
   /**
    * `{servers, unreadable}`, and the second field is why the shape is an object.
@@ -825,12 +842,12 @@ export function checks(env, probe) {
     if (found.length) {
       // Not one finding — three. `soma init` DELIBERATELY registers the bus at user scope:
       // that is how a promoted operator session drives the fleet at all. A lead never
-      // inherits user scope (`--strict-mcp-config` plus its one-server mcp.json, asserted
-      // one row up), and a teammate that discovers this bus holds the role-less CANDIDATE
-      // surface, which the gate's bus arm denies to every non-lead session. So the
-      // registration init writes, with its state root pinned, is EXPECTED — and this check
-      // FAILing on it taught the operator to skim past the row, which is how a real finding
-      // here would have died. What stays a finding:
+      // inherits user scope (`--strict-mcp-config` plus an mcp.json of exactly `soma` and
+      // `sequential-thinking`, asserted one row up), and a teammate that discovers this bus
+      // holds the role-less CANDIDATE surface, which the gate's bus arm denies to every
+      // non-lead session. So the registration init writes, with its state root pinned, is
+      // EXPECTED — and this check FAILing on it taught the operator to skim past the row,
+      // which is how a real finding here would have died. What stays a finding:
       //   - a PIN-LESS registration: a promoted session then drives whatever root its own
       //     environment resolves — the measured wrong-fleet failure `soma init` was fixed for;
       //   - a soma-shaped server that does not run soma's own bus, which nothing audited.

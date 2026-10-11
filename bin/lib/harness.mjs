@@ -31,9 +31,10 @@
  *
  *   **A budget class is a function of the harness, not a field a lead chooses.** The
  *   design's table maps research→H6, standard→H1, iterate→H2/H3, review→H4,
- *   babysit→H5, and the watchdog binds the breaker from the *harness id* on the task
- *   row. A report that declares some other class is therefore not a smaller
- *   reservation or a larger one — it is a plan of record that disagrees with the
+ *   babysit→H5, and the watchdog binds the breaker from the *harness id* the lead
+ *   declared, unless the operator pinned a class for the task at enqueue. A report
+ *   that declares some other class is therefore not a smaller reservation or a
+ *   larger one — it is a plan of record that disagrees with the
  *   mechanism enforcing it, which the digest and `soma_status` would then render as
  *   fact. It is refused, and the refusal says which class to report.
  *
@@ -191,9 +192,9 @@ const menu = (registry) =>
  * for an unknown harness, for a registry that maps a harness to a class this fleet
  * does not define, and for a config or registry that could not be read — three
  * different diagnoses, but one meaning for the caller, which then has nothing to bind
- * a breaker to. The design's answer to that case is the watchdog's
- * `budgetClassFor(t.harness || 'H1')` fallback and its HARNESS_DEFAULTED event, so no
- * lead runs breakerless; keeping this function total is what lets that fallback run.
+ * a breaker to. The watchdog's answer to that case is its fallback class and the
+ * HARNESS_DEFAULTED event (`budgetClassOf` in `soma-watchdog.mjs`), so no lead runs
+ * breakerless; keeping this function total is what lets that fallback run.
  */
 export function budgetClassFor(harnessId) {
   const registry = loadHarnesses();

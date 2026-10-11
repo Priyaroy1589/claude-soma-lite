@@ -140,6 +140,45 @@ export const hasPane = (pane, run = tmux.defaultRun) => {
 };
 
 /**
+ * Is this session's pane on soma's OWN tmux server? The proof `soma_adopt` needs before it
+ * records `wake: 'tmux'`, and `beat()` before it repairs the lease's pane (issue #2).
+ *
+ * `$TMUX_PANE` is only a pane id, and a pane id is a small per-server counter. An orchestrator
+ * promoted inside the operator's everyday tmux carries THAT server's `%3`, and soma's server has a
+ * `%3` of its own whenever it has four panes: a lead's or a teammate's. So existence is not
+ * enough. `hasPane(pane)` answers yes for exactly the collision this exists to catch, and that yes
+ * is how wake keystrokes reached a stranger's pane. What tells two servers apart is the socket's
+ * path: tmux puts it first in every pane's `$TMUX` (`<socket_path>,<server_pid>,<session_index>`),
+ * byte-identical to the server's own `#{socket_path}`, realpath and all. Measured on tmux 3.6a:
+ *
+ *   display-message -p -t %0  '#{pane_id} #{socket_path}'   exit=0  '%0 /private/var/…/soma'
+ *   display-message -p -t %99 '#{pane_id} #{socket_path}'   exit=0  ' /private/var/…/soma'
+ *                                                                    <- missing pane: an EMPTY id
+ *   (no server at all)                                      exit=1  ''
+ *
+ * So ONE round trip on this bus's socket answers both questions, and both halves must match: the
+ * id tmux resolved is the pane asked about (the target-fallback rule `hasPane` states), and the
+ * socket it answered on is the one `$TMUX` names. A space separates them, not a tab: a client
+ * with no UTF-8 locale in its environment prints a tab in a format as `_` (measured), and a pane
+ * id never contains a space, so splitting at the first one also keeps a socket path that has
+ * spaces in it whole. The first comma of `$TMUX` is tmux's own reading of it, so a socket path
+ * with a comma in it fails here exactly as it fails for tmux.
+ *
+ * Every answer that is not a match is `false`: no pane, no `$TMUX` (a session outside tmux), no
+ * server, a missing pane, another server. `false` means `wake: 'notify'`, which is desktop toasts
+ * and pull delivery: slower, and never a keystroke into somebody else's pane. stderr is never
+ * read, so the "no server running on <path>" line cannot reach a caller.
+ */
+export const paneOnServer = (pane, tmuxVar, run = tmux.defaultRun) => {
+  if (typeof pane !== 'string' || pane === '') return false;
+  const socketPath = typeof tmuxVar === 'string' ? tmuxVar.split(',')[0] : '';
+  if (socketPath === '') return false;
+  const said = String(run(['display-message', '-p', '-t', pane, '#{pane_id} #{socket_path}']).stdout ?? '').replace(/\n+$/, '');
+  const cut = said.indexOf(' ');
+  return cut !== -1 && said.slice(0, cut) === pane && said.slice(cut + 1) === socketPath;
+};
+
+/**
  * How much of a lead's transcript to read in order to answer with its tail.
  *
  * `soma_transcript` is capped at 500 lines and 40,000 characters and keeps the end,
@@ -287,6 +326,10 @@ export function realDeps() {
     heartbeat: lease.heartbeat,
     leaseStale: lease.leaseStale,
     hasPane,
+    // The proof that this session's pane is on soma's own server, before a claim of keystroke
+    // wakes (issue #2). Unwired, every adopt claims notify. Fixed arity, like `paneStates` below:
+    // `paneOnServer` takes a trailing `run` transport that a forwarded extra argument would replace.
+    paneOnServer: (pane, tmuxVar) => paneOnServer(pane, tmuxVar),
 
     // --- the checkpoint -------------------------------------------------------
     readFleet: fleet.readFleet,
@@ -466,9 +509,14 @@ export function buildTools(env, deps = realDeps()) {
 /**
  * The environment `bus-tools` reads, assembled from this process's.
  *
- * Five variables reach it: `SOMA_ROLE`, `SOMA_LEAD_NAME`, `SOMA_TMUX_SOCKET`,
- * `CLAUDE_CODE_SESSION_ID` and `SOMA_TMUX_PANE`. The first three arrive with the
+ * Six variables reach it: `SOMA_ROLE`, `SOMA_LEAD_NAME`, `SOMA_TMUX_SOCKET`, `TMUX`,
+ * `CLAUDE_CODE_SESSION_ID` and `SOMA_TMUX_PANE`. The first four arrive with the
  * spread. The other two are the whole reason this function exists.
+ *
+ * `TMUX` arrives because Claude Code hands an MCP server its whole process environment, and
+ * tmux sets `$TMUX` beside `$TMUX_PANE` for every process in a pane. Its first field is the
+ * path of the server's socket, which is what `paneOnServer` compares to prove that the pane
+ * this session offers is on soma's own server rather than on the operator's (issue #2).
  *
  * **`CLAUDE_SESSION_ID` is not read, and must not be re-added.** The original sketch
  * resolved identity as `SOMA_SESSION_ID || CLAUDE_SESSION_ID`; measured on Claude
@@ -482,7 +530,8 @@ export function buildTools(env, deps = realDeps()) {
  * override for a test or a hand-run bus), so the fix here is the absence.
  *
  * `SOMA_TMUX_PANE` is `$TMUX_PANE`, which tmux sets for every process inside a
- * pane — and it decides `wake: 'tmux'` vs `wake: 'notify'` in the lease claim.
+ * pane — and it is the pane the lease claim offers, recorded as `wake: 'tmux'` only once
+ * `paneOnServer` proves it is on soma's server; otherwise the claim is `wake: 'notify'`.
  * Harness value first for the same reason as the session id: while tmux is telling
  * us which pane we are in, an override can only be wrong. It is a fallback rather
  * than an overwrite because the sketch's `SOMA_TMUX_PANE: process.env.TMUX_PANE`
@@ -574,7 +623,7 @@ const SPECS = {
   soma_enqueue: {
     description:
       'Add tasks to the queue. Each row needs an id and a brief you authored — the brief is the assignment a lead will work from, so write it, do not paste the ticket. '
-      + 'Rows are validated per task and the reply lists what was `skipped` and why (duplicate, invalid-id, reserved-id, unknown-repo, brief-too-long); a batch that is too large is refused whole.',
+      + 'Rows are validated per task and the reply lists what was `skipped` and why (duplicate, invalid-id, reserved-id, unknown-repo, unknown-budget-class, brief-too-long); a batch that is too large is refused whole.',
     inputSchema: obj({
       tasks: {
         type: 'array',
@@ -586,7 +635,7 @@ const SPECS = {
           repo: str('Repo name as configured in soma.json (a name, not a path).'),
           brief: str('The assignment: goal, constraints, and a checkable definition of done. Authored by you.'),
           base_branch: str('Branch to cut the worktree from. Defaults to the repo\'s configured base.'),
-          budget_class: str('Override the token budget class instead of letting the lead\'s harness pick it.'),
+          budget_class: str('Pin the lead\'s token budget class. It must name a class in soma.json\'s budgets; the breaker prices the lead at it from its first tick, in place of the class its harness reserves. Omit it to let the harness pick.'),
           verify_hint: str('The command the lead\'s independent verifier runs to prove the task done, e.g. "npm test". A task without one gets its repo\'s `verify_hint` from soma.json at enqueue.'),
           source: { type: 'object', description: 'Provenance, e.g. {ref: "PROJ-42"}.' },
         }, ['id']),

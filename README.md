@@ -71,7 +71,7 @@ code runs on Node.js 24 built-ins with no npm dependencies.
   `claude --model opus --effort max` with its own agent team.
 - **Loop harnesses.** A lead picks one of six harnesses (one-shot, iterate-to-green, TDD,
   review-fix, babysitter, research spike) and reports the choice, which the bus validates against
-  the registry. The harness sets the lead's budget class.
+  the registry. The harness sets the lead's budget class, unless the operator pinned one at enqueue.
 - **An MCP bus with no dependencies.** A hand-written stdio MCP server gives leads three tools to
   report through, and gives the orchestrator twelve tools to run the fleet. A lead's
   `NEEDS_INPUT`, `ERROR` or `COMPLETED` wakes the orchestrator: a keystroke into its pane when the
@@ -377,7 +377,8 @@ soma2() {
   the first fleet's watchdog live: `soma2 up` starts nothing, and the second queue never drains.
 - Run `soma2 init` once, so the bus it registers in the second config root pins that socket, and
   drive the second fleet only through `soma2`. Start its orchestrator under the second config root
-  (`CLAUDE_CONFIG_DIR="$HOME/.claude-second" claude`) and outside tmux;
+  (`CLAUDE_CONFIG_DIR="$HOME/.claude-second" claude`), inside that fleet's own tmux server
+  (`tmux -L soma_second new-session -s orchestrator`);
   [Driving the fleet](#driving-the-fleet-from-a-claude-code-session) says why.
 
 > zsh note: if you already have an `alias soma=…`, delete it. zsh expands the alias inside the
@@ -388,7 +389,9 @@ soma2() {
 `$SOMA_HOME/soma.json` is optional. soma loads its defaults and layers your file over them key by
 key (objects merge; arrays such as `seats` replace). Unknown keys are kept. The file is re-read on
 every watchdog tick, so most edits apply on the next tick. An unreadable file is an error, never a
-silent fall-back to the defaults. soma never writes this file.
+silent fall-back to the defaults, and so is a `seats` that is not an array: `soma up` exits 2 naming
+the key, and a running watchdog logs `WATCHDOG_ERROR` every tick and does nothing until the file is
+fixed. soma never writes this file.
 
 **`repos` is the key you must fill in.** A task's `repo` field is a key into this map, not a path.
 With `repos` empty, a task cannot spawn: the watchdog retries it three times and then marks it
@@ -420,7 +423,7 @@ With `repos` empty, a task cannot spawn: the watchdog retries it three times and
 | `budgets` | see below | Per-class token, turn and wall-clock caps. |
 | `repos` | `{}` | `{ "<key>": { "path": "<absolute>", "base_branch": "<branch>" } }`. Doctor fails an entry that lacks either. When `base_branch` is missing, a spawn falls back to `develop`. An optional `verify_hint` (the repo's verify command) is copied onto every task enqueued without one of its own. |
 | `teammate_mcp_allow` | `[]` | Personal MCP servers handed back to teammates, by exact name. See below. |
-| `seats` | `[]` | The account-rotation pool, in priority order: `[{ "config_dir": "~/.claude-seat-2", "label": "seat-2" }]`. `config_dir` must be absolute or `~`-prefixed. Empty means one account and no rotation. |
+| `seats` | `[]` | The account-rotation pool, in priority order: `[{ "config_dir": "~/.claude-seat-2", "label": "seat-2" }]`. `config_dir` must be absolute or `~`-prefixed. Empty means one account and no rotation. It must be an array: anything else is refused. |
 | `linger_minutes` | `45` | **Read by nothing.** The reaper that would use it is not built. |
 | `stall_minutes` | `20` | **Read by nothing.** There is no stall detector. |
 | `team_size_max` | `3` | **Read by nothing.** The lead's playbook limits team size, not the code. |
@@ -443,15 +446,28 @@ The retired key `resume_token_guard` is stripped with a warning if your file sti
   cache-creation tokens, plus a tenth of cache-read tokens, summed over every transcript Claude Code
   keeps for the lead's worktree (the lead's and its teammates'). `turn_cap` counts the lead's own
   turns and is a runaway-loop backstop, not a budget.
-- At 80% the watchdog logs a `BUDGET` event on the orchestrator's stream; nothing is sent to the
-  lead. At 100% it writes `leads/<id>/BUDGET_TRIPPED`, after which the gate denies the lead and its
-  teammates every tool except the soma bus: a tripped lead can still call its bus tools, and the
-  denial tells it to file `COMPLETED` or `ERROR` with what exists. **No verb clears a trip**: delete
-  the file by hand, or kill the lead.
-- The class comes from the harness the lead declares (H1 standard, H2 and H3 iterate, H4 review,
-  H5 babysit, H6 research). The harness reaches the task row when the orchestrator drains the
-  lead's `HARNESS` report; until then the lead is priced as H1, `standard`. A `budget_class` given
-  at enqueue is recorded on the row and shown in `soma_status`, but the breaker does not read it.
+- At 80% the watchdog logs a `BUDGET` event on the orchestrator's stream and writes
+  `leads/<id>/BUDGET_WARNED`. The lead hears about it once: the gate attaches a short `soma:` note
+  to the lead's next tool call that it allows, then renames the flag to `BUDGET_WARNED.delivered`.
+  Teammates never get the note. At 100% the watchdog writes `leads/<id>/BUDGET_TRIPPED`, after
+  which the gate denies the lead and its teammates every tool except the soma bus: a tripped lead
+  can still call its bus tools, and the denial tells it to file `COMPLETED` or `ERROR` with what
+  exists. **No verb clears a trip**: delete the file by hand, or kill the lead.
+- The breaker prices a lead at the first class that resolves. A `budget_class` given at enqueue
+  comes first, when soma.json's `budgets` defines it. Next is the class of the harness the lead
+  declares (H1 standard, H2 and H3 iterate, H4 review, H5 babysit, H6 research), read from the
+  lead's own newest `HARNESS` report, so it binds on the next tick without waiting for the
+  orchestrator to drain it. A lead with neither, which is every unpinned lead for its first
+  minutes, is priced as H1, `standard`, with no event. The fallback, `standard` with
+  `HARNESS_DEFAULTED` logged once for that lead, applies in exactly two cases: something was
+  declared and none of it can be priced (a harness the registry does not carry or soma.json cannot
+  price, or an enqueue class soma.json does not define with no priceable harness behind it), or
+  nothing was declared and even H1 cannot be priced, which means a broken install.
+- `soma_enqueue` refuses a `budget_class` soma.json does not define (`unknown-budget-class`, and
+  lists the classes it does define); `soma enqueue --file` stores what the file says. The breaker
+  passes such a class over and logs `HARNESS_DEFAULTED` once for that lead: the lead is priced by
+  its harness, with `budget_class: null` in the event, or at `standard` when it has declared no
+  harness yet.
 - The caps are calibrated against real one-ticket sessions, none of them a soma lead with a team;
   the team multiplier is an estimate (about 2.5×, in a 1.5× to 4× band). RUNBOOK §10 describes the
   measurement run that settles it.
@@ -527,14 +543,19 @@ Doctor prints 48 named checks plus one row per configured repo. Each row is `ok 
 (unobserved: the check could not be taken, which is **not** a pass). The verdict is `doctor: PASS`,
 `doctor: INCOMPLETE — …` (exit 0) or `doctor: FAIL — …` (exit 3).
 
-- **On a healthy fresh install, expect `INCOMPLETE` and no `FAIL`.** `PASS` is unreachable on this
-  build: `workflows enabled` and `session id matches hook payload` are always unobserved, and
-  `CLAUDE_CODE_SESSION_ID` is unobserved from a plain shell. Before the first lead exists,
+- **On a healthy install, expect `INCOMPLETE` and no `FAIL`: `PASS` cannot be reached on this
+  build.** Two rows are always unobserved: `workflows enabled`, which doctor hard-wires to
+  unobserved because no local file can answer it, and `session id matches hook payload`, which reads
+  `state/last-hook-payload.json`, a file nothing in this build writes. So the best verdict is
+  `doctor: INCOMPLETE — N of M checks hold, 2 unobserved` when doctor runs inside a Claude Code
+  session (the orchestrator's Bash tool, say), and `…, 3 unobserved` from a plain shell, where
+  `CLAUDE_CODE_SESSION_ID` is unobserved too. Before the first lead exists,
   `every worktree guard file carries rules`, `guard file matches the generator` and
-  `lead mcp single-server` are unobserved too.
-- **Once a lead exists, `lead mcp single-server` reads `FAIL`.** It requires a lead's MCP config to
-  name only `soma`, but leads now also get the sequential-thinking server and the check was not
-  updated. Doctor then exits 3. Every other `FAIL` is real.
+  `lead mcp single-server` are unobserved as well. Every other row can read `ok`. [RUNBOOK §10](RUNBOOK.md#the-rows-soma-doctor-cannot-take-and-how-to-confirm-them-by-hand)
+  says how to confirm the three by hand.
+- **Once a lead exists, `lead mcp single-server` reads `ok`.** Despite its name, it checks that a
+  lead's MCP config names exactly the two servers soma writes there: `soma` and the stateless
+  sequential-thinking server. Any `FAIL` is real.
 - **`repos readable — 0 repos configured` is not "ready".** It means there was nothing to probe.
 - **`claude cd-compound read runs` = FAIL** means your Claude Code build stops on a permission
   prompt that bypass mode cannot skip (Claude Code 2.1.259 did, and unattended sessions sat on it
@@ -577,7 +598,7 @@ soma retry my-task-1            # put a failed or skipped row back on the queue
 | `soma peek <lead> [--lines N]` | Read-only tail of the lead's pane (default 60 lines, at most 2000). |
 | `soma send <lead> "<message>" [--force]` | Type one line into the lead's composer and submit it. Refused while the pane shows a dialog, a shell, a dead pane or nothing readable, unless `--force`. |
 | `soma kill <lead> ["<reason>"]` | Kill the lead's tmux session, read tmux back, then mark the row `failed`. Exit 3 means the lead may still be running and the row was left alone. |
-| `soma resume <lead> [--force]` | Restart a dead lead from its recorded Claude Code session, on the seat soma picks. Refuses while the session may still be live, unless `--force`. |
+| `soma resume <lead> [--force]` | Restart a dead lead from its recorded Claude Code session, on the seat soma picks. Refuses while the session may still be live, unless `--force`, and refuses a `soma.json` soma cannot load before it kills anything (exit 2). |
 | `soma retry <lead>` | Put a `failed` or `skipped` row back on the queue. A `done` row is refused: enqueue a new id instead. |
 | `soma digest [--lines N]` | The fleet's recent events across every stream, oldest first (default 40, at most 2000). Moves no cursor. |
 | `soma thaw` | Lift an organisation spend-cap freeze by clearing `state/backpressure.json`. Refuses a live rate-limit storm and an unreadable record. |
@@ -600,8 +621,9 @@ may still be running.
 `soma enqueue --file` takes a JSON **array** (an object keyed by id is refused). Each row needs an
 `id` matching `^[a-z][a-z0-9-]{0,63}$`, because it becomes a directory name, a tmux session and an
 event stream. Fields kept on the row: `id`, `title`, `repo`, `brief`, `base_branch`, `budget_class`,
-`verify_hint`, `source`. Anything else is dropped. A row with no `verify_hint` takes its repo's from
-`soma.json`. Invalid and duplicate rows are skipped rather than fatal, and the counts are printed:
+`verify_hint`, `source`. A `budget_class` is also copied to `budget_override`, the pin the breaker
+reads first. Anything else is dropped. A row with no `verify_hint` takes its repo's from `soma.json`.
+Invalid and duplicate rows are skipped rather than fatal, and the counts are printed:
 compare them with what you sent.
 
 ```json
@@ -639,11 +661,12 @@ orchestrator tool call is a heartbeat, so open each turn with `soma_inbox` or `s
 > [!WARNING]
 > **Other places to run the orchestrator.** Outside tmux also works, but a lead's wake-up then
 > arrives only as a desktop notification, and the events wait for your next turn: safe, only
-> slower. **Never start the orchestrator in your own tmux while leads are running:** the bus
-> records your pane's id without checking which tmux server it is on, and a wake-up is typed into
-> the pane with that id on soma's server, which can be a lead's or a teammate's. For a fleet on
-> another socket, such as `soma2`'s, start the orchestrator outside tmux: on this build, leads
-> send every wake-up to the default `soma` server ([issue #1](https://github.com/techfreakworm/claude-soma-lite/issues/1)).
+> slower. The same holds in your own tmux, on any server that is not soma's: the bus cannot prove
+> your pane is on soma's server, so it adopts with `wake notify` (`degraded_wake: true`). Only a
+> pane on soma's own server gets keystroke wake-ups. For a fleet on another socket, such as
+> `soma2`'s, start the orchestrator inside that fleet's own tmux server
+> (`tmux -L soma_second new-session -s orchestrator`): a lead types its wake-ups only on its own
+> fleet's server.
 
 Two tools to be careful with:
 
@@ -761,7 +784,8 @@ Named so that you meet them here rather than in a running fleet. RUNBOOK §9 and
 details.
 
 - `hold`, `release` and `gc` refuse with a reason. `soma up --canary` cannot pass: its live driver is
-  not built, so it exits 2 with *the canary needs a live driver*.
+  not built, so the canary reports `ERROR` (nothing proven) and `up` refuses with exit 3: *the canary
+  did not report a pass*.
 - **Two hooks ship but nothing installs them**: the orchestrator inject hook (add it by hand, above)
   and the lead's `PostCompact` re-orientation hook. After a compaction, a lead can lose its harness
   contract. `soma_send` it a pointer to `soma_task()`.
@@ -802,13 +826,12 @@ details.
 | admission stopped after a Claude Code upgrade; `VERSION_GATE` event | the new version is outside `tested_claude` | re-prove the invariants on the new build, widen `tested_claude.max` in `soma.json`, then `soma down` and `soma up` |
 | `backpressure: FROZEN … org_level_disabled_until` | the organisation's spend cap was reached | once the cap is lifted, move or kill leads whose transcript still ends on the cap, then `soma thaw` |
 | a promoted session shows an empty fleet | the bus is pinned to the wrong state root | re-run `soma init` from the right shell; check the `SOMA_HOME=` it prints |
-| `soma doctor` says `INCOMPLETE`, never `PASS` | expected: two checks are always unobserved on this build | read the `????` rows against [Reading `soma doctor`](#reading-soma-doctor) |
-| `soma doctor` fails `lead mcp single-server` | expected once a lead exists: the check predates the sequential-thinking server | nothing; any other `FAIL` is real |
+| `soma doctor` says `INCOMPLETE`, never `PASS` | expected: two checks are always unobserved on this build, three from a plain shell | read the `????` rows against [Reading `soma doctor`](#reading-soma-doctor), and confirm those by hand ([RUNBOOK §10](RUNBOOK.md#the-rows-soma-doctor-cannot-take-and-how-to-confirm-them-by-hand)) |
 | every lead shows `0` tokens | the wrong Claude Code config root, so no transcript matches. The budget breaker is welded open | doctor's `claude config root` row; use your wrapper |
 | `soma status` shows `LIVE ?` everywhere | tmux could not be read, which is not a dead fleet | `tmux -L soma ls` |
 | `soma kill` or `soma down` exits 3 | soma could not confirm the session stopped, so it changed nothing | `soma status`, then try again |
 | `soma up` refuses with *no terminal here to confirm* | stdin is not a TTY. There is no `--yes` | run it from an interactive shell |
-| `soma up --canary` exits 2: *the canary needs a live driver* | expected: the driver is not built | run `soma up` without `--canary` |
+| `soma up --canary` exits 3: *the canary did not report a pass* | expected: the live driver is not built, so the canary reports `ERROR` and proves nothing | run `soma up` without `--canary` |
 | `SOMA_HOME must be an absolute path` | a relative value, or a quoted `~` | spell the path out |
 | `does not support hard links` | `SOMA_HOME` is on exFAT, FAT, or a FUSE or cloud-sync mount | move `SOMA_HOME` to a local volume |
 | `npm test` prints no `pass` or `fail` lines | Node 20 or older: the test glob matched nothing | use Node 24 |

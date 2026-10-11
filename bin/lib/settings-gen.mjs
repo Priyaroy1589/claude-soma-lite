@@ -6,7 +6,8 @@
  * can be attached, and it attaches them as *files* rather than argv because argv
  * binds one process while a file binds everything that reads it from disk:
  *
- *   leads/<id>/mcp.json            the lead's entire MCP surface: one server, soma.
+ *   leads/<id>/mcp.json            the lead's entire MCP surface: soma and the stateless
+ *                                  sequential-thinking server, nothing else.
  *   leads/<id>/settings.json       the base of the lead's `--settings`: model pin and three
  *                                  hooks, and DELIBERATELY NO `permissions` BLOCK.
  *                                  NOT the file `--settings` points at — `spawn`'s
@@ -48,11 +49,13 @@
  *   connectors and plugin servers. See `enumerateUserMcpServers` for what each
  *   source can and cannot see, and STANDING_DENIES for the prefix rules.
  *
- * - **The lead's MCP config holds exactly one server.** Two would be a recursion
- *   guard failure, not a convenience: a lead that can reach an orchestrator bus
- *   can spawn leads, which can spawn leads. `soma doctor` asserts the single-server
- *   property, and `--strict-mcp-config` (spawner) is what stops user scope from
- *   adding a second behind our back.
+ * - **The lead's MCP config holds exactly two servers, `soma` and the stateless
+ *   `sequential-thinking`.** The guard is that neither reaches an orchestrator bus,
+ *   because a lead that reaches one can spawn leads, which can spawn leads. So a third
+ *   server is a recursion-guard decision, not a convenience (`writeLeadMcpConfig` says
+ *   what bar the second one cleared). `soma doctor` asserts that exact set (`lead mcp
+ *   single-server`), and `--strict-mcp-config` (spawner) is what stops user scope from
+ *   adding another behind our back.
  *
  * - **NO `permissions` BLOCK IN THE LEAD FILE — that absence is load-bearing, and putting
  *   one back is the build's worst regression.** `writeLeadSettings` used to write
@@ -110,6 +113,7 @@ import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 import { SOMA_HOME, leadDir, p } from './paths.mjs';
 import { loadConfig } from './config.mjs';
+import { socketName } from './tmux.mjs';
 
 /**
  * The installed `bin/` directory — this file's parent's parent.
@@ -450,6 +454,11 @@ export function enumerateUserMcpServers(home = homedir(), env = process.env, opt
  * expose (`leadTools`, not `orchTools`), and `SOMA_LEAD_NAME` to attribute every
  * event it appends. `SOMA_HOME` is passed explicitly because the lead is started
  * `env -i` and must not fall back to `$HOME/.soma` when the fleet lives elsewhere.
+ * `SOMA_TMUX_SOCKET` likewise must not fall back to `soma`: a bus on the wrong server types
+ * its wakes into whatever pane holds the orchestrator's pane id there, which in the field was
+ * another fleet's orchestrator (issue #1). Both values are the ones the spawner itself uses
+ * (`paths.SOMA_HOME()`, `tmux.socketName()`), the same two `spawn.buildLeadEnv` injects, so
+ * the lead's env and this file cannot name two roots or two servers.
  *
  * `sequential-thinking` is the second and only other server. It is here because
  * `buildLeadArgv` passes `--strict-mcp-config`, so this file is the lead's ENTIRE MCP
@@ -473,7 +482,7 @@ export function writeLeadMcpConfig(id, busPath = join(BIN_DIR, 'soma-bus.mjs')) 
       soma: {
         command: 'node',
         args: [fwd(busPath)],
-        env: { SOMA_ROLE: 'lead', SOMA_LEAD_NAME: id, SOMA_HOME: SOMA_HOME() },
+        env: { SOMA_ROLE: 'lead', SOMA_LEAD_NAME: id, SOMA_HOME: SOMA_HOME(), SOMA_TMUX_SOCKET: socketName() },
       },
       'sequential-thinking': {
         command: 'npx',

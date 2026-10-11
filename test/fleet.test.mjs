@@ -1,7 +1,8 @@
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
@@ -172,13 +173,18 @@ test('a queued task carries the whole record, and the checkpoint round-trips thr
 
   const [one, two] = f.readFleet().tasks;
   assert.deepEqual(Object.keys(one).sort(), [
-    'attempts', 'base_branch', 'base_sha', 'brief', 'budget_class', 'created', 'id',
+    'attempts', 'base_branch', 'base_sha', 'brief', 'budget_class', 'budget_override', 'created', 'id',
     'lead_session_uuid', 'repo', 'rotations', 'seat', 'source', 'status', 'title', 'tmux_session', 'updated',
     'verify_hint',
   ]);
   assert.equal(one.status, 'queued');
   assert.equal(one.attempts, 0);
   assert.equal(one.base_branch, 'develop');
+  // A class given at enqueue is written twice: `budget_class` for display, which the inbox fold
+  // then keeps following the lead's harness, and `budget_override`, the pin the breaker reads
+  // first and nothing else ever writes.
+  assert.equal(one.budget_class, 'standard');
+  assert.equal(one.budget_override, 'standard');
   assert.deepEqual(one.source, { kind: 'md', ref: 'x' });
   assert.ok(Number.isInteger(one.created) && one.created === one.updated);
   // No verify command on the task and no repo map to fall back on: null, written, not absent.
@@ -192,6 +198,8 @@ test('a queued task carries the whole record, and the checkpoint round-trips thr
   assert.equal(two.repo, null);
   assert.deepEqual(two.source, {});
   assert.equal(two.brief, '');
+  assert.equal(two.budget_class, null);
+  assert.equal(two.budget_override, null, 'no class pinned: the lead is priced by its harness');
   assert.equal(two.verify_hint, null);
 
   const onDisk = JSON.parse(readFileSync(p('state', 'fleet.json'), 'utf8'));
@@ -538,7 +546,7 @@ test('the checkpoint lock releases the lock it published, not whatever holds tha
   const successor = `${spawnSync(process.execPath, ['-e', '']).pid}\n`;
   assert.notEqual(successor, `${process.pid}\n`);
   f.withFleetLock(() => {
-    assert.equal(readFileSync(lock, 'utf8'), `${process.pid}\n`, 'the lock names us while we hold it');
+    assert.equal(readFileSync(lock, 'utf8').trim(), String(process.pid), 'the lock names us while we hold it');
     rmSync(lock);                       // a waiter decides we are dead and takes it over...
     writeFileSync(lock, successor);      // ...and publishes its own
   });
@@ -546,11 +554,32 @@ test('the checkpoint lock releases the lock it published, not whatever holds tha
   assert.equal(readFileSync(lock, 'utf8'), successor, 'and it must still be the successor that owns it');
   rmSync(lock);
 
-  // A successor whose BYTES match ours but whose inode does not — a recycled pid re-taking its
-  // own lock — is a successor too, and only the inode tells them apart.
+  // A successor carrying our own pid — a recycled pid re-taking its own lock — is a successor
+  // too. On ext4 it lands on our inode NUMBER, which the filesystem hands straight back, so there
+  // only the bytes can tell them apart: the successor's carry no nonce of ours. While a lock's
+  // bytes were the pid alone, this failed on every run on an ext4 Linux VM.
   f.withFleetLock(() => { rmSync(lock); writeFileSync(lock, `${process.pid}\n`); });
   assert.equal(existsSync(lock), true, 'a successor carrying our own pid is still not our lock');
   rmSync(lock);
+
+  // A successor carrying our EXACT bytes, nonce and all, on another inode: a copy, which isolates
+  // the inode half of the identity. Our inode is pinned under a second name before the swap, so
+  // the filesystem cannot hand its number to the copy (ext4 would) and the two are different
+  // files on every filesystem.
+  const pinned = `${lock}.pinned`;
+  let ours = null, copy = null;
+  f.withFleetLock(() => {
+    const bytes = readFileSync(lock, 'utf8');
+    linkSync(lock, pinned);
+    ours = statSync(lock).ino;
+    rmSync(lock);
+    writeFileSync(lock, bytes);
+    copy = statSync(lock).ino;
+  });
+  assert.notEqual(copy, ours, 'sanity: the copy really is a different file');
+  assert.equal(existsSync(lock), true, 'a successor carrying our exact bytes is still not our lock');
+  rmSync(lock);
+  rmSync(pinned);
 
   // Which must not turn into a lock nothing ever clears: over-caution here is its own outage.
   f.withFleetLock(() => 'ok');

@@ -118,7 +118,9 @@ $SOMA_HOME/
   events/                <stream>.ndjson — one per lead, plus orch.ndjson
   heartbeats/            <lead> — touched by the lead's PostToolUse hook
   leads/<id>/            brief.md, mcp.json, settings.json, settings.launch.json,
-                         BUDGET_TRIPPED     (meta.json is in the design and in
+                         BUDGET_TRIPPED, BUDGET_WARNED (BUDGET_WARNED.delivered once
+                         the gate has handed the lead its 80% note)
+                         (meta.json is in the design and in
                          docs/ROADMAP.md, and NOTHING WRITES IT — see §9)
   logs/                  watchdog.log, <lead>.log (tmux pipe-pane transcripts)
   worktrees/<repo>/<id>/ the lead's checkout, on branch soma/<id>
@@ -136,8 +138,11 @@ forever.
 ## 4. `soma.json`
 
 Optional. `loadConfig()` is `DEFAULTS` with your file layered over it, key by key, and unknown keys
-are preserved. Minimum useful file — **`repos` is the one you must fill in**, because a task naming
-an unconfigured repo cannot spawn:
+are preserved. A file that does not parse is refused, never read as the defaults, and so is a
+`seats` that is not an array. `soma up` then exits 2 with a message naming the key; a watchdog
+already running logs `WATCHDOG_ERROR` on every tick and acts on nothing until the file is fixed,
+exactly as it does for an unparseable file. Minimum useful file — **`repos` is the one you must fill
+in**, because a task naming an unconfigured repo cannot spawn:
 
 ```json
 {
@@ -161,7 +166,7 @@ an unconfigured repo cannot spawn:
 | `budgets` | see below | Per-lead token/turn/wall caps by class. |
 | `repos` | `{}` | `{ "<key>": { path, base_branch, verify_hint } }`. `base_branch` falls back to `develop`. A task without its own `verify_hint` takes the repo's at enqueue. |
 | `teammate_mcp_allow` | `[]` | Hands specific MCP servers back to teammates. Read `README.md` for its two measured limits before using it. |
-| `seats` | `[]` | The account pool (design 2026-09-15 §2): `[{ "config_dir": "~/.claude-seat-b", "label": "seat-b" }]`, one entry per Claude Code config dir that holds a separate `claude auth login` and whose `projects/` is a symlink to the fleet's shared transcript tree. Empty = one account, no rotation. An array, so an edit **replaces** the pool, and its ORDER is the priority order — every launch takes the first entry that is open and not `unverified`, so the account you watch goes LAST (§7 step 4). `~` expands against your home when the pool loads; a `config_dir` must be **absolute or `~`-prefixed** — a relative one is `resolve()`d against the cwd of whichever process read the pool, so a watchdog started from your home and a `soma` command run inside a repo name two different directories for the same entry, and the one that does not exist simply contributes nothing to the worktree MCP deny list without saying so; an empty `config_dir` is refused with a sentence; a missing `label` defaults to the dir's basename. `lib/seats.mjs` reads it; closures land in `state/seats.json` (`closed_until` is epoch ms, `0` = open) and are never shorter than five minutes nor longer than 32 days. A corrupt `state/seats.json` is never overwritten — fix or delete it by hand. |
+| `seats` | `[]` | The account pool (design 2026-09-15 §2): `[{ "config_dir": "~/.claude-seat-b", "label": "seat-b" }]`, one entry per Claude Code config dir that holds a separate `claude auth login` and whose `projects/` is a symlink to the fleet's shared transcript tree. Empty = one account, no rotation. It must be an array: `{}`, a string, a number or `null` is refused (above). A malformed *entry* inside the array is not refused at load; doctor's `seats readable` row names it. An array, so an edit **replaces** the pool, and its ORDER is the priority order — every launch takes the first entry that is open and not `unverified`, so the account you watch goes LAST (§7 step 4). `~` expands against your home when the pool loads; a `config_dir` must be **absolute or `~`-prefixed** — a relative one is `resolve()`d against the cwd of whichever process read the pool, so a watchdog started from your home and a `soma` command run inside a repo name two different directories for the same entry, and the one that does not exist simply contributes nothing to the worktree MCP deny list without saying so; an empty `config_dir` is refused with a sentence; a missing `label` defaults to the dir's basename. `lib/seats.mjs` reads it; closures land in `state/seats.json` (`closed_until` is epoch ms, `0` = open) and are never shorter than five minutes nor longer than 32 days. A corrupt `state/seats.json` is never overwritten — fix or delete it by hand. |
 | `resume_context_fraction` | `0.7` | Revival guard as a fraction of the context window, not an absolute. |
 | `tested_claude` | `2.1.178`–`2.1.999` | **Enforced, and this row used to say it was not.** The watchdog reads `claude --version` once per process and closes admission fleet-wide while it sits outside this range, emitting `VERSION_GATE`. Measured: `2.1.220` in range; `2.1.177`, `2.2.0` and `3.0.0` all out. It fails **open** only when the version or a bound will not parse. **The first Claude Code minor bump stops your queue** — widen `max` or re-run bring-up. |
 
@@ -176,9 +181,15 @@ an unconfigured repo cannot spawn:
 | `babysit` | 8,000,000 | 0 (disabled) | 0 (unbounded) |
 
 `tokens_cap` meters **the lead and its whole team** (teammate turns go to their own transcripts).
-`turn_cap` is calibrated per lead and is a backstop, not a budget. Warn at 80 %, hard trip at 100 %;
-a trip writes `leads/<id>/BUDGET_TRIPPED`, which the PreToolUse gate reads to deny every tool except
-the soma bus — so a tripped lead can still file `COMPLETED` or `ERROR`, and nothing else.
+`turn_cap` is calibrated per lead and is a backstop, not a budget. Warn at 80 %, hard trip at 100 %.
+A warning logs `BUDGET` on the orchestrator's stream and writes `leads/<id>/BUDGET_WARNED`; the
+PreToolUse gate attaches a one-time `soma:` note to the lead's next allowed tool call and renames the
+flag to `BUDGET_WARNED.delivered`, and teammates never get it. A trip writes
+`leads/<id>/BUDGET_TRIPPED`, which the PreToolUse gate reads to deny every tool except the soma bus —
+so a tripped lead can still file `COMPLETED` or `ERROR`, and nothing else.
+A lead is priced at the class pinned at enqueue when soma.json defines it, else at the class its
+newest `HARNESS` report reserves, else at `standard`; README's budget section has the exact rule
+and when `HARNESS_DEFAULTED` fires.
 
 ### Config keys that are declared and read by nothing
 
@@ -371,13 +382,23 @@ to clear it; the FAIL stands until the lead is next resumed, revived or rotated.
 
 | summary | exit | meaning |
 |---|---|---|
-| `doctor: PASS — all 48 checks hold on this machine` | 0 | every check was taken and held |
+| `doctor: PASS — all 48 checks hold on this machine` | 0 | every check was taken and held — **not reachable on this build**: two rows are always unobserved (below, and §10) |
 | `doctor: INCOMPLETE — N of M checks hold, K unobserved` | **0** | nothing failed, but **K assertions did not run** |
 | `doctor: FAIL — N of M checks failed` | 3 | at least one check was taken and did not hold |
 
 > `soma doctor` **exits 0 on `INCOMPLETE`** — `runDoctor` returns `results.every(r => r.ok !== false)`.
 > An unobserved check must not refuse a machine, but it is not a pass either. If you gate a script
 > on `soma doctor`, gate it on the word, not only on `$?`.
+
+**`PASS` is not reachable on this build.** Two rows are always unobserved: `workflows enabled`,
+which doctor hard-wires to unobserved because no local file can answer it, and
+`session id matches hook payload`, which reads `state/last-hook-payload.json`, a file nothing in
+this build writes. So the best verdict is `doctor: INCOMPLETE — N of M checks hold, 2 unobserved`
+from a Claude Code session's Bash tool (the orchestrator's, say), and `…, 3 unobserved` from a plain
+shell, because `CLAUDE_CODE_SESSION_ID` is unobserved there too. Before the first lead and
+worktree exist, `every worktree guard file carries rules`, `guard file matches the generator` and
+`lead mcp single-server` are unobserved as well. Every other row can read `ok`. §10 *The rows
+`soma doctor` cannot take* says how to confirm the three by hand.
 
 ### 5.3 `soma up` — the spend gate
 
@@ -390,11 +411,21 @@ Order of operations, and every step can stop it:
 1. `ensureTree()` and the hard-link probe → **exit 2** on failure.
 2. **Already-live short-circuit.** If tmux reports `soma-watchdog` live, nothing is started, no new
    spend is authorised, and the **pause flag is still read and reported** — a live watchdog is *not*
-   an open queue. Exit 0.
-3. `loadConfig()` → **exit 2** if it throws.
+   an open queue. Exit 0 — **unless you passed `--canary`**: then the canary runs here too (§5.4),
+   with no projection and no prompt, and anything but a pass is **exit 3**. The watchdog that was
+   already running is left exactly as it is, and the refusal says so, then carries the same NOTE as
+   §5.4:
+
+   ```
+   soma up: the canary did not report a pass (its verdict is on stderr above), and the watchdog that
+   was already running is untouched: --canary checks a fleet, it does not stop one; `soma down` does.
+   ```
+3. `loadConfig()` → **exit 2** if it throws: a `soma.json` that does not parse, or a value §4 says
+   is refused. Nothing is projected, asked or started.
 4. **Print the worst-case spend projection.**
 5. **Ask, on the terminal.**
-6. `--canary`, if you passed it (§5.4) → **exit 3** unless it reports a pass.
+6. `--canary`, if you passed it (§5.4) → **exit 3** unless it reports a pass. This is where it runs
+   on a fresh start; with a watchdog already live it runs at step 2 instead.
 7. Start the watchdog in a detached tmux session under `env -i`.
 8. **Read tmux back.** `tmux new-session` exits 0 for a command `env -i` cannot resolve, leaving a
    session whose pane died instantly — which reads as a running watchdog to anything that asks by
@@ -450,15 +481,20 @@ design. If you need it in a wrapper, the wrapper needs a real terminal.
 The flag is answered, and then it refuses. `bin/lib/canary.mjs` ships the **evaluation** only:
 `evaluateCanary(probe)` is a pure predicate over a probe result with full unit coverage, and the
 **live driver** that spawns the synthetic lead and produces that probe is a declared v1.x gap.
-`probeCanary` *requires* the driver to be injected — a canary nobody drove must not look like a
-pass — so `runCanary()` with no driver reports "unproven", and `up` refuses:
+`probeCanary` *requires* a driver — a canary nobody drove must not look like a pass — so `soma up`
+hands it one that says it is not built. The canary reports **ERROR**, nothing proven, on stderr, and
+`up` refuses with **exit 3**. On a fresh start it reads as below; with a watchdog already running,
+the refusal's first sentence is the one §5.3 step 2 quotes:
 
 ```
+canary: ERROR — the canary did not run, so none of the 9 invariants was proven; the queue stays closed
+  reason: the live driver threw before producing a probe: the live driver is not built on this build — canary.mjs ships the evaluation only (a declared v1.x gap)
+  unproven: busMounted, teammateCanEdit, leadCannotWrite, teammateUserMcpDenied, somaPrDraft, slotFreedAfterComplete, rcUrl, oauthUnderEnvI, cdCompoundReadRuns
 soma up: the canary did not report a pass, so the queue was not opened (its verdict is on stderr
-above). NOTE, because it is the likeliest reason on this build: canary.mjs ships the EVALUATION
-only and records the live driver as a declared v1.x gap, so runCanary with no driver injected can
-only report "unproven". Establish the nine invariants by hand (see bin/lib/canary.mjs) and run
-soma up without --canary.
+above). NOTE, because it is the likeliest reason on this build: `canary.mjs` ships the EVALUATION
+only and records the live driver as a declared v1.x gap, so the canary `soma up` runs has no driver
+to observe anything with and can only report "unproven". Establish the nine invariants by hand (see
+bin/lib/canary.mjs) and run `soma up` without --canary.
 ```
 
 **The golden path is `init` → `doctor` → `up`, without `--canary`.** The design spec's first-run
@@ -492,8 +528,9 @@ already running and keep running whoever holds it.
   the refusal proves only that a lease record exists. That is the difference between stealing from
   a live orchestrator and clearing a corpse.
 - `adopted: true` — note `lease_seq` and `unread_count`. `degraded_wake: true` means this session is
-  not in a tmux pane, so pushes arrive as desktop toasts and on your next turn rather than as a
-  live keystroke wake.
+  not in a pane on soma's own tmux server (it is outside tmux, or in another tmux server such as
+  your everyday one), so pushes arrive as desktop toasts and on your next turn rather than as a
+  live keystroke wake. Only a pane on soma's own server gets keystroke wakes.
 
 **Keep the lease warm.** It reads **stale after 10 minutes** without a heartbeat, and a stale lease
 is adoptable by the next session *without* `force` — so a live-but-idle orchestrator loses the fleet
@@ -517,7 +554,11 @@ soma enqueue --file tasks.json
 `tasks.json` is a **JSON array** (an object keyed by id is the likely mistake and is refused by
 name). Each row needs at least `id`, matching `^[a-z][a-z0-9-]{0,63}$` — it becomes a directory
 name, a tmux target and an event stream, so nothing else is admitted. Fields that survive into the
-fleet row: `id`, `title`, `repo`, `source`, `brief`, `base_branch`, `budget_class`, `verify_hint`.
+fleet row: `id`, `title`, `repo`, `source`, `brief`, `base_branch`, `budget_class`, `verify_hint`,
+and `budget_override`, a copy of `budget_class` that pins the breaker to it. This verb stores the
+class as the file gives it and does not check that soma.json defines it (`soma_enqueue` does). One it
+does not define is passed over and `HARNESS_DEFAULTED` says so once: the lead is priced by its
+harness, or at `standard` before it declares one.
 
 ```json
 [
@@ -554,7 +595,9 @@ The watchdog tick (default 30 s) does seven things:
    `LEAD_PANE_RECOVERED`. `unobservable` (the screen could not be read) is **not a verdict**: it
    never alarms, never revives, and never overwrites a verdict already held. `soma status` shows
    the same reading in its `PANE` column (`working` / `idle` / `draft` / `prompt` / `shell` /
-   `exited` / `gone` / `other`, `?` when tmux could not be read, `-` for a row with no session).
+   `exited` / `gone` / `other`, `?` when tmux could not be read, `-` for a row with no session;
+   when no tmux server answers on soma's socket at all there are no panes to list, so a row with a
+   session reads `gone`).
    `draft` is text sitting unsent in the composer (a long `soma send` can land there without its
    Enter firing, and the delivery is not fixed yet); the composer is located under
    the `──── lead-<id> ─` rule a `--name`d session draws, so it fires on this fleet's leads.
@@ -623,7 +666,7 @@ Confirmed against the `switch` in `bin/soma.mjs`. Nothing below is aspirational.
 | `soma peek <lead> [--lines N]` | read-only pane tail (default 60, max 2000) |
 | `soma send <lead> "<msg>"` | type one line into the lead's composer and submit |
 | `soma kill <lead> ["reason"]` | kill the session, mark the row `failed` |
-| `soma resume <lead> [--force]` | restart a dead lead from its recorded claude session, on the seat `pick()` chooses — written to the row's `seat`; with no pool configured, this process's own `CLAUDE_CONFIG_DIR` and `seat: null`. The seat is picked **before** the kill, and every seat closed or unverified is a refusal (exit 3), not a launch on this shell's own account |
+| `soma resume <lead> [--force]` | restart a dead lead from its recorded claude session, on the seat `pick()` chooses — written to the row's `seat`; with no pool configured, this process's own `CLAUDE_CONFIG_DIR` and `seat: null`. The seat is picked **before** the kill, and every seat closed or unverified is a refusal (exit 3), not a launch on this shell's own account. A `soma.json` that `loadConfig()` refuses (§4) is refused before the kill too, with the loader's reason (exit 2) |
 | `soma retry <lead>` | re-queue a `failed` or `skipped` row |
 | `soma digest [--lines N]` | recent events, oldest first, **consuming nothing** |
 | `soma enqueue --file <f>` | add tasks from a JSON array |
@@ -752,7 +795,7 @@ The org spend cap is the one limit that does not rotate: it freezes admission th
 ```
 0  ok
 1  usage, or you declined
-2  this machine cannot run soma   (relative SOMA_HOME, no hard links, unreadable config)
+2  this machine cannot run soma   (relative SOMA_HOME, no hard links, a soma.json §4 refuses)
 3  soma refused                    (a fleet state, not an environment fault)
 ```
 
@@ -768,9 +811,19 @@ read-back through `liveSessions`, which answers `null` for "not measured", givin
 | outcome | `kill` | `down` |
 |---|---|---|
 | `killed` — tmux exited 0 | row → `failed`, `KILLED` event, **exit 0** | `watchdog: stopped`, **exit 0** |
-| `absent` — tmux read back, nothing by that name | row → `failed`, **exit 0** (`not found (tmux read back)`) | `no session named soma-watchdog was running`, **exit 0** |
+| `absent` — tmux read back, nothing by that name | row → `failed`, **exit 0** (`not found (tmux read back)`) | `no session named soma-watchdog was running`, **exit 0** — also when no tmux server answers on soma's socket, and the line then names the socket (below, and §11.10) |
 | `live` — tmux answered, session still there | **row left untouched**, `KILL_REFUSED` event, **exit 3** | `the watchdog was NOT stopped`, **exit 3** |
 | `unmeasured` — tmux would not answer | **row left untouched**, `KILL_REFUSED` event, **exit 3** | `UNVERIFIED`, **exit 3** |
+
+**When no tmux server answers on soma's socket** (every machine before its first `soma up`, and
+after the fleet's last session has exited), tmux says so in one of two sentences: `error connecting
+to <path> (No such file or directory)` or `no server running on <path>`. Only `down` and `status`
+read them. `down` prints `no session named soma-watchdog was running (no tmux server answers on
+socket soma)` and exits 0, and `status` prints `watchdog: absent — no tmux server answers on socket
+soma, …`. `kill` does not, so it still refuses with exit 3, and neither does the watchdog, which
+skips the tick. Neither sentence proves that no server exists, and on that reading `kill` would
+write a `failed` row over a live lead and the watchdog would read every live lead as dead. §11.10
+names the two states in which a live server gives those sentences, and how to recover from each.
 
 **Read exit 3 from `kill` as: the lead may still be running, and soma refused to write a `failed`
 row over a possibly-live lead.** A `failed` row beside a live lead is the destructive case — you
@@ -819,9 +872,15 @@ soma retry task-42               # put a failed/skipped row back on the queue
 Three things worth knowing before you use them:
 
 - **`status` reports `?`, not `dead`, when tmux cannot be read.** A 5 s timeout on a wedged server
-  is byte-identical to a healthy server with nothing on it. Same three-state discipline on the
-  queue (`open` / `PAUSED` / `unreadable`) and the lease (holder / `none` / `UNREADABLE`) — an
-  unreadable state root is *not* evidence that admission is open.
+  is byte-identical to a healthy server with nothing on it. No tmux server answering on soma's
+  socket at all is a different answer, because tmux says so, and it reads as an empty server:
+  `watchdog: absent — no tmux server answers on socket soma`, spawned rows `dead` (§7, *Exit 3 on
+  `kill` and `down`*; §11.10). Same three-state discipline on the queue (`open` / `PAUSED` /
+  `unreadable`) and the lease (holder / `none` / `UNREADABLE`) — an unreadable state root is *not*
+  evidence that admission is open. And `open` is the flag's reading alone: it stands bare only
+  beside a live watchdog, and otherwise reads
+  ``open (no watchdog is running, so nothing is admitted until `soma up`)``, or says that whether
+  anything is admitting work is unknown.
 - **`attach`: press `Esc` before typing** if the lead is mid-turn, or your keystrokes interleave
   with its own output. Detach with `C-b d`. Attaching always works, even when the checkpoint is
   the thing that is broken.
@@ -844,7 +903,7 @@ stops on the next tick; running leads continue. The flag lives at `state/QUEUE_P
 | `soma release <lead>` | The other half of `hold`. **Not** `soma_release` — that MCP tool hands back the orchestrator lease. | see above |
 | `soma gc` | No worktree/branch/log/digest sweep exists. | `git worktree remove` by hand. soma never touches `~/.claude/projects`, which `--resume` needs. |
 | `soma thaw` | Refuses a **storm** record (`reason: storm`): a live storm is the watchdog's — it re-writes its record on every tick it corroborates the storm and clears it itself when the panes stop matching, so a clear here would be undone within a tick and would hide the storm from `soma status` meanwhile. Refuses an **unreadable** record: it never overwrites bytes it cannot read. | An org spend-cap freeze (`reason: org_level_disabled_until`) is what `soma thaw` is for: it clears `state/backpressure.json`, prints the record it cleared, and admission resumes on the next tick. Order of operations, because the tick reads transcript tails and not calendars: first move or kill every lead whose transcript still ends on the cap row — `soma send <lead> "continue"` once you believe the cap has lifted (a healthy reply proves it; a second cap row proves it has not) or `soma kill <lead>` — then `soma thaw`. A record that comes back within a tick means a spawned lead's tail still reads the cap. `soma status` / `soma_status` show `backpressure` three-state (none / FROZEN with reason and since / unreadable); the lift has no event of its own — the record is what says it lifted. |
-| `soma up --canary` | The flag is answered; the driver is a v1.x gap, so it can only report "unproven". | §5.4 and §10 |
+| `soma up --canary` | The flag is answered; the driver is a v1.x gap, so the canary can only report "unproven" (`canary: ERROR`) and `up` refuses with exit 3. | §5.4 and §10 |
 | `soma_inbox` from the CLI | No `inbox` subcommand in v1. | `soma digest`, or `tail -n 40 "$SOMA_HOME/events/"*.ndjson` |
 
 `hold`, `release` and `gc` refuse with **exit 3**, not 1 (so do `thaw`'s four refusals: an unreadable record, a storm record, a clear that throws, and `--as` without the lease) — they *are* refusals, and exit 1 made a real-but-unbuilt
@@ -1010,6 +1069,51 @@ never observed that arming happen.** What is measured, and what is not:
   `continuing automatically at <reset>` and the lead resuming with nobody there. Nothing short of
   that. Until then this is **evidenced, not observed** — write it that way in any report, and never
   as a pass.
+
+### The rows `soma doctor` cannot take, and how to confirm them by hand
+
+`soma doctor` cannot print `PASS` on this build (§5.2): two of its rows are always unobserved, and a
+third is unobserved from a plain shell. Each asks a real question that no local file answers, so each
+is a bring-up check like the rest of this section. Confirm them by hand:
+
+- **`workflows enabled`** asks whether dynamic workflows are available to a **spawned** lead (design
+  requirement 5; the lead playbook's Step 4 fans its reads out through them). Doctor hard-wires it
+  to unobserved, because the answer depends on the account's plan and the Claude Code build, not on
+  anything on disk. Check it once per account — each seat, if rotation is configured — and again
+  after a Claude Code upgrade. With a throwaway task at `max_leads: 1`:
+
+  ```bash
+  soma send <lead> "Reply with one word, yes or no: is a tool named Workflow in your tool list?"
+  soma peek <lead>
+  ```
+
+  `yes` means the row would hold.
+
+- **`session id matches hook payload`** compares the `CLAUDE_CODE_SESSION_ID` a session's
+  subprocesses see with the `session_id` Claude Code hands that same session's hooks. It matters
+  because of the inject hook (`bin/hooks/orch-inject.mjs`, which you wire by hand; §5.1 says why
+  `soma init` does not): it treats a prompt as the lease holder's only when the hook payload's
+  `session_id` equals the id the bus recorded in the lease from `CLAUDE_CODE_SESSION_ID`. If the two
+  disagree, a promoted orchestrator silently never gets event headers. Doctor would read the payload
+  from `state/last-hook-payload.json`, which nothing in this build writes. By hand, in a Claude Code
+  session's Bash tool:
+
+  ```bash
+  echo "$CLAUDE_CODE_SESSION_ID"
+  ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$CLAUDE_CODE_SESSION_ID".jsonl
+  ```
+
+  The first prints a uuid. The second must list exactly one file: the transcript of the session you
+  are typing in. Hooks receive the session's `session_id` together with a `transcript_path` named
+  after it, so one file means the two agree. If no file is listed, they do not: `ls` says *No such
+  file or directory*, or, under zsh, the glob itself aborts with *no matches found*. End to end: with
+  the inject hook wired, a promoted session that gets unread event headers on its next prompt has
+  passed this comparison.
+
+- **`CLAUDE_CODE_SESSION_ID`** is unobserved from a plain shell by design: only a Claude Code
+  session's subprocesses carry it. Run `soma doctor` from a Claude Code session's Bash tool (the
+  orchestrator's, say) and it is observed, and should read `ok`; the `echo` above printing a uuid is
+  the same evidence.
 
 ### The measurement run that turns four estimates into numbers
 
@@ -1299,6 +1403,63 @@ closed.**
 
 `teammateCanEdit` is the canary invariant that would have caught this, and the canary driver does
 not exist on this build (§5.4) — which is why it reached you through a runbook section instead.
+
+### 11.10 A live tmux server can say "no server", and `status` and `down` then believe it
+
+`soma status` and `soma down` read tmux's two no-server sentences, `error connecting to <path> (No
+such file or directory)` and `no server running on <path>`, as an empty server (§7): `status`
+reports `watchdog: absent — no tmux server answers on socket soma` with every spawned lead `dead`,
+and `down` reports that no watchdog was running and exits 0. Both sentences were measured on tmux
+3.6a. Before the first `soma up`, and after the fleet's last session has exited, they are true. In
+two states a LIVE server gives them too, and then both reports are wrong while the server, its
+watchdog and its leads keep running:
+
+- **Its socket file was deleted while it runs** — a `/tmp` cleaner is the usual way. Measured in a
+  throwaway sandbox on tmux 3.6a, with stand-in sessions on a private socket rather than a real
+  fleet: once the live server's socket file was removed, tmux printed `error connecting to <path>
+  (No such file or directory)`, `soma status` reported the watchdog absent, and `soma down` exited
+  0 saying none was running, while the server and its sessions stayed alive. A `new-session` on the
+  same socket name (the call `soma up` makes to start its watchdog) then exited 0 and started a
+  SECOND server on the same path: a different pid, the first one still alive, and the socket
+  listing only the second one's sessions. Before any second server existed, `SIGUSR1` to the first
+  server's process recreated its socket, and `soma status` read the watchdog live again (tmux(1)
+  documents that signal for this). **Inferred, not reproduced on a fleet:** what follows a `soma
+  up` in this state, because `up` needs a terminal to confirm and was not run. Its new watchdog
+  would see none of the first server's leads, read them as dead (`LEAD_DEAD`) and respawn them,
+  leaving two leads on each worktree. **Recovery, in this order:** when leads are visibly running,
+  send `SIGUSR1` to the orphaned server's process (`ps` lists it as `tmux -L <socket> …`) BEFORE
+  any `soma up`, and run `soma up` only once `soma status` reads the fleet again.
+- **It is wedged, and its accept queue has overflowed.** Measured on macOS, tmux 3.6a: a server
+  stopped with `SIGSTOP`, 300 clients started against it and killed, and the next client printed
+  `no server running on <path>` while the server was alive; a `new-session` then started a fresh
+  server on the same path and left the stopped one orphaned. So `status` and `down` misreport as
+  above, and `soma up` would start a second server and a second watchdog. **Recovery:** `SIGUSR1`
+  is no help here, because the socket file is still in place and the server is simply not accepting
+  on it. `SIGCONT` resumes a stopped server. One that stays wedged has to be killed, which ends
+  every session in it, leads included, and from there it is the reboot path (§7, *Reboot contract*).
+
+Nothing is written on the wrong reading. `soma kill` does not take it (it refuses with exit 3, as
+for any unreadable tmux), and the watchdog never does (it skips the tick). The damage is a report
+that says the fleet is down when it is not, and a second fleet if you answer that report with `soma
+up`. That risk is not new: `up` would start the second fleet on any unreadable tmux whatever
+`status` said, because its own already-running check reads a `null` as "not running", and it did
+so before this reading existed. `ps` is what tells a server that is really gone from these two
+states: if a tmux server process for soma's socket is still alive, you are in one of them.
+
+### 11.11 A tmux lease can keep a pane its holder no longer has
+
+**Inferred from reading the code, not reproduced.** When `beat()` cannot prove that the holder's
+pane is on soma's tmux server, it offers the heartbeat no pane, so a `wake: tmux` lease keeps the
+pane id it last recorded. That is the case once the holder has moved off soma's server: resumed in
+another tmux server, or outside tmux (the second is unchanged from before). Pane ids are not reused
+while a server lives, but they restart at `%0` when soma's server is recreated. A lead can then be
+handed the recorded id, and a lead's wake would pass the pane gate into that lead's composer.
+
+`beat()` leaves the transport alone on purpose: `lease.heartbeat` repairs a pane and leaves any
+change of transport to `soma_adopt`. **Recovery:** run `/soma-promote` again where the holder now
+is. `soma_adopt` re-proves the pane and rewrites the lease as `wake notify`. The window is narrower
+than it was: before `beat()` proved the pane, a resume into another tmux server re-pointed the
+lease at that server's pane id at once.
 
 ---
 

@@ -1,3 +1,4 @@
+import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -59,6 +60,7 @@ const row = (over = {}) => ({
   status: 'queued',
   base_branch: null,
   budget_class: null,
+  budget_override: null,
   lead_session_uuid: null,
   tmux_session: null,
   attempts: 0,
@@ -128,7 +130,7 @@ const SHELL_FRAME = 'host% Operator: hello, this is your brief\nzsh: command not
 const ctx = (over = {}) => {
   const calls = {
     appendEvent: [], notify: [], spawnLead: [], resumeLead: [], killSession: [], capturePane: [],
-    tripBudget: [], setTaskStatus: [], readUsage: [], readDirUsage: [], budgetClassFor: [],
+    tripBudget: [], warnBudget: [], setTaskStatus: [], readUsage: [], readDirUsage: [], budgetClassFor: [],
     checkBudgetClocks: [], updateFleet: 0, aliveSessions: 0, paneStates: 0, queuePaused: 0, versionOk: 0,
     writeBackpressure: [], clearBackpressure: 0, readBackpressure: 0,
     // The limits phase, plus the options object each launch now carries.
@@ -185,6 +187,9 @@ const ctx = (over = {}) => {
     },
     notify: (title, body) => { calls.notify.push([title, body]); },
     tripBudget: (id) => { calls.tripBudget.push(id); order.push(`tripBudget:${id}`); },
+    // The 80% flag the gate hands the lead. `over.warnBudget` runs after the call is recorded, so a
+    // fixture can make the write throw and still see that it was attempted.
+    warnBudget: (id) => { calls.warnBudget.push(id); order.push(`warnBudget:${id}`); (over.warnBudget ?? (() => {}))(id); },
     tripped: (id) => (over.tripped ?? (() => false))(id),
     // `opts` is the seat: `{configDir}` or `{}`. Recorded beside the id, so the existing
     // `deepEqual(calls.spawnLead, ['a'])` assertions keep their shape.
@@ -840,6 +845,403 @@ test('a lead already warned in the log is not warned again', async () => {
   });
   await tick(c.deps);
   assert.deepEqual(eventsOf(c, 'BUDGET'), []);
+  assert.deepEqual(c.calls.warnBudget, [], 'the flag goes with the event: a lead warned once is not written a second note');
+});
+
+// ════════════════════ The 80% warning reaches the lead ════════════════════
+//
+// The BUDGET event lands on the orchestrator's stream, which the lead never reads. So at the 80%
+// verdict the watchdog also writes `leads/<id>/BUDGET_WARNED`, and the PreToolUse gate hands the lead
+// a note on its next allowed tool call (`bin/hooks/lead-gate.mjs`, job 5). The flag goes FIRST: the
+// logged BUDGET is the once-per-lead dedupe, so a write that failed after it landed would never be
+// retried and the lead would never be told.
+
+test('at 80% the watchdog writes the lead its flag, then logs the BUDGET', async () => {
+  const { tick } = await load('warnflag-' + Date.now());
+  const c = ctx({
+    cfg: cfgOf({ budgets: { standard: { tokens_cap: 1000, turn_cap: 0, wall_ms: 0 } } }),
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u' })] },
+    alive: new Set(['lead-a']),
+    readDirUsage: () => dirUsage({ est_tokens: 850, sessions: [usage({ uuid: 'u' })] }),
+  });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'BUDGET').payload.pct, 80);
+  assert.deepEqual(c.calls.warnBudget, ['a'], 'the lead was not written its 80% flag');
+  assert.deepEqual(c.calls.tripBudget, [], 'a warning is not a trip');
+  ranBefore(c.order, 'warnBudget:a', 'event:BUDGET');
+});
+
+test('at 100% the watchdog trips the lead and writes no 80% flag', async () => {
+  const { tick } = await load('tripnowarn-' + Date.now());
+  const c = ctx({
+    cfg: cfgOf({ budgets: { standard: { tokens_cap: 1000, turn_cap: 0, wall_ms: 0 } } }),
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u' })] },
+    alive: new Set(['lead-a']),
+    readDirUsage: () => dirUsage({ est_tokens: 1000, sessions: [usage({ uuid: 'u' })] }),
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.tripBudget, ['a']);
+  assert.equal(oneEvent(c, 'BUDGET').payload.pct, 100);
+  assert.deepEqual(c.calls.warnBudget, [], "a trip is not a warning: the gate's deny tells a tripped lead");
+});
+
+test('an 80% flag that cannot be written is a WATCHDOG_ERROR and no BUDGET, so the next tick retries both', async () => {
+  const { tick } = await load('warnfail-' + Date.now());
+  const fixture = (over = {}) => ctx({
+    cfg: cfgOf({ budgets: { standard: { tokens_cap: 1000, turn_cap: 0, wall_ms: 0 } } }),
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u' })] },
+    alive: new Set(['lead-a']),
+    readDirUsage: () => dirUsage({ est_tokens: 850, sessions: [usage({ uuid: 'u' })] }),
+    ...over,
+  });
+
+  const failed = fixture({ warnBudget: () => { throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }); } });
+  await tick(failed.deps);
+  assert.deepEqual(failed.calls.warnBudget, ['a'], 'the write was not even attempted');
+  const errs = eventsOf(failed, 'WATCHDOG_ERROR').filter((e) => e.payload?.where === 'budget');
+  assert.equal(errs.length, 1, `expected one budget WATCHDOG_ERROR: ${JSON.stringify(failed.calls.appendEvent.map((e) => e.type))}`);
+  assert.equal(errs[0].lead, 'a');
+  assert.deepEqual(eventsOf(failed, 'BUDGET'), [], 'a BUDGET logged over a failed write would dedupe the warning away for good');
+
+  // The next tick: the log still holds no BUDGET for this lead, so both are attempted again.
+  const next = fixture();
+  await tick(next.deps);
+  assert.deepEqual(next.calls.warnBudget, ['a']);
+  assert.equal(oneEvent(next, 'BUDGET').payload.pct, 80);
+});
+
+test('the real warnBudget writes the flag at warnPath, and heals a thinned state root to do it', async () => {
+  // The writer's half of the path agreement that hooks.test.mjs measures from the reader's side
+  // (the file at warnPath is the file the real gate claims). Real bytes under a throwaway
+  // $SOMA_HOME with no `leads/` at all: the write creates the directory instead of leaving the lead
+  // untold, the same self-heal `tripBudget` carries.
+  const home = mkdtempSync(join(tmpdir(), 'soma-wd-warn-'));
+  const savedHome = process.env.SOMA_HOME;
+  process.env.SOMA_HOME = home;
+  try {
+    const real = (await load('real-warn-' + Date.now())).realDeps();
+    const { warnPath } = await import('../bin/lib/wd/budget.mjs');
+    assert.equal(warnPath('a'), join(home, 'leads', 'a', 'BUDGET_WARNED'));
+    real.warnBudget('a');
+    assert.match(readFileSync(warnPath('a'), 'utf8'), /^\d+\n$/, 'the flag was not written, or not where warnPath says');
+  } finally {
+    if (savedHome === undefined) delete process.env.SOMA_HOME;
+    else process.env.SOMA_HOME = savedHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ════════════════════════ Which class prices a lead ════════════════════════
+//
+// The breaker priced every lead off `task.harness || 'H1'`, and `task.harness` reaches the row
+// only when the orchestrator drains the lead's HARNESS through `soma_inbox`. So until that drain
+// every lead was metered as H1, and a class the operator pinned at enqueue never reached the
+// breaker at all. Each class below carries a token cap no other class has, so the `tokens_cap` in
+// a BUDGET payload names the class that priced the lead.
+
+/** Four classes with four different token caps: a BUDGET payload says which one was bound. */
+const PRICED = {
+  standard: { ...CLASS },                                             // 1,000,000
+  iterate: { tokens_cap: 3_000_000, turn_cap: 600, wall_ms: 12 * 3600 * 1000 },
+  review: { tokens_cap: 2_000_000, turn_cap: 600, wall_ms: 10 * 3600 * 1000 },
+  babysit: { tokens_cap: 400_000, turn_cap: 0, wall_ms: 0 },
+};
+
+/** The class each harness reserves, as `prompts/harnesses.json` ships the table. */
+const RESERVES = { H1: 'standard', H2: 'iterate', H3: 'iterate', H4: 'review', H5: 'babysit', H6: 'research' };
+
+/**
+ * A lead priced the way `harness.budgetClassFor` prices one: the class its harness reserves, read
+ * off the fixture's own config, and null for a harness the table does not carry or a class the
+ * config does not define (`research` is not configured here). `budgets` is used as given, so a
+ * prototype on it survives.
+ */
+const priced = (over = {}, budgets = structuredClone(PRICED)) => {
+  const cfg = cfgOf({ budgets });
+  return ctx({
+    cfg,
+    alive: new Set(['lead-a']),
+    budgetClassFor: (h) => (Object.hasOwn(RESERVES, h) && Object.hasOwn(cfg.budgets, RESERVES[h]) ? cfg.budgets[RESERVES[h]] : null),
+    ...over,
+  });
+};
+
+/** A worktree whose lead and team have spent `est` est_tokens, the lead three turns in. */
+const spent = (est) => () => dirUsage({ est_tokens: est, sessions: [usage({ uuid: 'u', turns: 3 })] });
+
+/** A HARNESS report as `soma_report` stores it on the lead's own stream. */
+const declared = (id, ts, cls) => ev('HARNESS', 'a', ts, { harness_id: id, budget_class: cls, plan_summary: 'p' });
+
+test('a class pinned at enqueue prices the lead from its first tick, before it declares a harness', async () => {
+  const { tick } = await load('bc1-' + Date.now());
+  const c = priced({
+    // What `fleet.enqueue` writes for `budget_class: 'babysit'`. No HARNESS has been filed yet.
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', budget_class: 'babysit', budget_override: 'babysit' })] },
+    // Over babysit's 400,000 and half of standard's 1,000,000: only the pinned class trips this.
+    readDirUsage: spent(500_000),
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.tripBudget, ['a'], 'priced as H1, the pinned class never reaches the breaker');
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.babysit.tokens_cap);
+  assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), []);
+});
+
+test('the lead\'s own HARNESS report prices it at once, without waiting for the orchestrator\'s drain', async () => {
+  const { tick } = await load('bc2-' + Date.now());
+  const c = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u' })] },          // undrained: no harness on the row
+    leadEvents: { a: [ev('STARTED', 'a', NOW - 9 * MIN), declared('H3', NOW - 8 * MIN, 'iterate')] },
+    // 2.5x standard's cap and 83% of iterate's: H1 trips this lead, H3 only warns it.
+    readDirUsage: spent(2_500_000),
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.tripBudget, [], 'an iterate lead tripped at standard\'s cap because its report was still unread');
+  const budget = oneEvent(c, 'BUDGET');
+  assert.equal(budget.payload.pct, 80);
+  assert.equal(budget.payload.tokens_cap, PRICED.iterate.tokens_cap);
+  assert.ok(c.calls.budgetClassFor.includes('H3'), `budgetClassFor was asked for ${JSON.stringify(c.calls.budgetClassFor)}`);
+  assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), []);
+});
+
+test('the newest HARNESS on the lead\'s stream beats the stale harness its row still carries', async () => {
+  const { tick } = await load('bc3-' + Date.now());
+  // The documented H1 -> H4 degrade: the orchestrator drained the first report and not the second.
+  const stream = { a: [declared('H1', NOW - 30 * MIN, 'standard'), declared('H4', NOW - 5 * MIN, 'review')] };
+  const c = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', harness: 'H1', budget_class: 'standard' })] },
+    leadEvents: stream,
+    // 1.8x standard's cap and 90% of review's.
+    readDirUsage: spent(1_800_000),
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.tripBudget, [], 'priced off the row, an H4 lead trips at H1\'s cap');
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap);
+
+  // A row the fold wrote before `budget_override` existed: drained to H4, with the class of the
+  // FIRST report, which that fold never updated. Nothing on such a row says whether an operator
+  // chose `standard`, so a resolver that read `budget_class` as a pin would price this H4 lead
+  // at H1's cap. Only `budget_override` is a pin, and this row has none.
+  const legacy = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', harness: 'H4', budget_class: 'standard' })] },
+    leadEvents: stream,
+    readDirUsage: spent(1_800_000),
+  });
+  await tick(legacy.deps);
+  assert.deepEqual(legacy.calls.tripBudget, []);
+  assert.equal(oneEvent(legacy, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap);
+});
+
+test('a pinned class beats the harness the lead declared', async () => {
+  const { tick } = await load('bc4-' + Date.now());
+  const c = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', harness: 'H4', budget_class: 'babysit', budget_override: 'babysit' })] },
+    leadEvents: { a: [declared('H4', NOW - 5 * MIN, 'review')] },
+    // Over babysit's 400,000 and a quarter of review's 2,000,000.
+    readDirUsage: spent(500_000),
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.tripBudget, ['a']);
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.babysit.tokens_cap);
+  assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), []);
+});
+
+/**
+ * Pins no class can be bound from, each with the name a HARNESS_DEFAULTED payload gives it. The
+ * strings: a name soma.json never wrote; three that resolve through Object.prototype, which a
+ * truthiness or `in` lookup would bind; an own key whose value is not a record; and a record class
+ * reachable only through the budgets' prototype. The rest are not strings at all, which
+ * `soma enqueue --file` stores as the file says. Only a string can name a class:
+ * `Object.hasOwn(budgets, 42)` would find a class named "42", and `['babysit']` would find babysit.
+ */
+const UNBOUND = [
+  ['premium', 'premium'], ['constructor', 'constructor'], ['toString', 'toString'], ['__proto__', '__proto__'],
+  ['flat', 'flat'], ['inherited', 'inherited'],
+  [42, '42'], [true, 'true'], [{}, 'object'], [{ toString: 1 }, 'object'], [['babysit'], 'array'],
+];
+
+/** The budgets those pins are tried against: every trap above, beside the four real classes. */
+const unboundBudgets = () => Object.assign(
+  Object.create({ inherited: { tokens_cap: 1, turn_cap: 0, wall_ms: 0 } }),
+  structuredClone(PRICED),
+  { flat: 42, 42: { tokens_cap: 1, turn_cap: 0, wall_ms: 0 } },
+);
+
+test('a pin no class can be bound from is passed over for the harness, and said once', async () => {
+  const { tick } = await load('bc5-' + Date.now());
+  for (const [pin, name] of UNBOUND) {
+    const mk = (extra = {}) => priced({
+      fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', budget_class: pin, budget_override: pin })] },
+      leadEvents: { a: [declared('H4', NOW - 5 * MIN, 'review')] },
+      readDirUsage: spent(1_800_000),
+      ...extra,
+    }, unboundBudgets());
+    const c = mk();
+    await tick(c.deps);
+    assert.deepEqual(c.calls.tripBudget, [], name);
+    assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap, `${name}: priced by its harness`);
+    // A pin that silently stops binding is the very complaint this resolver answers: the operator
+    // asked for a class, and the lead is metered at another. So it is said, with a null class,
+    // because no fallback was bound: the lead's own harness prices it.
+    const said = oneEvent(c, 'HARNESS_DEFAULTED');
+    assert.equal(said.lead, 'a', name);
+    assert.deepEqual(said.payload, { harness: 'H4', budget_override: name, budget_class: null }, name);
+    assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), [], name);
+
+    // Once per lead, off the durable log.
+    const again = mk({ orchEvents: [ev('HARNESS_DEFAULTED', 'a', NOW - MIN, said.payload)] });
+    await tick(again.deps);
+    assert.deepEqual(eventsOf(again, 'HARNESS_DEFAULTED'), [], name);
+    assert.equal(oneEvent(again, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap, name);
+  }
+});
+
+test('a passed-over pin names the harness that priced the lead as the lead spelled it, cut to 32', async () => {
+  const { tick } = await load('bc5c-' + Date.now());
+  // `harness.budgetClassFor` prices a leading id with prose after it, so a spelling a lead typed
+  // can be long and still price the lead. One event is one atomic append, so it is cut.
+  const spelling = `H4 ${'review loop, '.repeat(10)}`;
+  const c = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', budget_class: 'premium', budget_override: 'premium' })] },
+    leadEvents: { a: [declared(spelling, NOW - 5 * MIN, 'review')] },
+    readDirUsage: spent(1_800_000),
+    budgetClassFor: (h) => (/^H4\b/.test(h) ? PRICED.review : null),
+  });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap);
+  assert.deepEqual(oneEvent(c, 'HARNESS_DEFAULTED').payload, { harness: spelling.slice(0, 32), budget_override: 'premium', budget_class: null });
+});
+
+test('a pin that is not a string is still a declaration: with no harness behind it, standard is bound and said', async () => {
+  const { tick } = await load('bc5b-' + Date.now());
+  for (const [pin, name] of UNBOUND.filter(([p]) => typeof p !== 'string')) {
+    const c = priced({
+      fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', budget_class: pin, budget_override: pin })] },
+      leadEvents: { a: [ev('STARTED', 'a', NOW - 9 * MIN)] },
+      readDirUsage: spent(1_200_000),
+    }, unboundBudgets());
+    await tick(c.deps);
+    // Read as "nothing declared", this lead took H1's class without a word, which is the silent
+    // pricing the announcement exists to end.
+    assert.deepEqual(c.calls.budgetClassFor, [], `${name}: a declared pin never takes the silent H1 path`);
+    assert.deepEqual(oneEvent(c, 'HARNESS_DEFAULTED').payload, { harness: null, budget_override: name, budget_class: 'standard' }, name);
+    assert.deepEqual(c.calls.tripBudget, ['a'], name);
+    assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.standard.tokens_cap, name);
+    assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), [], name);
+  }
+});
+
+test('a lead that has declared nothing yet is priced as H1, and that is not announced', async () => {
+  const { tick } = await load('bc6-' + Date.now());
+  // `''` is no pin either: it names nothing, and `soma_enqueue` refuses it at the door.
+  for (const pin of [null, '']) {
+    const c = priced({
+      fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', budget_class: pin, budget_override: pin })] },
+      leadEvents: { a: [ev('STARTED', 'a', NOW - 9 * MIN)] },
+      readDirUsage: spent(1_200_000),
+    });
+    await tick(c.deps);
+    // Every lead spends its first minutes here, before its step-1 HARNESS report. Announcing it
+    // would announce every spawn, and an alarm that fires on every spawn is one an operator mutes.
+    assert.deepEqual(c.calls.budgetClassFor, ['H1'], JSON.stringify(pin));
+    assert.deepEqual(c.calls.tripBudget, ['a'], JSON.stringify(pin));
+    assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.standard.tokens_cap, JSON.stringify(pin));
+    assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), [], JSON.stringify(pin));
+  }
+});
+
+test('a declaration nothing can price binds standard and says so once, naming what was declared', async () => {
+  const { tick } = await load('bc7-' + Date.now());
+  const cases = [
+    { name: 'a harness the registry does not carry, read off the stream before any drain',
+      over: {}, stream: [declared('H9', NOW - 5 * MIN, 'standard')],
+      payload: { harness: 'H9', budget_override: null, budget_class: 'standard' } },
+    { name: 'a harness on the row whose class soma.json does not define',
+      over: { harness: 'H6' }, stream: [],
+      payload: { harness: 'H6', budget_override: null, budget_class: 'standard' } },
+    { name: 'a pinned class soma.json does not define, with no harness declared behind it',
+      over: { budget_class: 'premium', budget_override: 'premium' }, stream: [],
+      payload: { harness: null, budget_override: 'premium', budget_class: 'standard' } },
+    // Both cut to 32: one event is one atomic append, so nothing unbounded rides in a payload.
+    { name: 'long spellings of both',
+      over: { budget_class: 'p'.repeat(100), budget_override: 'p'.repeat(100) }, stream: [declared('X'.repeat(100), NOW - 5 * MIN, 'standard')],
+      payload: { harness: 'X'.repeat(32), budget_override: 'p'.repeat(32), budget_class: 'standard' } },
+  ];
+  for (const { name, over, stream, payload } of cases) {
+    const mk = (extra = {}) => priced({
+      fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', ...over })] },
+      leadEvents: { a: stream },
+      readDirUsage: spent(1_200_000),
+      ...extra,
+    });
+    const c = mk();
+    await tick(c.deps);
+    const said = oneEvent(c, 'HARNESS_DEFAULTED');
+    assert.equal(said.lead, 'a', name);
+    assert.deepEqual(said.payload, payload, name);
+    assert.deepEqual(c.calls.tripBudget, ['a'], `${name}: the fallback class still trips`);
+    assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.standard.tokens_cap, name);
+
+    // Once per lead, off the durable log; the breaker keeps running under it.
+    const again = mk({ orchEvents: [ev('HARNESS_DEFAULTED', 'a', NOW - MIN, payload)] });
+    await tick(again.deps);
+    assert.deepEqual(eventsOf(again, 'HARNESS_DEFAULTED'), [], name);
+    assert.deepEqual(again.calls.tripBudget, ['a'], `${name}: the dedupe is on the announcement, never on the breaker`);
+  }
+});
+
+test('a lead stream that cannot be read costs the pricing its freshest input, never the lead its breaker', async () => {
+  const { tick } = await load('bc8-' + Date.now());
+  const c = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', harness: 'H4', budget_class: 'review' })] },
+    readDirUsage: spent(1_800_000),
+    deps: { leadEvents: () => { throw new Error('EACCES reading the lead stream'); } },
+  });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap, 'priced by the harness the row carries');
+  assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR').filter((e) => e.payload?.where === 'budget'), []);
+  assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), []);
+});
+
+test('a HARNESS that names no harness declares nothing, so the one before it still prices the lead', async () => {
+  const { tick } = await load('bc9-' + Date.now());
+  // `soma_report` refuses such a report before it is stored, so only a hand-written line can be
+  // one. It must not mask the real declaration filed before it.
+  const c = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u' })] },
+    leadEvents: { a: [declared('H4', NOW - 9 * MIN, 'review'), ev('HARNESS', 'a', NOW - 2 * MIN, {})] },
+    readDirUsage: spent(1_800_000),
+  });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap);
+  assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), []);
+});
+
+test('a row enqueued before the pin existed has no budget_override key at all, and that is no pin', async () => {
+  const { tick } = await load('bc10-' + Date.now());
+  // The shape every row on a fleet that predates this field has: the key ABSENT, not null, beside
+  // a `budget_class` that may be an operator's choice or the old fold's copy of a first report.
+  const legacy = (over) => {
+    const r = row({ status: 'spawned', lead_session_uuid: 'u', budget_class: 'babysit', ...over });
+    delete r.budget_override;
+    assert.equal(Object.hasOwn(r, 'budget_override'), false, 'the fixture must be the key-absent shape');
+    return r;
+  };
+
+  // With a declared harness: priced by it. Read as a pin, `babysit` would trip this lead at 400,000.
+  const c = priced({ fleet: { tasks: [legacy()] }, leadEvents: { a: [declared('H4', NOW - 5 * MIN, 'review')] }, readDirUsage: spent(1_800_000) });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.tripBudget, []);
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap);
+  assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), [], 'a missing field is not a pin that failed to bind');
+  assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), []);
+
+  // With nothing declared yet: H1's class, silently, like any unpinned lead in its first minutes.
+  const early = priced({ fleet: { tasks: [legacy()] }, readDirUsage: spent(1_200_000) });
+  await tick(early.deps);
+  assert.deepEqual(early.calls.budgetClassFor, ['H1']);
+  assert.equal(oneEvent(early, 'BUDGET').payload.tokens_cap, PRICED.standard.tokens_cap);
+  assert.deepEqual(eventsOf(early, 'HARNESS_DEFAULTED'), []);
+  assert.deepEqual(eventsOf(early, 'WATCHDOG_ERROR'), []);
 });
 
 // ════════════════════════ Model deviation ════════════════════════
@@ -1905,6 +2307,10 @@ test('the version gate closes admission and says which version closed it', async
   const gate = oneEvent(c, 'VERSION_GATE');
   assert.equal(gate.payload.version, '2.9.0');
   assert.equal(gate.payload.tested_max, '2.1.999');
+  // And its reason names something the operator can DO. It said admission stays closed "until soma
+  // up --canary re-proves them" — and on this build --canary cannot pass: its live driver is not built.
+  assert.doesNotMatch(gate.payload.why, /--canary/, 'the gate must not send the operator to a check that cannot pass on this build');
+  assert.match(gate.payload.why, /tested_claude/, 'the dial that re-opens it');
   // Announced once per version, not once per tick.
   const again = ctx({
     fleet: { tasks: [row({ id: 'a', status: 'queued' })] },
@@ -2009,6 +2415,9 @@ test('REQUIRED_DEPS cannot be shortened at runtime, because a name dropped from 
   assert.throws(() => { mod.REQUIRED_DEPS[0] = 'x'; }, TypeError);
   assert.equal(mod.REQUIRED_DEPS.includes('queuePaused'), true);
   assert.equal(mod.REQUIRED_DEPS.includes('tripped'), true);
+  // The 80% flag. Optional-chained, a tick would log the BUDGET and never write the one thing the
+  // lead hears, and every injected test would still pass.
+  assert.equal(mod.REQUIRED_DEPS.includes('warnBudget'), true);
   // The pane census's listing. A tick that optional-chained it would skip the census silently
   // and every dead shell in the fleet would stay invisible, exactly as before the census.
   assert.equal(mod.REQUIRED_DEPS.includes('paneStates'), true);
@@ -3482,6 +3891,67 @@ test('a revival picks its seat BEFORE the kill and before the attempt: a malform
   ranBefore(ok.order, 'pickSeat', 'killSession:lead-a');
 });
 
+test('a revival refuses a seats that is not an array at the pick, even when the pick answers null: no death scene, no attempt, no kill', async () => {
+  const { tick } = await load('lim-revive-nonarray-' + Date.now());
+  // `seatsConfigured` read a non-array `seats` as "no seats", so revival skipped the pick and
+  // launched seat-blind — into a spawner that reads the same soma.json, reaches `seats.loadSeats`
+  // through `launchRoots` → `seatRoots`, and throws AFTER the death scene, the attempt and the
+  // kill. Three ticks of one typo reached GAVE_UP. The row carries no seat label and the pick
+  // answers null without reading `cfg.seats` (the harness default, and what `seats.pick` does for
+  // an unreadable state/seats.json), so the refusal has to be the watchdog's own read of the pool:
+  // a fix that relied on the pick dep throwing would still kill this lead.
+  for (const seatsCfg of [{}, 'a', 5, true]) {
+    const name = `seats ${JSON.stringify(seatsCfg)}`;
+    const c = ctx({
+      cfg: cfgOf({ seats: seatsCfg }),
+      fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u', attempts: 1 })] },
+      alive: new Set(),                                                       // dead -> revival
+    });
+    await tick(c.deps);
+    assert.deepEqual(eventsOf(c, 'LEAD_DEAD'), [], `${name}: no death scene was captured`);
+    assert.equal(c.task().attempts, 1, `${name}: the attempt was not spent`);
+    assert.deepEqual(c.calls.killSession, [], `${name}: the dead pane is still standing`);
+    assert.deepEqual(c.calls.spawnLead, [], name);
+    assert.deepEqual(c.calls.resumeLead, [], name);
+    const err = oneEvent(c, 'WATCHDOG_ERROR');
+    assert.equal(err.payload.where, 'revival', name);
+    assert.equal(err.lead, 'a', name);
+    assert.match(err.payload.error, /cfg\.seats must be an array/, `${name}: reported by name, for the operator to fix`);
+  }
+  // The control: the same dead row with `seats: []` — no rotation — is killed, charged and
+  // relaunched, so the assertions above are the refusal and not a revival that never runs here.
+  const ok = ctx({
+    cfg: cfgOf({ seats: [] }),
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u', attempts: 1 })] },
+    alive: new Set(),
+  });
+  await tick(ok.deps);
+  assert.deepEqual(ok.calls.killSession, ['lead-a']);
+  assert.equal(ok.task().attempts, 2);
+  assert.equal(eventsOf(ok, 'LEAD_DEAD').length, 1);
+});
+
+test('admission with a seats that is not an array claims nothing: the pool is asked before the row is spawned', async () => {
+  const { tick } = await load('adm-nonarray-' + Date.now());
+  const { loadSeats } = await import('../bin/lib/seats.mjs');
+  // The pick as `seats.pick` makes it on a readable state file: through `loadSeats`, which refuses
+  // a non-array by name. Read as "no seats", `{}` let admission claim the row and launch into a
+  // spawner that throws on the same value — an attempt charged per tick until GAVE_UP failed the task.
+  const c = ctx({
+    cfg: cfgOf({ seats: {} }),
+    fleet: { tasks: [row({ id: 'b', status: 'queued' })] },
+    pickSeat: (now, cfg) => { loadSeats(cfg); return null; },
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.spawnLead, [], 'nothing was launched');
+  assert.deepEqual(c.calls.setTaskStatus, [], 'the row was never claimed');
+  assert.equal(c.task('b').status, 'queued');
+  assert.equal(c.task('b').attempts, 0, 'and no attempt was charged');
+  const err = oneEvent(c, 'WATCHDOG_ERROR');
+  assert.equal(err.payload.where, 'admission');
+  assert.match(err.payload.error, /cfg\.seats must be an array/);
+});
+
 test('cfg.seats [] — the value production actually passes — is no seats at all: no pool read, no reopen, no lock, today\'s launch', async () => {
   const { tick } = await load('lim-empty-' + Date.now());
   // A soma.json with no `seats` key — every config written before seats existed — makes
@@ -3662,7 +4132,7 @@ test('a row whose seat is not a usable label rotates FROM nowhere nameable, rath
   }
 });
 
-test('a reopen that answers with no array, and a cfg.seats that is not an array, are silent skips rather than a tick-ending throw', async () => {
+test('a reopen that answers with no array is a silent skip, and a cfg.seats that is not an array is one named error, never a tick-ending throw', async () => {
   const { tick } = await load('lim-guards-' + Date.now());
   // Two guards nothing could fail. `reopenSeats` is an injected dep and `for (const row of
   // undefined)` is a TypeError that costs the whole reopen pass — and, being reported against
@@ -3673,11 +4143,12 @@ test('a reopen that answers with no array, and a cfg.seats that is not an array,
     assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), [], `reopenSeats -> ${JSON.stringify(answer) ?? 'undefined'}`);
     assert.deepEqual(eventsOf(c, 'SEAT_REOPENED'), []);
   }
-  // `soma.json` is not validated for `seats` on purpose (`config.mjs`: "nothing here validates the
-  // entries, because loadConfig() runs on every tick and must not throw for a typo that soma
-  // doctor can name"), so a hand-written `"seats": "seat-a"` reaches the tick as a string.
-  // `seatOfRow`'s `!seatsConfigured(cfg)` half is what keeps `seats.loadSeats` — which refuses a
-  // non-array by name — from turning that typo into a WATCHDOG_ERROR every 30 s per limit-hit lead.
+  // A hand-written `"seats": "seat-a"` no longer reaches a tick from soma.json: `loadConfig`
+  // refuses a non-array `seats` (`config.mjs` `validated`), and the tick ends at its first line.
+  // An INJECTED one still can, and it is not "no seats" — that reading is what sent a dead lead
+  // seat-blind past the kill into a spawner that refuses the same value. It is a pool
+  // `seats.loadSeats` refuses by name, so the limit-hit lead's close throws before anything is
+  // closed or killed, and the phase files that sentence against the lead, once, without ending the tick.
   const typo = ctx({
     cfg: cfgOf({ seats: 'seat-a' }),
     fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u', seat: 'seat-a' })] },
@@ -3686,9 +4157,12 @@ test('a reopen that answers with no array, and a cfg.seats that is not an array,
     readTail: tail(FIVE_HOUR_ROW),
   });
   await tick(typo.deps);
-  assert.deepEqual(eventsOf(typo, 'WATCHDOG_ERROR'), [], 'a soma.json typo is soma doctor\'s to name, not a per-tick error');
+  const err = oneEvent(typo, 'WATCHDOG_ERROR');
+  assert.equal(err.payload.where, 'limits');
+  assert.equal(err.lead, 'a');
+  assert.match(err.payload.error, /cfg\.seats must be an array, got string/, 'named, so the operator can fix it');
   assert.deepEqual(typo.calls.closeSeat, [], 'and it closes nothing, because there is no readable pool to close in');
-  assert.equal(typo.calls.reopenSeats, 0);
+  assert.deepEqual(typo.calls.killSession, [], 'nor kills the lead it could not place');
 });
 
 // ═══════════════ The revert — ROTATION_FAILED restores the original seat ═══════════════
