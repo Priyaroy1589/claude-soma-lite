@@ -1401,18 +1401,32 @@ test('the write-idiom scan stays linear on the shapes that made it quadratic', a
   // anything is timed, and once at full size before its own rounds: in a fresh process the
   // first shape timed otherwise read 6.8–7.4 on the Linux VM, its code still cold. A cheap
   // shape gets more than five rounds, up to twenty or a quarter of a second of its own time:
-  // with every core busy, five rounds left one cheap shape reading 6.9. A shape whose first
-  // round reads under 2 stops there. The three cd shapes whose cost is a fixed budget did in
-  // every measured run (cd tracking gives up past `CWD_MAX` characters, and target resolution
-  // past 256 targets), and they cost about a second per call on the Linux VM: timing them five
-  // times like the rest made this test take 32–36 s there, against 14–18 s. A linear shape does
-  // now and then, when its first quarter-size run was the one stretched, and passes that run on
-  // less evidence. The exit cannot let superlinear growth through: under 2 is half of linear and
-  // an eighth of quadratic, so a quadratic shape would need its quarter-size run stretched about
-  // eight times more than its full-size run in the same round; noise on the full-size run only
-  // raises the ratio, which sends a shape into the full rounds, not out of them. And one
-  // absolute limit stays, at 30 s per call, as a backstop only: it is for a scan gone
+  // with every core busy, five rounds left one cheap shape reading 6.9.
+  //
+  // The early exit is a property of the SHAPE, never of a measurement. Three shapes are marked
+  // `capped`: the cd shapes whose cost is a fixed budget, because cd tracking gives up past
+  // `CWD_MAX` characters and target resolution past 256 targets. They cost about a second per
+  // call on the Linux VM, and timing them five times like the rest made this test take 32–36 s
+  // there, against 14–18 s. A marked shape stops after its first round only if that round reads
+  // under 2; every other shape always runs its full rounds, so for 19 of the 22 the exit is
+  // unreachable however loaded the machine is. A marked shape's quarter-size run takes 0.08 s
+  // (macOS) to 0.64 s (the Linux VM) idle, so a miss would need that run stretched about eight
+  // times more than its full-size run in one round — a stall of over half a second on macOS and
+  // of seconds on the Linux VM — while a scan regression in a marked shape reads ~16 in its first
+  // round and goes on to the full rounds. The exit used to be open to any shape whose first round
+  // read under 2, on the argument that only a quarter-size run stretched eight times more than
+  // its full-size run could get a quadratic shape there. Load does that to a cheap shape, whose
+  // runs last milliseconds: inside the full parallel suite on the Linux VM, "two hundred thousand
+  // semicolons" stopped at 0.26 (8.2 ms full against 31.4 ms for a quarter, about fifteen times
+  // the quarter's share), and on macOS with every core busy "fifty thousand flags behind a
+  // wrapper" stopped at 1.71 — so a cheap shape regressed to a quadratic costing tens of
+  // milliseconds could have passed a loaded run.
+  //
+  // And one absolute limit stays, at 30 s per call, as a backstop only: it is for a scan gone
   // pathological outright, and sits over twenty times above the slowest call measured anywhere.
+  //
+  // A shape whose cost is a fixed budget rather than a function of its size; see the early exit.
+  const capped = (shape) => Object.assign(shape, { capped: true });
   const shapes = {
     'many sed tokens, no separator': (q) => 'sed '.repeat(51_200 * q),            // 200 KB at q = 1
     'a heredoc that mentions sed': (q) => `cat <<'EOF'\n${'  # normalise with sed and awk\n'.repeat(5000 * q)}EOF\n`,
@@ -1428,11 +1442,11 @@ test('the write-idiom scan stays linear on the shapes that made it quadratic', a
     // the length bound in `cdDestination`, `cd a` repeated normalizes a path that grows by
     // two characters each iteration — quadratic, and 80 000 of them is a 1 MB command.
     'fifty thousand newline segments': (q) => 'echo x\n'.repeat(50_000 * q),
-    'fifty thousand cds down': (q) => 'cd a\n'.repeat(50_000 * q),
+    'fifty thousand cds down': capped((q) => 'cd a\n'.repeat(50_000 * q)),
     'fifty thousand cds up': (q) => 'cd ..\n'.repeat(50_000 * q),
     'fifty thousand unfollowable cds': (q) => 'cd $X\n'.repeat(50_000 * q),
-    'twenty thousand cd-and-delete pairs': (q) => 'cd a && rm b\n'.repeat(20_000 * q),
-    'twenty thousand subshell cds': (q) => '(cd a)'.repeat(20_000 * q),
+    'twenty thousand cd-and-delete pairs': capped((q) => 'cd a && rm b\n'.repeat(20_000 * q)),
+    'twenty thousand subshell cds': capped((q) => '(cd a)'.repeat(20_000 * q)),
     'two hundred thousand semicolons': (q) => ';'.repeat(200 * 1024 * q),
     'a hundred thousand newlines': (q) => '\n'.repeat(100 * 1024 * q),
     'a hundred thousand line continuations': (q) => `tee ${'\\\n'.repeat(100_000 * q)}f`,
@@ -1440,6 +1454,10 @@ test('the write-idiom scan stays linear on the shapes that made it quadratic', a
     'fifty thousand flags behind a wrapper': (q) => `nice ${'-n '.repeat(50_000 * q)}tee f`,
     'a one-megabyte single cd path': (q) => `cd ${'a/'.repeat(500_000 * q)} && rm settings.local.json`,
   };
+  // The comment above promises exactly these three, so marking another shape is a decision this
+  // line makes someone take on purpose.
+  assert.deepEqual(Object.keys(shapes).filter((what) => shapes[what].capped),
+    ['fifty thousand cds down', 'twenty thousand cd-and-delete pairs', 'twenty thousand subshell cds']);
   const time = (cmd) => {
     const started = process.hrtime.bigint();
     evaluateGate(bash(cmd), LEAD_ENV, () => false);
@@ -1457,7 +1475,7 @@ test('the write-idiom scan stays linear on the shapes that made it quadratic', a
       quarterMs = Math.min(quarterMs, q);
       fullMs = Math.min(fullMs, ms);
       spent += q + ms;
-      if (round === 1 && fullMs / quarterMs < 2) break;   // a fixed budget, not growth: see above
+      if (round === 1 && shape.capped && fullMs / quarterMs < 2) break;   // only a marked shape: see above
     }
     const growth = fullMs / quarterMs;
     assert.ok(growth < 8,
