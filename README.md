@@ -71,7 +71,7 @@ code runs on Node.js 24 built-ins with no npm dependencies.
   `claude --model opus --effort max` with its own agent team.
 - **Loop harnesses.** A lead picks one of six harnesses (one-shot, iterate-to-green, TDD,
   review-fix, babysitter, research spike) and reports the choice, which the bus validates against
-  the registry. The harness sets the lead's budget class.
+  the registry. The harness sets the lead's budget class, unless the operator pinned one at enqueue.
 - **An MCP bus with no dependencies.** A hand-written stdio MCP server gives leads three tools to
   report through, and gives the orchestrator twelve tools to run the fleet. A lead's
   `NEEDS_INPUT`, `ERROR` or `COMPLETED` wakes the orchestrator: a keystroke into its pane when the
@@ -460,9 +460,11 @@ The retired key `resume_token_guard` is stripped with a warning if your file sti
   declared and none of it can be priced (a harness the registry does not carry or soma.json cannot
   price, or an enqueue class soma.json does not define with no priceable harness behind it), or
   nothing was declared and even H1 cannot be priced, which means a broken install.
-- An enqueue class soma.json does not define is ignored without an event whenever the lead's
-  harness can be priced. `soma_enqueue` refuses one (`unknown-budget-class`, with the classes
-  soma.json does define); `soma enqueue --file` does not check it.
+- `soma_enqueue` refuses a `budget_class` soma.json does not define (`unknown-budget-class`, and
+  lists the classes it does define); `soma enqueue --file` stores what the file says. The breaker
+  passes such a class over and logs `HARNESS_DEFAULTED` once for that lead: the lead is priced by
+  its harness, with `budget_class: null` in the event, or at `standard` when it has declared no
+  harness yet.
 - The caps are calibrated against real one-ticket sessions, none of them a soma lead with a team;
   the team multiplier is an estimate (about 2.5×, in a 1.5× to 4× band). RUNBOOK §10 describes the
   measurement run that settles it.

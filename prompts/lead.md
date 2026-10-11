@@ -94,9 +94,9 @@ reserves exactly one class (H1→standard, H2→iterate, H3→iterate, H4→revi
 H6→research) — that is the direction that binds, because the watchdog prices your harness (or a
 class the operator pinned for this task at enqueue), not your declaration. If it refuses, read the
 refusal and fix the field — never route around it.
-Once stored, the watchdog binds your circuit breaker to that class and the orchestrator holds a
-**one-turn veto**. Spend that turn on cheap, reversible setup (task list, roster, reading the gate
-script), not on dispatching work.
+Once stored, the watchdog binds your circuit breaker to that class (or to the class the operator
+pinned) and the orchestrator holds a **one-turn veto**. Spend that turn on cheap, reversible setup
+(task list, roster, reading the gate script), not on dispatching work.
 
 Autonomy levels, and what each one forbids:
 

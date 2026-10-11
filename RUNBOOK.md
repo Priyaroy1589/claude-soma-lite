@@ -526,9 +526,10 @@ soma enqueue --file tasks.json
 name). Each row needs at least `id`, matching `^[a-z][a-z0-9-]{0,63}$` — it becomes a directory
 name, a tmux target and an event stream, so nothing else is admitted. Fields that survive into the
 fleet row: `id`, `title`, `repo`, `source`, `brief`, `base_branch`, `budget_class`, and
-`budget_override`, a copy of `budget_class` that pins the breaker to it. This verb does not check
-that soma.json defines the class (`soma_enqueue` does); one it does not define is ignored without
-an event whenever the lead's harness can be priced.
+`budget_override`, a copy of `budget_class` that pins the breaker to it. This verb stores the class
+as the file gives it and does not check that soma.json defines it (`soma_enqueue` does). One it does
+not define is passed over and `HARNESS_DEFAULTED` says so once: the lead is priced by its harness, or
+at `standard` before it declares one.
 
 ```json
 [

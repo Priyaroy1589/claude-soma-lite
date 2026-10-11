@@ -821,15 +821,17 @@ test('a budget class soma.json does not define is refused at intake, and the rep
     { id: 'cr-7', budget_class: 'Babysit' },              // matched exactly, as the breaker matches it
     { id: 'cr-8', budget_class: 7 },
     { id: 'cr-9', budget_class: '' },
+    { id: 'cr-10', budget_class: 'toString' },            // two more names no budgets object owns
+    { id: 'cr-11', budget_class: '__proto__' },
   ] });
   assert.deepEqual(r.queued, ['cr-1', 'cr-2', 'cr-3']);
-  assert.deepEqual(r.skipped, ['cr-4', 'cr-5', 'cr-6', 'cr-7', 'cr-8', 'cr-9'].map((id) => ({ id, reason: 'unknown-budget-class' })));
+  assert.deepEqual(r.skipped, ['cr-4', 'cr-5', 'cr-6', 'cr-7', 'cr-8', 'cr-9', 'cr-10', 'cr-11'].map((id) => ({ id, reason: 'unknown-budget-class' })));
   assert.deepEqual(r.known_budget_classes, ['standard', 'babysit'], 'only the classes the breaker can bind');
   assert.deepEqual(c.s.fleet.tasks.map((t) => t.id), ['cr-1', 'cr-2', 'cr-3']);
 
   // No refusal of that kind, no list: the reply carries what the caller needs to act on.
-  const fine = await bt.orchTools(c).get('soma_enqueue')({ tasks: [{ id: 'cr-10', budget_class: 'standard' }] });
-  assert.deepEqual(fine.queued, ['cr-10']);
+  const fine = await bt.orchTools(c).get('soma_enqueue')({ tasks: [{ id: 'cr-12', budget_class: 'standard' }] });
+  assert.deepEqual(fine.queued, ['cr-12']);
   assert.equal(fine.known_budget_classes, undefined);
 });
 
@@ -1522,6 +1524,39 @@ test('a pinned class survives a superseding HARNESS, and a drain with nothing el
   const again = await bt.orchTools(still).get('soma_inbox')({});
   assert.equal(again.folded, 0);
   assert.equal(still.s.updates, 0);
+});
+
+test('a supersede across two separate drains moves the class with the harness, and the fold never writes a pin', async () => {
+  const bt = await load();
+  const c = orch({ tasks: [{ id: 'cr-1', status: 'spawned' }], events: [{ type: 'HARNESS', lead: 'cr-1', payload: { harness_id: 'H1' } }] });
+  const tools = bt.orchTools(c);
+  assert.equal((await tools.get('soma_inbox')({})).folded, 1);
+  assert.equal(c.s.fleet.tasks[0].budget_class, 'standard');
+
+  // The documented degrade, filed after the first report was drained and marked read.
+  const ts = T0 + 5000;
+  c.s.events.push({ id: `${ts}-0009`, ts, type: 'HARNESS', lead: 'cr-1', payload: { harness_id: 'H4' } });
+  assert.equal((await tools.get('soma_inbox')({})).folded, 1);
+  assert.equal(c.s.fleet.tasks[0].harness, 'H4');
+  assert.equal(c.s.fleet.tasks[0].budget_class, 'review');
+  assert.equal(c.s.fleet.tasks[0].budget_override, null, 'only fleet.enqueue writes the pin');
+});
+
+test('a row the old fold left behind has its class corrected by the next report, though its harness has not moved', async () => {
+  const bt = await load();
+  // What the fold before `budget_override` left after an H1 -> H4 supersede: the harness moved,
+  // the class did not, and the row has no `budget_override` key at all. When the lead next reports
+  // H4 (a re-report, or a re-delivery the cursor did not get past), the class is the ONLY thing the
+  // row disagrees with, so the transaction has to open for it alone.
+  const c = withoutKeys(orch({
+    tasks: [{ id: 'cr-1', status: 'spawned', harness: 'H4', budget_class: 'standard' }],
+    events: [{ type: 'HARNESS', lead: 'cr-1', payload: { harness_id: 'H4' } }],
+  }), 'budget_override');
+  const r = await bt.orchTools(c).get('soma_inbox')({});
+  assert.equal(r.folded, 1);
+  assert.equal(c.s.updates, 1);
+  assert.equal(c.s.fleet.tasks[0].budget_class, 'review');
+  assert.equal(Object.hasOwn(c.s.fleet.tasks[0], 'budget_override'), false, 'a missing pin is no pin, and the fold does not invent one');
 });
 
 test('a COMPLETED event folds its PR url onto the row', async () => {

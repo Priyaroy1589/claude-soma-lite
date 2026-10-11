@@ -1044,45 +1044,108 @@ test('a pinned class beats the harness the lead declared', async () => {
   assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), []);
 });
 
-test('a pinned class soma.json does not define falls through to the harness, without a word', async () => {
+/**
+ * Pins no class can be bound from, each with the name a HARNESS_DEFAULTED payload gives it. The
+ * strings: a name soma.json never wrote; three that resolve through Object.prototype, which a
+ * truthiness or `in` lookup would bind; an own key whose value is not a record; and a record class
+ * reachable only through the budgets' prototype. The rest are not strings at all, which
+ * `soma enqueue --file` stores as the file says. Only a string can name a class:
+ * `Object.hasOwn(budgets, 42)` would find a class named "42", and `['babysit']` would find babysit.
+ */
+const UNBOUND = [
+  ['premium', 'premium'], ['constructor', 'constructor'], ['toString', 'toString'], ['__proto__', '__proto__'],
+  ['flat', 'flat'], ['inherited', 'inherited'],
+  [42, '42'], [true, 'true'], [{}, 'object'], [{ toString: 1 }, 'object'], [['babysit'], 'array'],
+];
+
+/** The budgets those pins are tried against: every trap above, beside the four real classes. */
+const unboundBudgets = () => Object.assign(
+  Object.create({ inherited: { tokens_cap: 1, turn_cap: 0, wall_ms: 0 } }),
+  structuredClone(PRICED),
+  { flat: 42, 42: { tokens_cap: 1, turn_cap: 0, wall_ms: 0 } },
+);
+
+test('a pin no class can be bound from is passed over for the harness, and said once', async () => {
   const { tick } = await load('bc5-' + Date.now());
-  // A name soma.json never wrote; `constructor`, which a truthiness lookup finds on
-  // Object.prototype (a function); an own key whose value is not a record; and a record class
-  // reachable only through the budgets' prototype, which an `in` lookup would bind.
-  const inherited = Object.assign(Object.create({ premium: { tokens_cap: 1, turn_cap: 0, wall_ms: 0 } }), structuredClone(PRICED));
-  for (const [pinned, budgets] of [
-    ['premium', structuredClone(PRICED)],
-    ['constructor', structuredClone(PRICED)],
-    ['flat', { ...structuredClone(PRICED), flat: 42 }],
-    ['premium', inherited],
-  ]) {
-    const c = priced({
-      fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', budget_class: pinned, budget_override: pinned })] },
+  for (const [pin, name] of UNBOUND) {
+    const mk = (extra = {}) => priced({
+      fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', budget_class: pin, budget_override: pin })] },
       leadEvents: { a: [declared('H4', NOW - 5 * MIN, 'review')] },
       readDirUsage: spent(1_800_000),
-    }, budgets);
+      ...extra,
+    }, unboundBudgets());
+    const c = mk();
     await tick(c.deps);
-    assert.deepEqual(c.calls.tripBudget, [], pinned);
-    assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap, pinned);
-    assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), [], `${pinned}: the harness priced this lead, so nothing was defaulted`);
-    assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), [], pinned);
+    assert.deepEqual(c.calls.tripBudget, [], name);
+    assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap, `${name}: priced by its harness`);
+    // A pin that silently stops binding is the very complaint this resolver answers: the operator
+    // asked for a class, and the lead is metered at another. So it is said, with a null class,
+    // because no fallback was bound: the lead's own harness prices it.
+    const said = oneEvent(c, 'HARNESS_DEFAULTED');
+    assert.equal(said.lead, 'a', name);
+    assert.deepEqual(said.payload, { harness: 'H4', budget_override: name, budget_class: null }, name);
+    assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), [], name);
+
+    // Once per lead, off the durable log.
+    const again = mk({ orchEvents: [ev('HARNESS_DEFAULTED', 'a', NOW - MIN, said.payload)] });
+    await tick(again.deps);
+    assert.deepEqual(eventsOf(again, 'HARNESS_DEFAULTED'), [], name);
+    assert.equal(oneEvent(again, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap, name);
+  }
+});
+
+test('a passed-over pin names the harness that priced the lead as the lead spelled it, cut to 32', async () => {
+  const { tick } = await load('bc5c-' + Date.now());
+  // `harness.budgetClassFor` prices a leading id with prose after it, so a spelling a lead typed
+  // can be long and still price the lead. One event is one atomic append, so it is cut.
+  const spelling = `H4 ${'review loop, '.repeat(10)}`;
+  const c = priced({
+    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', budget_class: 'premium', budget_override: 'premium' })] },
+    leadEvents: { a: [declared(spelling, NOW - 5 * MIN, 'review')] },
+    readDirUsage: spent(1_800_000),
+    budgetClassFor: (h) => (/^H4\b/.test(h) ? PRICED.review : null),
+  });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap);
+  assert.deepEqual(oneEvent(c, 'HARNESS_DEFAULTED').payload, { harness: spelling.slice(0, 32), budget_override: 'premium', budget_class: null });
+});
+
+test('a pin that is not a string is still a declaration: with no harness behind it, standard is bound and said', async () => {
+  const { tick } = await load('bc5b-' + Date.now());
+  for (const [pin, name] of UNBOUND.filter(([p]) => typeof p !== 'string')) {
+    const c = priced({
+      fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', budget_class: pin, budget_override: pin })] },
+      leadEvents: { a: [ev('STARTED', 'a', NOW - 9 * MIN)] },
+      readDirUsage: spent(1_200_000),
+    }, unboundBudgets());
+    await tick(c.deps);
+    // Read as "nothing declared", this lead took H1's class without a word, which is the silent
+    // pricing the announcement exists to end.
+    assert.deepEqual(c.calls.budgetClassFor, [], `${name}: a declared pin never takes the silent H1 path`);
+    assert.deepEqual(oneEvent(c, 'HARNESS_DEFAULTED').payload, { harness: null, budget_override: name, budget_class: 'standard' }, name);
+    assert.deepEqual(c.calls.tripBudget, ['a'], name);
+    assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.standard.tokens_cap, name);
+    assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), [], name);
   }
 });
 
 test('a lead that has declared nothing yet is priced as H1, and that is not announced', async () => {
   const { tick } = await load('bc6-' + Date.now());
-  const c = priced({
-    fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u' })] },
-    leadEvents: { a: [ev('STARTED', 'a', NOW - 9 * MIN)] },
-    readDirUsage: spent(1_200_000),
-  });
-  await tick(c.deps);
-  // Every lead spends its first minutes here, before its step-1 HARNESS report. Announcing it
-  // would announce every spawn, and an alarm that fires on every spawn is one an operator mutes.
-  assert.deepEqual(c.calls.budgetClassFor, ['H1']);
-  assert.deepEqual(c.calls.tripBudget, ['a']);
-  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.standard.tokens_cap);
-  assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), []);
+  // `''` is no pin either: it names nothing, and `soma_enqueue` refuses it at the door.
+  for (const pin of [null, '']) {
+    const c = priced({
+      fleet: { tasks: [row({ status: 'spawned', lead_session_uuid: 'u', budget_class: pin, budget_override: pin })] },
+      leadEvents: { a: [ev('STARTED', 'a', NOW - 9 * MIN)] },
+      readDirUsage: spent(1_200_000),
+    });
+    await tick(c.deps);
+    // Every lead spends its first minutes here, before its step-1 HARNESS report. Announcing it
+    // would announce every spawn, and an alarm that fires on every spawn is one an operator mutes.
+    assert.deepEqual(c.calls.budgetClassFor, ['H1'], JSON.stringify(pin));
+    assert.deepEqual(c.calls.tripBudget, ['a'], JSON.stringify(pin));
+    assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.standard.tokens_cap, JSON.stringify(pin));
+    assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), [], JSON.stringify(pin));
+  }
 });
 
 test('a declaration nothing can price binds standard and says so once, naming what was declared', async () => {
@@ -1150,6 +1213,34 @@ test('a HARNESS that names no harness declares nothing, so the one before it sti
   await tick(c.deps);
   assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap);
   assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), []);
+});
+
+test('a row enqueued before the pin existed has no budget_override key at all, and that is no pin', async () => {
+  const { tick } = await load('bc10-' + Date.now());
+  // The shape every row on a fleet that predates this field has: the key ABSENT, not null, beside
+  // a `budget_class` that may be an operator's choice or the old fold's copy of a first report.
+  const legacy = (over) => {
+    const r = row({ status: 'spawned', lead_session_uuid: 'u', budget_class: 'babysit', ...over });
+    delete r.budget_override;
+    assert.equal(Object.hasOwn(r, 'budget_override'), false, 'the fixture must be the key-absent shape');
+    return r;
+  };
+
+  // With a declared harness: priced by it. Read as a pin, `babysit` would trip this lead at 400,000.
+  const c = priced({ fleet: { tasks: [legacy()] }, leadEvents: { a: [declared('H4', NOW - 5 * MIN, 'review')] }, readDirUsage: spent(1_800_000) });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.tripBudget, []);
+  assert.equal(oneEvent(c, 'BUDGET').payload.tokens_cap, PRICED.review.tokens_cap);
+  assert.deepEqual(eventsOf(c, 'HARNESS_DEFAULTED'), [], 'a missing field is not a pin that failed to bind');
+  assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), []);
+
+  // With nothing declared yet: H1's class, silently, like any unpinned lead in its first minutes.
+  const early = priced({ fleet: { tasks: [legacy()] }, readDirUsage: spent(1_200_000) });
+  await tick(early.deps);
+  assert.deepEqual(early.calls.budgetClassFor, ['H1']);
+  assert.equal(oneEvent(early, 'BUDGET').payload.tokens_cap, PRICED.standard.tokens_cap);
+  assert.deepEqual(eventsOf(early, 'HARNESS_DEFAULTED'), []);
+  assert.deepEqual(eventsOf(early, 'WATCHDOG_ERROR'), []);
 });
 
 // ════════════════════════ Model deviation ════════════════════════
