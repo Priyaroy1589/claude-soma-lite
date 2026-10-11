@@ -845,7 +845,7 @@ test('a lead already warned in the log is not warned again', async () => {
   });
   await tick(c.deps);
   assert.deepEqual(eventsOf(c, 'BUDGET'), []);
-  assert.deepEqual(c.calls.warnBudget, [], 'the flag goes with the event: a lead warned once is not written a second note');
+  assert.deepEqual(c.calls.warnBudget, [], 'the flag goes with the event: a session warned once is not written a second note');
 });
 
 // ════════════════════ The 80% warning reaches the lead ════════════════════
@@ -853,8 +853,8 @@ test('a lead already warned in the log is not warned again', async () => {
 // The BUDGET event lands on the orchestrator's stream, which the lead never reads. So at the 80%
 // verdict the watchdog also writes `leads/<id>/BUDGET_WARNED`, and the PreToolUse gate hands the lead
 // a note on its next allowed tool call (`bin/hooks/lead-gate.mjs`, job 5). The flag goes FIRST: the
-// logged BUDGET is the once-per-lead dedupe, so a write that failed after it landed would never be
-// retried and the lead would never be told.
+// logged BUDGET is the once-per-session dedupe, so a write that failed after it landed would never
+// be retried and the lead would never be told.
 
 test('at 80% the watchdog writes the lead its flag, then logs the BUDGET', async () => {
   const { tick } = await load('warnflag-' + Date.now());
@@ -929,6 +929,160 @@ test('the real warnBudget writes the flag at warnPath, and heals a thinned state
     else process.env.SOMA_HOME = savedHome;
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+// ════════════════════ The 80% note is per session, not per lead ════════════════════
+//
+// Spend is the worktree directory's, so it carries across revivals; the note does not. A lead
+// revived `fresh` is a new session (a new `lead_session_uuid`) with none of the old context, so it
+// starts already past 80% of the same budget and has never been told. So the dedupe is per SESSION:
+// every BUDGET names the session it covers, and the 80% branch fires while no BUDGET covers the
+// row's current one. A `resume` keeps the uuid, and with it the note it already had. A BUDGET
+// logged before events named a session covers every session of its lead, so a lead in flight at the
+// upgrade is not told twice.
+
+/** A lead at 85% of a 1,000-token class, on session `uuid`, alive, with `orchEvents` in the log. */
+const warned = (uuid, orchEvents, over = {}) => ctx({
+  cfg: cfgOf({ budgets: { standard: { tokens_cap: 1000, turn_cap: 0, wall_ms: 0 } } }),
+  fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: uuid })] },
+  alive: new Set(['lead-a']),
+  readDirUsage: () => dirUsage({ est_tokens: 850, sessions: [usage({ uuid: 'u' }), usage({ uuid: 'v' })] }),
+  orchEvents,
+  ...over,
+});
+
+test('a lead warned on one session is warned again on a fresh one, which never saw the note', async () => {
+  const { tick } = await load('warn-fresh-' + Date.now());
+  const c = warned('v', [ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80, session_uuid: 'u' })]);
+  await tick(c.deps);
+  assert.deepEqual(c.calls.warnBudget, ['a'], 'session v was never told it is past 80%');
+  const budget = oneEvent(c, 'BUDGET');
+  assert.equal(budget.payload.pct, 80);
+  assert.equal(budget.payload.session_uuid, 'v');
+  ranBefore(c.order, 'warnBudget:a', 'event:BUDGET');
+  assert.deepEqual(c.calls.notify, [], 'a warning is still not toasted');
+});
+
+test('a resume keeps its session, and with it the note: no second warning', async () => {
+  const { tick } = await load('warn-resume-' + Date.now());
+  const c = warned('u', [
+    ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80, session_uuid: 'u' }),
+    ev('REVIVED', 'a', NOW - 10 * MIN, { plan: 'resume', attempt: 1, session_uuid: 'u' }),
+  ]);
+  await tick(c.deps);
+  assert.deepEqual(c.calls.warnBudget, []);
+  assert.deepEqual(eventsOf(c, 'BUDGET'), []);
+});
+
+test('a BUDGET logged before events named a session covers every session of its lead', async () => {
+  const { tick } = await load('warn-legacy-' + Date.now());
+  // No `session_uuid` key at all: what every BUDGET written before this change looks like. Read as
+  // one session it would re-warn every lead in flight at the upgrade. Read as all of them, a lead
+  // warned before the upgrade is not told again on any fresh session it starts after it: one missed
+  // note per such revival, and the gap closes as those leads finish.
+  const c = warned('v', [ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80 })]);
+  await tick(c.deps);
+  assert.deepEqual(c.calls.warnBudget, []);
+  assert.deepEqual(eventsOf(c, 'BUDGET'), []);
+});
+
+test('a BUDGET line whose payload is not a record is read as the legacy shape, never thrown on: the tick runs and still warns', async () => {
+  const { tick } = await load('warn-torn-' + Date.now());
+  // `orchHistory` folds the log before every phase, outside every phase's try, so a fold that threw
+  // on one torn line would reject the tick every 30 s: no census, no revival, no breaker, for the
+  // whole fleet. `Object.hasOwn(null, …)` throws, and the record check in front of it is the
+  // difference. Lead `b` has no row, so its five torn lines decide nothing but whether the fold
+  // survives them (a line with no lead never reaches the check), and lead `a`'s own warning is the
+  // evidence the fold ran to its end.
+  const torn = [null, undefined, 'garbage', 42, []].map((payload, i) => {
+    const e = ev('BUDGET', 'b', NOW - (30 - i) * MIN, payload);
+    if (payload === undefined) delete e.payload;                 // absent, not the helper's `{}`
+    return e;
+  });
+  assert.equal(Object.hasOwn(torn[1], 'payload'), false, 'the fixture must carry a line with no payload key at all');
+  // Lead `c` is at 85% on session `w` and has one torn line of its OWN. Read as the legacy shape, it
+  // covers every session of `c`, so `c` is not told: the line reads as already said, the same safe
+  // direction as a blind stream. A fold that skipped a torn line instead of reading it so would tell
+  // `c` a note the line may already stand for.
+  const h = warned('v', [...torn, ev('BUDGET', 'c', NOW - 20 * MIN, null)], {
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'v' }), row({ id: 'c', status: 'spawned', lead_session_uuid: 'w' })] },
+    alive: new Set(['lead-a', 'lead-c']),
+  });
+  await tick(h.deps);
+  assert.ok(h.calls.paneStates >= 1, 'phase 0 ran: the fold did not reject the tick');
+  assert.deepEqual(eventsOf(h, 'WATCHDOG_ERROR'), []);
+  assert.deepEqual(h.calls.warnBudget, ['a'], 'a, at 85% on a known session, is still told; c, whose own torn line reads as already said, is not');
+  const budget = oneEvent(h, 'BUDGET');
+  assert.equal(budget.lead, 'a');
+  assert.equal(budget.payload.session_uuid, 'v');
+});
+
+test('a BUDGET for a session with no uuid covers only that, not the session that later gets one', async () => {
+  const { tick } = await load('warn-null-' + Date.now());
+  // `session_uuid: null` is a BUDGET logged while the row had no uuid. It is a session like any
+  // other, not the legacy shape, so it does not cover the uuid a fresh revival writes later.
+  const told = warned(null, [ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80, session_uuid: null })]);
+  await tick(told.deps);
+  assert.deepEqual(told.calls.warnBudget, [], 'the same null session is covered');
+  const fresh = warned('v', [ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80, session_uuid: null })]);
+  await tick(fresh.deps);
+  assert.deepEqual(fresh.calls.warnBudget, ['a']);
+  assert.equal(oneEvent(fresh, 'BUDGET').payload.session_uuid, 'v');
+});
+
+test('every BUDGET the meter writes names its session, trip and warn alike, and null when the row has none', async () => {
+  const { tick } = await load('warn-names-' + Date.now());
+  const spend = (est, uuid) => ctx({
+    cfg: cfgOf({ budgets: { standard: { tokens_cap: 1000, turn_cap: 0, wall_ms: 0 } } }),
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: uuid })] },
+    alive: new Set(['lead-a']),
+    readDirUsage: () => dirUsage({ est_tokens: est, sessions: [usage({ uuid: 'u' })] }),
+  });
+  for (const [est, uuid, pct, want] of [[850, 'u', 80, 'u'], [1000, 'u', 100, 'u'], [850, null, 80, null], [1000, null, 100, null]]) {
+    const c = spend(est, uuid);
+    await tick(c.deps);
+    const budget = oneEvent(c, 'BUDGET');
+    assert.equal(budget.payload.pct, pct);
+    assert.equal(Object.hasOwn(budget.payload, 'session_uuid'), true, `${pct}%: the key itself, or a reader takes it for the legacy shape`);
+    assert.equal(budget.payload.session_uuid, want, `${pct}% on ${uuid}`);
+  }
+});
+
+test('a dead lead revived fresh is told on the same tick: the meter runs after the revival', async () => {
+  const { tick } = await load('warn-revived-' + Date.now());
+  const c = ctx({
+    cfg: cfgOf({ budgets: { standard: { tokens_cap: 1000, turn_cap: 0, wall_ms: 0 } } }),
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'old', attempts: 0 })] },
+    alive: new Set(),
+    readUsage: () => usage({ uuid: 'old', live_context: 900_000 }),                  // saturated: fresh
+    spawnLead: () => ({ lead: 'a', session_uuid: 'new', tmux_target: 'lead-a', cwd: '/w/a' }),
+    readDirUsage: () => dirUsage({ est_tokens: 850, sessions: [usage({ uuid: 'old' })] }),
+    orchEvents: [ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80, session_uuid: 'old' })],
+  });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'REVIVED').payload.plan, 'fresh');
+  assert.deepEqual(c.calls.warnBudget, ['a'], 'the new session starts past 80% and would otherwise first hear of it at the trip');
+  assert.equal(oneEvent(c, 'BUDGET').payload.session_uuid, 'new');
+  ranBefore(c.order, 'spawnLead:a', 'warnBudget:a');
+});
+
+test('a tripped lead on a fresh session is not warned: the trip already told it', async () => {
+  const { tick } = await load('warn-tripped-' + Date.now());
+  const c = warned('v', [ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80, session_uuid: 'u' })], {
+    readDirUsage: () => dirUsage({ est_tokens: 1000, sessions: [usage({ uuid: 'v' })] }),
+    tripped: () => true,
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.warnBudget, []);
+  assert.deepEqual(eventsOf(c, 'BUDGET'), []);
+});
+
+test('an unreadable event log warns no session, fresh or not: it reads as already said', async () => {
+  const { tick } = await load('warn-blind-' + Date.now());
+  const c = warned('v', [], { deps: { orchEvents: () => { throw new Error('EACCES: events/orch.jsonl'); } } });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.warnBudget, []);
+  assert.deepEqual(eventsOf(c, 'BUDGET'), []);
 });
 
 // ════════════════════════ Which class prices a lead ════════════════════════

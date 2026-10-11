@@ -182,9 +182,12 @@ in**, because a task naming an unconfigured repo cannot spawn:
 
 `tokens_cap` meters **the lead and its whole team** (teammate turns go to their own transcripts).
 `turn_cap` is calibrated per lead and is a backstop, not a budget. Warn at 80 %, hard trip at 100 %.
-A warning logs `BUDGET` on the orchestrator's stream and writes `leads/<id>/BUDGET_WARNED`; the
-PreToolUse gate attaches a one-time `soma:` note to the lead's next allowed tool call and renames the
-flag to `BUDGET_WARNED.delivered`, and teammates never get it. A trip writes
+A warning logs `BUDGET` on the orchestrator's stream and writes `leads/<id>/BUDGET_WARNED`, once per
+lead session; the PreToolUse gate attaches a one-time `soma:` note to the lead's next allowed tool
+call and renames the flag to `BUDGET_WARNED.delivered`, and teammates never get it. Per session, not
+per lead: the spend is the worktree's and carries across a revival, so a lead revived onto a fresh
+session (a new session uuid, none of the old context) is warned again on the tick it relaunches,
+while a resumed lead keeps its session and its note. A trip writes
 `leads/<id>/BUDGET_TRIPPED`, which the PreToolUse gate reads to deny every tool except the soma bus —
 so a tripped lead can still file `COMPLETED` or `ERROR`, and nothing else.
 A lead is priced at the class pinned at enqueue when soma.json defines it, else at the class its

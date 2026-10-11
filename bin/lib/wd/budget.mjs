@@ -16,12 +16,16 @@
  *
  * **Who writes and who consumes `warnPath`.** The BUDGET event at 80% lands on the
  * orchestrator's stream, which the lead never reads; `leads/<id>/BUDGET_WARNED` is how the
- * lead hears. The watchdog writes it once, at the 80% verdict, and BEFORE it logs that
- * BUDGET event, because the logged event is the once-per-lead dedupe: a write that failed
- * after the event landed would never be retried. The same gate hook consumes it: the first
- * time the LEAD itself makes a tool call the gate allows, the gate renames the flag to
- * `BUDGET_WARNED.delivered` and hands the lead a short wind-down note as context. Teammates
- * never see or consume it, and neither does a tripped lead, which the trip already told.
+ * lead hears. The watchdog writes it once per lead SESSION, at the 80% verdict, and BEFORE it
+ * logs that BUDGET event, because the logged event is the once-per-session dedupe: a write that
+ * failed after the event landed would never be retried. Per session, not per lead, because the
+ * spend judged here is the worktree directory's and carries across a revival, while a lead
+ * revived `fresh` is a new session with none of the old context: it starts past 80% and has to
+ * be told again. A `resume` keeps its session, and the note it already had. The same gate hook
+ * consumes it: the first time the LEAD itself makes a tool call the gate allows, the gate
+ * renames the flag to `BUDGET_WARNED.delivered` and hands the lead a short wind-down note as
+ * context. Teammates never see or consume it, and neither does a tripped lead, which the trip
+ * already told.
  * Presence is the protocol here too: the rename is the claim, so one flag is one note even
  * when two registrations of the gate race on the same call, and `.delivered` is a record
  * that nothing reads.

@@ -323,7 +323,18 @@ function orchHistory(deps) {
       revertRefusedAt: NEVER_FRESH,
     };
   }
-  const budget = new Set();
+  // BUDGET is said once per lead SESSION, not once per lead. Spend is the worktree directory's, so it
+  // carries across revivals, and a lead revived `fresh` is a new session with none of the old context:
+  // deduped per lead, it started past 80% of the same budget and was never told. So each BUDGET names
+  // the session it covers (`session_uuid`, null for a row with no uuid), and a BUDGET with no own
+  // `session_uuid` at all was logged before events named one: it covers every session of its lead,
+  // so a lead in flight at the upgrade is not told twice. Maps and Sets keyed by lead id, never
+  // objects (the `constructor` reason above).
+  const budgetSessions = new Map();
+  const budgetEverySession = new Set();
+  const budget = {
+    has: (lead, session) => budgetEverySession.has(lead) || budgetSessions.get(lead)?.has(session) === true,
+  };
   const deviation = new Set();
   const defaulted = new Set();
   const gaveUp = new Set();
@@ -352,7 +363,19 @@ function orchHistory(deps) {
     const lead = typeof e?.lead === 'string' && e.lead !== '' ? e.lead : null;
     const at = stampOf(e);
     switch (e?.type) {
-      case 'BUDGET': if (lead) budget.add(lead); break;
+      case 'BUDGET': {
+        if (!lead) break;
+        const p = e?.payload;
+        if (p === null || typeof p !== 'object' || !Object.hasOwn(p, 'session_uuid')) {
+          budgetEverySession.add(lead);
+          break;
+        }
+        // Read back with `declaredName`, the rule `meter` writes it with, so a uuid and its own
+        // event can never disagree about which session is meant.
+        if (!budgetSessions.has(lead)) budgetSessions.set(lead, new Set());
+        budgetSessions.get(lead).add(declaredName(p.session_uuid));
+        break;
+      }
       case 'MODEL_DEVIATION': if (lead) deviation.add(lead); break;
       case 'HARNESS_DEFAULTED': if (lead) defaulted.add(lead); break;
       case 'TURNS_UNMEASURED': if (lead) unmeasured.add(lead); break;
@@ -1215,26 +1238,34 @@ function meter(deps, cfg, task, history, now) {
   // how long the operator has been paying for this task.
   const verdict = checkBudget(usage, cls, { now, startedAt: startedAtOf(deps, task, now) });
 
+  // The session this verdict is for, and the one every BUDGET below names: the row's own uuid, or
+  // null for a row with none. The 80% note is deduped per session (`orchHistory`), so this is read
+  // after phase 2, off the row a fresh revival has just written its new uuid onto.
+  const session = declaredName(task.lead_session_uuid);
+
   if (verdict === 'trip') {
     // Presence is the whole protocol for `BUDGET_TRIPPED`, so the flag file is also the
     // dedupe. A tripped lead stays over its cap forever; unguarded, this toasts every 30 s
     // for as long as the row exists, which is how a real alarm becomes one people mute.
     if (!deps.tripped(task.id)) {
       deps.tripBudget(task.id);
-      deps.appendEvent(ORCH, { type: 'BUDGET', payload: { pct: TRIP_PCT, ...usage, ...caps }, lead: task.id });
+      deps.appendEvent(ORCH, { type: 'BUDGET', payload: { pct: TRIP_PCT, ...usage, ...caps, session_uuid: session }, lead: task.id });
       deps.notify('soma', `${task.id} budget tripped: it can report but not act`);
     }
-  } else if (verdict === 'warn' && !history.budget.has(task.id)) {
+  } else if (verdict === 'warn' && !history.budget.has(task.id, session)) {
     // No toast: `prompts/orchestrator.md` says a BUDGET at 80 % is usually nothing to do, and
-    // the once-per-lead dedupe comes off the durable log. `BUDGET_WARNED` is not a dedupe: the
-    // BUDGET event lands on the orchestrator's stream, which the lead never reads, so this flag is
-    // the lead's copy — the PreToolUse gate hands the lead a note on its next allowed tool call
+    // the once-per-session dedupe comes off the durable log. Once per SESSION, not per lead: the
+    // spend is the directory's and carries across a revival, so a lead revived `fresh` (a new
+    // uuid, none of the old context) starts past 80% and is told again, on the tick it relaunches,
+    // while a `resume` keeps its uuid and the note it already had. `BUDGET_WARNED` is not a dedupe:
+    // the BUDGET event lands on the orchestrator's stream, which the lead never reads, so this flag
+    // is the lead's copy — the PreToolUse gate hands the lead a note on its next allowed tool call
     // and renames the flag to `.delivered`. The flag goes FIRST because the logged BUDGET is the
     // dedupe: a write that throws here logs nothing, the throw becomes this lead's WATCHDOG_ERROR,
     // and the next tick tries both again. Logged first, a failed write would be deduped away and
     // the lead never told.
     deps.warnBudget(task.id);
-    deps.appendEvent(ORCH, { type: 'BUDGET', payload: { pct: WARN_PCT, ...usage, ...caps }, lead: task.id });
+    deps.appendEvent(ORCH, { type: 'BUDGET', payload: { pct: WARN_PCT, ...usage, ...caps, session_uuid: session }, lead: task.id });
   }
 
   // Deviation is judged on the LEAD's own session, never the directory's model union: nothing

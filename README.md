@@ -447,9 +447,11 @@ The retired key `resume_token_guard` is stripped with a warning if your file sti
   keeps for the lead's worktree (the lead's and its teammates'). `turn_cap` counts the lead's own
   turns and is a runaway-loop backstop, not a budget.
 - At 80% the watchdog logs a `BUDGET` event on the orchestrator's stream and writes
-  `leads/<id>/BUDGET_WARNED`. The lead hears about it once: the gate attaches a short `soma:` note
-  to the lead's next tool call that it allows, then renames the flag to `BUDGET_WARNED.delivered`.
-  Teammates never get the note. At 100% the watchdog writes `leads/<id>/BUDGET_TRIPPED`, after
+  `leads/<id>/BUDGET_WARNED`. Each lead session hears about it once: the gate attaches a short
+  `soma:` note to the lead's next tool call that it allows, then renames the flag to
+  `BUDGET_WARNED.delivered`. A lead revived onto a fresh session keeps the spend but none of the old
+  context, so it is told again; a resumed lead keeps its session and is not. Teammates never get
+  the note. At 100% the watchdog writes `leads/<id>/BUDGET_TRIPPED`, after
   which the gate denies the lead and its teammates every tool except the soma bus: a tripped lead
   can still call its bus tools, and the denial tells it to file `COMPLETED` or `ERROR` with what
   exists. **No verb clears a trip**: delete the file by hand, or kill the lead.
