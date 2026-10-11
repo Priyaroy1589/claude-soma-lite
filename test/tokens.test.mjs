@@ -367,8 +367,9 @@ test('every known usage field is classified as either counted or deliberately ig
     // a breakdown OF `output_tokens`: measured over real assistant rows it NEVER
     // exceeds output_tokens, and in aggregate it is close to half of all output volume — so counting
     // it would inflate the output term by nearly half and invalidate every calibrated cap.
-    'cache_creation', 'inference_geo', 'iterations', 'output_tokens_details', 'server_tool_use',
-    'service_tier', 'speed',
+    // `fallback_credit` arrived the same way, and is `null` on every real row that carries it.
+    'cache_creation', 'fallback_credit', 'inference_geo', 'iterations', 'output_tokens_details',
+    'server_tool_use', 'service_tier', 'speed',
   ];
   const counted = Object.keys(USAGE_FIELDS.counted);
   const ignored = Object.keys(USAGE_FIELDS.ignored);
@@ -458,6 +459,7 @@ test('a fully-known usage row reports no unknown fields', async (t) => {
   usage.cache_creation = { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 };
   usage.server_tool_use = { web_search_requests: 0, web_fetch_requests: 0 };
   usage.service_tier = null; usage.inference_geo = null; usage.iterations = null; usage.speed = null;
+  usage.fallback_credit = null;
   seed(root, 'p', 'uuid-26', asst('claude-fable-5', usage));
   process.env.CLAUDE_CONFIG_DIR = root;
   const { readUsage } = await load('allknown');

@@ -94,8 +94,10 @@ const DEFAULT_MAX_LINE = 16 * 1024 * 1024;
  * Every `message.usage` key Claude Code is known to emit, and what this module does with it.
  *
  * Exhaustive against an audit of 19 604 real assistant rows across 181 transcripts — a full
- * nested leaf walk, not a spot check. Anything not in here surfaces as
- * `unknown_usage_fields`, which is the guard described in the module header.
+ * nested leaf walk, not a spot check — plus the two fields later Claude Code versions added,
+ * `output_tokens_details` and `fallback_credit`, each caught by the guard and classified on its
+ * own measurement. Anything not in here surfaces as `unknown_usage_fields`, which is the guard
+ * described in the module header.
  *
  * **`counted` weights are what the shipped `tokens_cap` values are calibrated to.** Changing one
  * silently retunes every budget class. See the module header before you do.
@@ -143,6 +145,19 @@ export const USAGE_FIELDS = Object.freeze({
       'the thinking_tokens breakdown OF output_tokens (43.4% of it across 15 903 real rows, '
       + 'and never exceeding it in any row); output_tokens already counts these, so counting '
       + 'them again would inflate the output term by ~43%',
+    // Caught by the guard the same way, and classified on measurement, not on the name. Claude
+    // Code 2.1.294 to 2.1.296 write it, and across the operator's real transcripts **24 938 rows
+    // carry it and every one of them holds `null`**: there is no volume in it to count. What a
+    // redeemed fallback credit does to usage is documented, and it lands in fields already
+    // counted: the retry reports `cache_creation_input_tokens` lower and `cache_read_input_tokens`
+    // higher by the same amount, so the credit already moves `est_tokens` through those two
+    // weights. A non-null value has never been observed, so this reason says nothing about one:
+    // the day it appears, measure what it holds before trusting this classification.
+    fallback_credit:
+      'null on every real row that carries it (24 938 rows, Claude Code 2.1.294-2.1.296), so no '
+      + 'volume observed; a redeemed credit already shows in the counted cache fields '
+      + '(cache_creation_input_tokens down, cache_read_input_tokens up by as much); re-measure '
+      + 'if it is ever non-null',
   }),
 });
 
