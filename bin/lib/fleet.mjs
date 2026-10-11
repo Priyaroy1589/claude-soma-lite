@@ -284,6 +284,11 @@ function verifyHintFor(task, repos) {
  * what both the lead's standing brief and `soma_task` read: resolved once onto the row,
  * the two cannot disagree, and a resume, which rewrites the brief from the same row, gets
  * it too. The cost is that a repo hint added to soma.json later misses rows already queued.
+ *
+ * Every door applies `bus-tools.intake` before calling this (`soma_enqueue`, and
+ * `soma enqueue --file` in `soma.mjs`): the reserved id `orch`, the brief cap, and a repo or
+ * budget class soma.json does not define are refused there, from one function, so the doors
+ * cannot drift apart. What this function checks is only its own: the id rule and duplicates.
  */
 export function enqueue(tasks, { repos } = {}) {
   if (!Array.isArray(tasks)) throw new TypeError(`enqueue: tasks must be an array, got ${typeof tasks}`);

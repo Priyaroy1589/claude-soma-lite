@@ -555,10 +555,10 @@ soma enqueue --file tasks.json
 name). Each row needs at least `id`, matching `^[a-z][a-z0-9-]{0,63}$` — it becomes a directory
 name, a tmux target and an event stream, so nothing else is admitted. Fields that survive into the
 fleet row: `id`, `title`, `repo`, `source`, `brief`, `base_branch`, `budget_class`, `verify_hint`,
-and `budget_override`, a copy of `budget_class` that pins the breaker to it. This verb stores the
-class as the file gives it and does not check that soma.json defines it (`soma_enqueue` does). One it
-does not define is passed over and `HARNESS_DEFAULTED` says so once: the lead is priced by its
-harness, or at `standard` before it declares one.
+and `budget_override`, a copy of `budget_class` that pins the breaker to it. A class soma.json does
+not define is refused at intake (below). One that reaches a row anyway, because soma.json could not
+be read at enqueue or the class was removed from it since, is passed over and `HARNESS_DEFAULTED`
+says so once: the lead is priced by its harness, or at `standard` before it declares one.
 
 ```json
 [
@@ -568,10 +568,18 @@ harness, or at `standard` before it declares one.
 ]
 ```
 
-Invalid and duplicate ids are **skipped rather than fatal** — one bad row should not cost the other
-twenty-nine — and every drop is printed. If rows were offered and **none** was taken, `enqueue`
-exits **3**, because `queued 0` beside a zero exit is how a plan of thirty duplicate ids reads as a
-success.
+A bad row is **skipped rather than fatal** — one bad row should not cost the other twenty-nine — and
+every drop is printed with its reason. This verb and `soma_enqueue` run one intake check,
+`bus-tools.intake`, so a file loses exactly the rows the tool would refuse: the reserved id `orch`,
+the orchestrator's own stream (`reserved-id`); a `brief` over 16,384 characters (`brief-too-long`);
+a `repo` not in soma.json's `repos`, while it names any (`unknown-repo`); a `budget_class`
+soma.json's `budgets` does not define (`unknown-budget-class`); a row that is not an object
+(`not-an-object`). Then `fleet.enqueue` skips an invalid id (`invalid-id`) and one already in the
+fleet or earlier in the file (`duplicate`). After an `unknown-repo` or `unknown-budget-class` the CLI
+prints the names soma.json does define, one line each. If soma.json cannot be read it says so, and
+the repo and class checks check nothing; the other three still hold. If rows were offered and
+**none** was taken, `enqueue` exits **3**, because `queued 0` beside a zero exit is how a plan of
+thirty duplicate ids reads as a success.
 
 A task keeps its `verify_hint`, the command its lead's independent verifier runs. A task without one
 takes `repos.<name>.verify_hint` from `soma.json` at enqueue, so a hint added there later does not
@@ -669,7 +677,7 @@ Confirmed against the `switch` in `bin/soma.mjs`. Nothing below is aspirational.
 | `soma resume <lead> [--force]` | restart a dead lead from its recorded claude session, on the seat `pick()` chooses — written to the row's `seat`; with no pool configured, this process's own `CLAUDE_CONFIG_DIR` and `seat: null`. The seat is picked **before** the kill, and every seat closed or unverified is a refusal (exit 3), not a launch on this shell's own account. A `soma.json` that `loadConfig()` refuses (§4) is refused before the kill too, with the loader's reason (exit 2) |
 | `soma retry <lead>` | re-queue a `failed` or `skipped` row |
 | `soma digest [--lines N]` | recent events, oldest first, **consuming nothing** |
-| `soma enqueue --file <f>` | add tasks from a JSON array |
+| `soma enqueue --file <f>` | add tasks from a JSON array, refusing what `soma_enqueue` refuses (§6.2) |
 | `soma thaw` | clear an org spend-cap freeze (`state/backpressure.json`) and print the record cleared; **refuses a live storm and an unreadable record, exit 3** — see §9 |
 | `soma hold` / `release` / `gc` | **refuse with a reason, exit 3** — see §9 |
 

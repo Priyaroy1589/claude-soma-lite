@@ -1049,8 +1049,10 @@ test('a pinned class beats the harness the lead declared', async () => {
  * Pins no class can be bound from, each with the name a HARNESS_DEFAULTED payload gives it. The
  * strings: a name soma.json never wrote; three that resolve through Object.prototype, which a
  * truthiness or `in` lookup would bind; an own key whose value is not a record; and a record class
- * reachable only through the budgets' prototype. The rest are not strings at all, which
- * `soma enqueue --file` stores as the file says. Only a string can name a class:
+ * reachable only through the budgets' prototype. The rest are not strings at all. Both enqueue
+ * doors refuse every one of them, so a row gets one only from a hand-edited checkpoint, an enqueue
+ * with no class to check it against (soma.json unreadable, or defining none), or, for a string, a
+ * class removed from soma.json later. Only a string can name a class:
  * `Object.hasOwn(budgets, 42)` would find a class named "42", and `['babysit']` would find babysit.
  */
 const UNBOUND = [

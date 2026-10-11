@@ -474,11 +474,13 @@ const declaredName = (value) => (typeof value === 'string' && value !== '' ? val
 /**
  * The pin on a row as a HARNESS_DEFAULTED payload names it, cut to 32, or null when there is none.
  *
- * Any value but undefined, null and '' is a pin. `soma enqueue --file` stores what the file says,
- * so 42 or `{}` can arrive, and reading one as "nothing declared" priced that lead as H1 without a
- * word. A string keeps its spelling; anything else is named by `show`, which names an object by its
- * type and never calls `String()` on it: JSON can carry `{"toString": 1}`, `String()` of that
- * throws, and a throw in `meter` costs the lead its verdict for the tick.
+ * Any value but undefined, null and '' is a pin. Both enqueue doors refuse a pin that names no
+ * class, so 42 or `{}` reaches a row only through a hand-edited checkpoint or an enqueue that had no
+ * class to check it against (soma.json unreadable, or defining none); a class name can also lose
+ * its class to a later soma.json edit. Reading one as "nothing declared" priced that lead as H1
+ * without a word. A string keeps its spelling; anything else is named by `show`, which names an
+ * object by its type and never calls `String()` on it: JSON can carry `{"toString": 1}`, `String()`
+ * of that throws, and a throw in `meter` costs the lead its verdict for the tick.
  */
 const pinName = (pin) => (pin === undefined || pin === null || pin === '' ? null : (typeof pin === 'string' ? pin : show(pin)).slice(0, 32));
 
@@ -533,9 +535,9 @@ function definedClass(cfg, name) {
  * lead whose harness prices is passed over, and said: the payload carries `budget_class: null`,
  * because no fallback was bound and the lead's own harness prices it. An operator who pinned
  * babysit and is billed at review's cap is exactly the failure this resolver ends.
- * `soma_enqueue` refuses such a class at the door; one still reaches a row through
- * `soma enqueue --file`, which stores what the file says, or by being removed from soma.json after
- * the enqueue. A pin already announced under rule 4 is not announced again when a harness later
+ * Both enqueue doors refuse such a class (`bus-tools.intake`); one still reaches a row when soma.json
+ * could not be read at enqueue, by being removed from soma.json after it, or through a hand-edited
+ * checkpoint. A pin already announced under rule 4 is not announced again when a harness later
  * prices the lead: `HARNESS_DEFAULTED` is said once per lead.
  *
  * `cls` can still be null (rule 4 with no `standard` defined either), and the caller hands it to

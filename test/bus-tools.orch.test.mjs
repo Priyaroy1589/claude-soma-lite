@@ -1008,6 +1008,35 @@ test('a checkpoint that will not take the tasks is a refusal that names no file'
   assert.ok(!/[/\\]/.test(r.error), r.error);
 });
 
+test('intake reports the first check a row fails, cuts a refused id to 64, and sends each hint only beside its own refusal', async () => {
+  // Called directly, because both enqueue doors print what it returns: `soma_enqueue` as its
+  // reply, `soma enqueue --file` as its skipped list and hint lines.
+  const bt = await load();
+  const cfg = { repos: { r: { path: '/r' } }, budgets: { standard: { tokens_cap: 1000 } } };
+  // Rows that fail several checks each get the first in the documented order.
+  const brief = 'x'.repeat(20_000);
+  const order = bt.intake([
+    { id: 'orch', repo: 'nope', budget_class: 'premium', brief },
+    { id: 'cr-1', repo: 'nope', budget_class: 'premium', brief },
+    { id: 'cr-2', repo: 'nope', budget_class: 'premium' },
+  ], cfg);
+  assert.deepEqual(order.rejected, [
+    { id: 'orch', reason: 'reserved-id' },
+    { id: 'cr-1', reason: 'brief-too-long' },
+    { id: 'cr-2', reason: 'unknown-repo' },
+  ]);
+  // A refused row's id came from the caller and is quoted back, so it is cut to 64 characters.
+  const long = bt.intake([{ id: 'q'.repeat(100), repo: 'nope' }], cfg);
+  assert.deepEqual(long.rejected, [{ id: 'q'.repeat(64), reason: 'unknown-repo' }]);
+  // Each hint goes out only beside a refusal of its own kind.
+  const classOnly = bt.intake([{ id: 'cr-3', repo: 'r', budget_class: 'premium' }], cfg);
+  assert.deepEqual(classOnly.known_budget_classes, ['standard']);
+  assert.equal(classOnly.known_repos, null, 'no repo was refused, so no repo list');
+  const repoOnly = bt.intake([{ id: 'cr-4', repo: 'nope' }], cfg);
+  assert.deepEqual(repoOnly.known_repos, ['r']);
+  assert.equal(repoOnly.known_budget_classes, null, 'no class was refused, so no class list');
+});
+
 // ---------------------------------------------------------------------------
 // soma_queue
 // ---------------------------------------------------------------------------

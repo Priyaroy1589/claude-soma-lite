@@ -463,8 +463,9 @@ The retired key `resume_token_guard` is stripped with a warning if your file sti
   declared and none of it can be priced (a harness the registry does not carry or soma.json cannot
   price, or an enqueue class soma.json does not define with no priceable harness behind it), or
   nothing was declared and even H1 cannot be priced, which means a broken install.
-- `soma_enqueue` refuses a `budget_class` soma.json does not define (`unknown-budget-class`, and
-  lists the classes it does define); `soma enqueue --file` stores what the file says. The breaker
+- `soma_enqueue` and `soma enqueue --file` both refuse a `budget_class` soma.json does not define
+  (`unknown-budget-class`, and list the classes it does define). One can still reach a row, when
+  soma.json could not be read at enqueue or the class was removed from it later. The breaker
   passes such a class over and logs `HARNESS_DEFAULTED` once for that lead: the lead is priced by
   its harness, with `budget_class: null` in the event, or at `standard` when it has declared no
   harness yet.
@@ -593,7 +594,7 @@ soma retry my-task-1            # put a failed or skipped row back on the queue
 | `soma up [--canary]` | Print the worst-case spend projection, ask for `yes` on a terminal, start the watchdog in tmux, and read it back. No `--yes`; anything other than `y` or `yes`, including Ctrl-D, declines with exit 1. If a watchdog is already live, start nothing. `--canary` cannot pass on this build. |
 | `soma down` | Stop the watchdog. **Running leads are not stopped**: they continue unsupervised until `soma up`. |
 | `soma status` | State root, queue, backpressure, lease, watchdog, seat pool, and one row per lead with its pane state and seat. Read-only. |
-| `soma enqueue --file <tasks.json>` | Add tasks from a JSON array. Invalid and duplicate ids are skipped and listed; exit 3 if nothing was queued. |
+| `soma enqueue --file <tasks.json>` | Add tasks from a JSON array, with the checks `soma_enqueue` applies. A refused row (reserved id, unknown repo or budget class, over-long brief, invalid or duplicate id) is skipped and listed with its reason; exit 3 if nothing was queued. |
 | `soma attach <lead>` | Hand your terminal to the lead's tmux pane. Detach with your tmux prefix (Ctrl-b by default), then `d`. |
 | `soma peek <lead> [--lines N]` | Read-only tail of the lead's pane (default 60 lines, at most 2000). |
 | `soma send <lead> "<message>" [--force]` | Type one line into the lead's composer and submit it. Refused while the pane shows a dialog, a shell, a dead pane or nothing readable, unless `--force`. |
@@ -623,8 +624,6 @@ may still be running.
 event stream. Fields kept on the row: `id`, `title`, `repo`, `brief`, `base_branch`, `budget_class`,
 `verify_hint`, `source`. A `budget_class` is also copied to `budget_override`, the pin the breaker
 reads first. Anything else is dropped. A row with no `verify_hint` takes its repo's from `soma.json`.
-Invalid and duplicate rows are skipped rather than fatal, and the counts are printed:
-compare them with what you sent.
 
 ```json
 [
@@ -637,6 +636,24 @@ compare them with what you sent.
     "source": { "kind": "github", "ref": "my-org/my-repo#42" } }
 ]
 ```
+
+A bad row is skipped rather than fatal, listed with its reason, and counted: compare the counts
+with what you sent. These are the checks `soma_enqueue` applies, made by the same code:
+
+- `invalid-id` or `duplicate`: the id breaks the rule above, or is already in the fleet or earlier
+  in the file.
+- `reserved-id`: the id is `orch`, the orchestrator's own event stream.
+- `brief-too-long`: the `brief` is over 16,384 characters.
+- `unknown-repo`: `repo` is not a name under `soma.json`'s `repos`. Not checked while `repos` is
+  empty.
+- `unknown-budget-class`: `budget_class` is not a class `soma.json`'s `budgets` defines.
+- `not-an-object`: the row is not a JSON object.
+
+If any row was skipped as `unknown-repo`, a `known repos:` line follows the list, naming the repos
+`soma.json` configures (up to 50). If any was skipped as `unknown-budget-class`, a
+`known budget classes:` line names the classes it defines, the same way, so a file with both kinds
+of skip prints both lines. If `soma.json` cannot be read, soma says so and the repo and class
+checks are skipped.
 
 ### Driving the fleet from a Claude Code session
 
