@@ -1219,7 +1219,8 @@ export async function dispatch(argv, deps = {}) {
       // the number `soma doctor` returns for the same verdict and the code `--canary` uses.
       // --ignore-doctor is not the `--yes` this arm refuses to have: doctor still runs and
       // prints every row, and the spend still needs the typed "yes". The dep is resolved before
-      // the notice and the try, for the reason given at `start` below.
+      // the try, for the reason given at `start` below, and before the notice, so a missing dep
+      // never announces a doctor run that cannot happen.
       const doctor = N('doctor');
       d.print('soma up: running `soma doctor` first. It makes two billed `claude -p` calls and one'
         + ' `git fetch --dry-run` per configured repo, so it takes a little while.');

@@ -465,7 +465,8 @@ Order of operations, and every step can stop it:
 
 #### What the projection says, and the numbers
 
-With shipped defaults (`max_leads: 10`), `soma up` prints exactly this before asking anything:
+With shipped defaults (`max_leads: 10`), `soma up` prints exactly this after doctor's report
+(step 5) and before asking anything:
 
 ```
 Fleet worst case: 10 leads × 38,000,000 est_tokens (iterate, the largest budget class) = 380,000,000 est_tokens.

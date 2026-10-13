@@ -472,7 +472,7 @@ The retired key `resume_token_guard` is stripped with a warning if your file sti
   the team multiplier is an estimate (about 2.5×, in a 1.5× to 4× band). RUNBOOK §10 describes the
   measurement run that settles it.
 
-With the defaults, `soma up` prints this before asking anything:
+With the defaults, `soma up` prints this after doctor's report and before asking anything:
 
 ```
 Fleet worst case: 10 leads × 38,000,000 est_tokens (iterate, the largest budget class) = 380,000,000 est_tokens.

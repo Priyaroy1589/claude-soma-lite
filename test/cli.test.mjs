@@ -1818,8 +1818,8 @@ test('the up line of USAGE names --ignore-doctor', () => {
 
 test('up resolves the doctor dep before it prints anything: a missing doctor is a TypeError naming it, with stdout empty', async (t) => {
   root(t);
-  // `need`'s TypeError is a wiring bug in the caller, and the arms resolve their deps before they
-  // print or write anything so the bug never reads as a fleet state. An `up` that printed the
+  // `need`'s TypeError is a wiring bug in the caller, and this arm resolves doctor before its
+  // notice, so the bug never reads as a fleet state. An `up` that printed the
   // notice first would announce a doctor run that cannot happen. The quotes are deliberate:
   // `need`'s message lists every guarded name, so the bare word is in it whichever dep was missing,
   // and only `"doctor"` says doctor is the one.
