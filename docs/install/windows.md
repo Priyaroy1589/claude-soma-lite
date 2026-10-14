@@ -398,9 +398,9 @@ Do all of it in a Windows Terminal Ubuntu tab, not over SSH (see [WSL caveats](#
    soma up
    ```
 
-   `up` prints a worst-case token projection and asks you to type `yes`. There is no `--yes` flag,
-   and it refuses to run without a terminal. Do **not** use `--canary`: it cannot pass on this
-   build.
+   `up` runs doctor first and refuses on a `FAIL` row (exit 3), then prints a worst-case token
+   projection and asks you to type `yes`. There is no `--yes` flag, and it refuses to run without a
+   terminal. Do **not** use `--canary`: it cannot pass on this build.
 
 2. **Start the orchestrator inside soma's own tmux server, and promote it.** In the same
    Windows Terminal Ubuntu tab, run:
@@ -490,11 +490,13 @@ Claude Code upgrade.
   interop and the Windows `PATH`, both on by default (`[interop] enabled` and `appendWindowsPath`
   in `/etc/wsl.conf`, see [Microsoft: WSL configuration](https://learn.microsoft.com/en-us/windows/wsl/wsl-config)).
   If you turned `appendWindowsPath` off, `powershell.exe` is not found and doctor's `notifier` row
-  fails. Claude Code's troubleshooting page also advises against turning it off.
+  fails, so `soma up` refuses until it passes or you pass `--ignore-doctor`. Claude Code's
+  troubleshooting page also advises against turning it off.
 - **Shells that arrive over SSH have no Windows `PATH`.** WSL appends it only to processes started
   through `wsl.exe` or Windows Terminal, not to an `sshd` session (plain SSH, VS Code Remote-SSH
   and the like), even though interop itself works there. In such a session `which powershell.exe`
-  finds nothing, doctor's `notifier` row fails, and a watchdog started from it shows no toasts.
+  finds nothing and doctor's `notifier` row fails, so `soma up` refuses until it passes or you pass
+  `--ignore-doctor`, and a watchdog started from it anyway shows no toasts.
   Start `soma up` from a Windows Terminal tab, or append
   `/mnt/c/Windows/System32/WindowsPowerShell/v1.0` to `PATH` in the wrapper.
 - **The Windows `PATH` can shadow Linux tools.** Because the Windows `PATH` is appended, a tool you

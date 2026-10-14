@@ -263,7 +263,8 @@ export const USAGE = `usage: soma <command> [args]
   init [--seat <dir>]         create the state tree, install /soma-promote, register the bus;
                               --seat does the install and registration into another config dir (a rotation seat) with THIS fleet's pins
   doctor                      run every environment check and report what it observed
-  up [--canary]               open the queue: show worst-case spend, confirm, start the watchdog
+  up [--canary] [--ignore-doctor]   open the queue: run doctor first (a FAIL refuses, unless --ignore-doctor),
+                              then show worst-case spend, confirm, start the watchdog
   down                        stop the watchdog (running leads are NOT stopped)
   status                      one row per lead, plus queue, lease and watchdog health
   attach <lead>               attach to a lead's tmux pane (detach with C-b d)
@@ -1214,6 +1215,43 @@ export async function dispatch(argv, deps = {}) {
       } catch (e) {
         d.warn(`soma up: ${reason(e)}`);
         return ENV;
+      }
+      // Doctor is the preflight the design puts in front of the queue, and it runs here: after
+      // `loadConfig`, so a refused soma.json keeps its exit 2 and its own sentence, and before
+      // the projection, so nobody is asked to approve spend on a machine that failed a check.
+      // Not on the already-live path above, which opens nothing and authorises no spend.
+      // INCOMPLETE goes on: `runDoctor` resolves `true` for it, and PASS is unreachable on this
+      // build (its doc, RUNBOOK §5.2), so refusing it would refuse every machine. A FAIL is 3,
+      // the number `soma doctor` returns for the same verdict and the code `--canary` uses.
+      // --ignore-doctor is not the `--yes` this arm refuses to have: doctor still runs and
+      // prints every row, and the spend still needs the typed "yes". The dep is resolved before
+      // the try, for the reason given at `start` below, and before the notice, so a missing dep
+      // never announces a doctor run that cannot happen.
+      const doctor = N('doctor');
+      d.print('soma up: running `soma doctor` first. It makes two billed `claude -p` calls and one'
+        + ' `git fetch --dry-run` per configured repo, so it takes a little while.');
+      let ok;
+      let threw = null;
+      try {
+        ok = await doctor();
+      } catch (e) {
+        threw = reason(e);
+      }
+      if (ok !== true) {
+        const what = threw !== null
+          ? `doctor could not finish (${threw}) and gave no verdict`
+          : ok === false
+            ? 'doctor reported FAIL (its report is above)'
+            : `doctor answered ${ok === undefined ? 'nothing' : (summarise(ok) || typeof ok)} instead of a verdict`;
+        if (!rest.includes('--ignore-doctor')) {
+          d.warn(`soma up: ${what}, so the queue was not opened: nothing was projected or asked, and`
+            + ' no watchdog was started. Fix what it reports (each FAIL row names what it read) and'
+            + ' run `soma up` again, or pass --ignore-doctor to open it anyway: doctor still runs and'
+            + ' prints every row, and the spend confirmation still follows.');
+          return REFUSED;
+        }
+        d.warn(`soma up: ${what}. --ignore-doctor was passed, so up goes on to the spend`
+          + ' confirmation anyway; the flag fixes nothing doctor found.');
       }
       // The operator's own decision, taken with this figure in front of them: they kept
       // `max_leads: 10` accepting ~200M est_tokens per fleet run. It is shown once, here,

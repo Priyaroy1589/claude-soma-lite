@@ -42,11 +42,6 @@ This entry said v1 shipped no way to clear a trip, and that a tripped lead staye
 
 It is spelled `soma clear-trip`, not the `soma resume --clear-trip` this entry once planned: `resume` refuses a live lead, and a tripped lead is usually alive. One limit stays, stated in RUNBOOK §4: a wall-clock trip cleared long after it fired can still be past (1 + grants) × `wall_ms`, so the next tick trips it again, and another clear adds another allowance.
 
-### `soma up` does not run doctor
-Spec §13 makes preflight a gate: "the queue refuses to open until all three pass." `soma up` runs `ensureTree`, the hard-link probe, `loadConfig`, the spend prompt and the optional canary, then starts the watchdog. **`runDoctor` is imported but reachable only through `soma doctor`.** So a fleet opens on a machine with a failing MCP-deny-drift check, an erased guard file, or unauthenticated `gh`. This is wider than the known `--canary` gap and was undeclared.
-
-v1.x is small: call `runDoctor` from `up` and refuse on a `false` row. It should land together with the fix for `runDoctor()` returning `true` when every check is `null` — gating on today's verdict would gate on a boolean that reads "pass" from a machine where nothing was observed.
-
 ### `serialize_with` — withdrawn, not deferred
 The design has `soma_enqueue` accept `serialize_with:<task>` for tickets known to touch one module. **Four layers drop it**: the `soma_enqueue` inputSchema sets `additionalProperties:false` and omits it, `fleet.enqueue`'s explicit field list drops it, `admit` is pure FIFO, and nothing reads it downstream. The orchestrator prompt used to instruct passing it, so an orchestrator would believe it had serialised two tickets when it had not — the precise outcome the field exists to prevent, arrived at by trusting the mechanism. **That instruction is removed as of this branch**; the prompt now tells the orchestrator to enqueue the second ticket after the first reports `COMPLETED`.
 
