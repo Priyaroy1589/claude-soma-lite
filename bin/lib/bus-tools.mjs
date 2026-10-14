@@ -816,7 +816,7 @@ export function leadTools(ctx) {
   /**
    * `soma_task()` — re-orientation. A resumed or compacted lead has lost the brief
    * it was spawned with; this is how it gets it back without an operator retyping
-   * it, which is why the PostCompact hook's injected line names this tool.
+   * it, which is why the SessionStart(compact) hook's note names this tool.
    */
   tools.set('soma_task', async () => {
     const refusal = badLead();
@@ -1180,7 +1180,7 @@ export function orchTools(ctx) {
    * between steal and next call"; without this it was unbounded, and two compensating
    * controls the design names are absent or advisory (the DEMOTED send-keys notice is a
    * prompt a model may ignore, and "cuts that session off the event feed" depends on the
-   * `UserPromptSubmit` inject hook, which nothing installs).
+   * `UserPromptSubmit` inject hook, which is opt-in (`soma init --inject-hook`)).
    *
    * **The refusal names the holder**, the way `soma_release` does, because "you were
    * demoted" is only actionable with "by whom, and how long ago" attached — and because a

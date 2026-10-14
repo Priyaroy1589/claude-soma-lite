@@ -64,6 +64,7 @@ import { loadConfig } from './lib/config.mjs';
 import { runDoctor } from './lib/doctor.mjs';
 import { appendEvent, readEvents } from './lib/events.mjs';
 import { enqueue as fleetEnqueue, launching, readFleet, setTaskStatus, updateFleet } from './lib/fleet.mjs';
+import { inspectInject, installInjectHook } from './lib/inject-hook.mjs';
 import { heartbeat, readLease } from './lib/lease.mjs';
 import { SOMA_HOME, claudeConfigRoot, ensureTree, p } from './lib/paths.mjs';
 import { queuePaused } from './lib/queue.mjs';
@@ -72,6 +73,7 @@ import { pick as pickSeat, resolveConfigDir } from './lib/seats.mjs';
 import { resumeLead } from './lib/spawn.mjs';
 import * as tmux from './lib/tmux.mjs';
 import { projectFleetSpend, readUsage } from './lib/tokens.mjs';
+import { INTERVAL_DEFAULT_S, INTERVAL_MAX_S, INTERVAL_MIN_S, runWatch } from './lib/watch.mjs';
 import { STORM_REASON, clearBackpressure, readBackpressure } from './lib/wd/backpressure.mjs';
 import { clearTrip } from './lib/wd/budget.mjs';
 import { CENSUS_LINES, readPane, takeCensus } from './lib/wd/pane-state.mjs';
@@ -179,7 +181,7 @@ const REFUSED = 3;
  */
 export const GUARDED_DEPS = Object.freeze([
   'liveSessions', 'serverAbsent', 'serverProcesses', 'paneStates', 'newSession', 'killSession', 'sendKeys', 'capturePane', 'resumeLead',
-  'exec', 'capture', 'doctor', 'canary', 'confirm', 'linkProbe', 'installSkill',
+  'exec', 'capture', 'doctor', 'canary', 'confirm', 'linkProbe', 'installSkill', 'installInjectHook',
 ]);
 
 /**
@@ -261,8 +263,9 @@ const SEND_REFUSALS = new Map([
 
 export const USAGE = `usage: soma <command> [args]
 
-  init [--seat <dir>]         create the state tree, install /soma-promote, register the bus;
-                              --seat does the install and registration into another config dir (a rotation seat) with THIS fleet's pins
+  init [--seat <dir> | --inject-hook]   create the state tree, install /soma-promote, register the bus;
+                              --seat does the install and registration into another config dir (a rotation seat) with THIS fleet's pins;
+                              --inject-hook also registers the opt-in inject hook (UserPromptSubmit) in this config root's settings.json
   doctor                      run every environment check and report what it observed
   up [--canary] [--ignore-doctor]   open the queue: run doctor first (a FAIL refuses, unless --ignore-doctor),
                               then show worst-case spend, confirm, start the watchdog
@@ -277,6 +280,7 @@ export const USAGE = `usage: soma <command> [args]
   clear-trip <lead>           clear a lead's budget trip by granting one more allowance of its budget class
   enqueue --file <tasks.json> add tasks from a JSON array
   digest [--lines N]          the fleet's recent events, oldest first, consuming nothing
+  watch [--interval N] [--all]   one stdout line per fleet event that needs the orchestrator (for Claude Code's Monitor tool); reads the orch cursor, consumes nothing
   thaw                        lift an org spend-cap freeze: clear state/backpressure.json (refuses a live rate-limit storm)
 
 Mutating commands take --as <session_id>: soma then re-checks the orchestrator lease and
@@ -569,6 +573,9 @@ export const realDeps = () => ({
   confirm,
   linkProbe: probeHardLinks,
   installSkill,
+  // Writes the operator's own settings.json, and only `init --inject-hook` resolves it. Its one
+  // argument is the whole option set, so a forwarded extra argument could only ever be dropped.
+  installInjectHook: (opts) => installInjectHook(opts),
 });
 
 /* ------------------------------------------------------------------------- the dispatcher */
@@ -1425,6 +1432,16 @@ export async function dispatch(argv, deps = {}) {
        * yet — then read it back as success.
        */
       const seatFlag = flagValue(rest, '--seat');
+      // `--inject-hook` writes the config root's own settings.json, and a seat's sessions are leads,
+      // which the hook never injects into: the pair is refused before anything is touched.
+      const injectHook = rest.includes('--inject-hook');
+      if (injectHook && seatFlag !== undefined) {
+        d.warn('soma init: --inject-hook does not go with --seat. A seat runs leads, and leads are never injected into'
+          + ' (only the orchestrator lease holder gets events), so a seat would pay a node spawn per prompt for nothing.'
+          + ' Run `soma init --inject-hook` without --seat, against the config root your orchestrator session uses.'
+          + ' Nothing was done.');
+        return USAGE_CODE;
+      }
       if (seatFlag === null) {
         d.warn('soma init: --seat needs a directory, like `--seat ~/.claude-seat-b` — the config dir of the seat'
           + " (its own .claude.json, credentials and trust marks). Omit --seat to initialise the fleet's own root.");
@@ -1624,52 +1641,78 @@ export async function dispatch(argv, deps = {}) {
       }
 
       /**
-       * The inject hook: **observed, not asserted.**
+       * The inject hook: installed only when asked, and otherwise **observed, not asserted.**
        *
-       * This arm used to print `inject hook: NOT installed` unconditionally, and the comment
-       * that stood here reasoned carefully about one way that could become a lie — an operator
-       * finding `orch-inject.mjs` on disk — and concluded "presence of the file was never the
-       * reason; absence of an installer is". Correct, and it missed the other way: **an operator
-       * can wire the hook by hand.** Measured on the first real fleet — the hook was installed
-       * into `settings.json` as a `UserPromptSubmit` entry, verified firing in both profiles, and
-       * `soma init` went on reporting it as not installed.
+       * Opt-in, because it is a node spawn on every prompt of every session in this config root
+       * (`lib/inject-hook.mjs` says so, and why it pins SOMA_HOME and node). With `--inject-hook`
+       * the installer's own reading is the report: added, already there and on which root, or
+       * refused with the file untouched.
        *
-       * "soma init does not write user settings.json" is still true and is not the claim that
-       * broke. "The hook is not registered" is a claim about the world, so it has to be read
-       * from the world — and it has THREE answers, not two. Registered. Not registered. And
-       * *could not tell*, which must not print as either: an unreadable or absent settings.json
-       * is not evidence of absence, and this whole build's worst near-misses were two-state
-       * reports over three-state worlds.
+       * Without it, this arm once printed `inject hook: NOT installed` unconditionally while an
+       * operator's hand-wired hook was verified firing in both profiles. "The hook is not
+       * registered" is a claim about the world, so it is read from the world — and it has THREE
+       * answers: registered, not registered, and *could not tell*, which must not print as either:
+       * an unreadable or absent settings.json is not evidence of absence.
        */
       const settingsPath = join(cfgRoot, 'settings.json');
-      let injectState = 'unknown';
-      let injectDetail = '';
-      try {
-        const raw = d.readFile(settingsPath);
-        const entries = JSON.parse(raw)?.hooks?.UserPromptSubmit;
-        const wired = Array.isArray(entries) && entries.some((e) => Array.isArray(e?.hooks)
-          && e.hooks.some((h) => /orch-inject\.mjs/.test(String(h?.command ?? ''))));
-        injectState = wired ? 'wired' : 'absent';
-      } catch (e) {
-        injectDetail = reason(e);
-      }
-
-      if (injectState === 'wired') {
-        d.print(`inject hook: registered — a UserPromptSubmit entry in ${settingsPath} runs`
-          + ' orch-inject.mjs, so the lease holder gets unread event headers without asking.'
-          + ' NOT installed by soma init, which still does not write user settings.json: somebody'
-          + ' wired it by hand. Check it pins SOMA_HOME, or it reads the default state root.');
-      } else if (injectState === 'absent') {
-        d.print('inject hook: NOT installed — soma init does not write user settings.json in this'
-          + ` build, and ${settingsPath} registers no UserPromptSubmit hook running orch-inject.mjs.`
-          + ' So the lease holder gets no unread event headers: a lead can emit NEEDS_INPUT and'
-          + ' wait indefinitely while the orchestrator looks idle. Drain events with `soma digest`'
-          + ' (or soma_inbox once promoted); see skills/soma-promote/SKILL.md §3.');
+      if (injectHook) {
+        // A guarded dep resolved on this path only: plain init never asks for the one dep that
+        // writes the operator's settings.json, so it cannot write it.
+        const got = N('installInjectHook')({ settingsPath, root: SOMA_HOME() });
+        if (got?.ok === true && got.action === 'added') {
+          d.print(`inject hook: registered by soma init --inject-hook — a UserPromptSubmit entry in ${settingsPath} now runs`
+            + ` orch-inject.mjs pinned to SOMA_HOME=${SOMA_HOME()}, so the lease holder's next prompt carries the fleet's`
+            + ' unread event headers. It runs on every prompt of every session in this config root; every session but the'
+            + ' lease holder exits without injecting anything.');
+        } else if (got?.ok === true) {
+          d.print(`inject hook: already registered — ${settingsPath} has a UserPromptSubmit entry running orch-inject.mjs,`
+            + ' left exactly as it was.');
+          if (got.pins === 'other') {
+            d.warn(`soma init: that inject hook pins a SOMA_HOME that is not ${SOMA_HOME()}, so it reads another state root`
+              + ` and this fleet's events never reach the lease holder through it. Fix the SOMA_HOME= in that entry of`
+              + ` ${settingsPath}, or delete the entry and re-run \`soma init --inject-hook\`.`);
+            bad = true;
+          } else if (got.pins === 'none') {
+            d.warn('soma init: that inject hook pins no SOMA_HOME, so it reads whichever root the session exports — the'
+              + ' default ~/.soma when it exports none. NOT read as a failure: a session started from your soma wrapper'
+              + ` carries this fleet's. To pin it, delete the entry from ${settingsPath} and re-run \`soma init --inject-hook\`.`);
+          }
+        } else {
+          d.warn(`soma init: the inject hook was NOT registered: ${got?.error ?? 'unknown error'} — the lease holder gets no`
+            + ' unread event headers until it is. Fix the file and re-run `soma init --inject-hook`; meanwhile drain events'
+            + ' with `soma digest`, or soma_inbox once promoted.');
+          bad = true;
+        }
       } else {
-        d.print(`inject hook: NOT OBSERVED — ${settingsPath} could not be read (${injectDetail}),`
-          + ' so whether a UserPromptSubmit hook runs orch-inject.mjs is unknown. Read as neither'
-          + ' installed nor missing. soma init does not write that file either way; if nothing has'
-          + ' wired the hook, drain events with `soma digest`.');
+        let seen = null;
+        let injectDetail = '';
+        try {
+          seen = inspectInject(JSON.parse(d.readFile(settingsPath)), SOMA_HOME());
+        } catch (e) {
+          injectDetail = reason(e);
+        }
+        if (seen?.wired === true) {
+          d.print(`inject hook: registered — a UserPromptSubmit entry in ${settingsPath} runs orch-inject.mjs, so the`
+            + ' lease holder gets unread event headers without asking. '
+            + (seen.pins === 'this'
+              ? `It pins SOMA_HOME=${SOMA_HOME()}, this fleet's root.`
+              : seen.pins === 'other'
+                ? `It pins SOMA_HOME to a root that is not ${SOMA_HOME()}, so it reads another fleet's events: fix that entry,`
+                  + ' or delete it and run `soma init --inject-hook`.'
+                : 'It pins no SOMA_HOME, so it reads whichever root the session exports (the default ~/.soma when none):'
+                  + ' delete it and run `soma init --inject-hook` to pin this one.'));
+        } else if (seen !== null) {
+          d.print(`inject hook: NOT installed — ${settingsPath} registers no UserPromptSubmit hook running orch-inject.mjs,`
+            + ' so the lease holder gets no unread event headers: a lead can emit NEEDS_INPUT and wait indefinitely while'
+            + ' the orchestrator looks idle. `soma init --inject-hook` registers it (opt-in: a node spawn per prompt in every'
+            + ' session of this config root). Until then drain events with `soma digest` (or soma_inbox once promoted);'
+            + ' see skills/soma-promote/SKILL.md §3.');
+        } else {
+          d.print(`inject hook: NOT OBSERVED — ${settingsPath} could not be read (${injectDetail}), so whether a`
+            + ' UserPromptSubmit hook runs orch-inject.mjs is unknown. Read as neither installed nor missing.'
+            + ' `soma init --inject-hook` registers it — it creates the file when there is none and never rewrites one it'
+            + ' cannot read; until something does, drain events with `soma digest`.');
+        }
       }
 
       if (bad) return ENV;
@@ -2112,6 +2155,82 @@ export async function dispatch(argv, deps = {}) {
         + ' oldest first, cursor untouched (the v1.x digest composer is not built, so this is the raw log)');
       for (const e of tail) {
         d.print(`${iso(e.ts)}  ${String(e.type ?? '?').padEnd(18)} ${e.lead ?? '-'}  ${summarise(e.payload)}`);
+      }
+      return OK;
+    }
+
+    case 'watch': {
+      // The keystroke-free poller (`lib/watch.mjs`): one stdout line per event that needs the
+      // orchestrator, for Claude Code's Monitor tool. Like `digest`, it consumes nothing — no
+      // sendKeys, no notify, no appendEvent, no writeCursor — so any number may run.
+      let all = false;
+      let interval = INTERVAL_DEFAULT_S;
+      for (let i = 0; i < rest.length; i++) {
+        if (rest[i] === '--all') {
+          all = true;
+        } else if (rest[i] === '--interval') {
+          const v = rest[++i];
+          if (!/^\d+$/.test(v ?? '') || Number(v) < INTERVAL_MIN_S || Number(v) > INTERVAL_MAX_S) {
+            d.warn(`soma watch: --interval takes a whole number of seconds from ${INTERVAL_MIN_S} to ${INTERVAL_MAX_S}`
+              + ` (got ${v === undefined ? 'nothing' : JSON.stringify(v)}).`);
+            return USAGE_CODE;
+          }
+          interval = Number(v);
+        } else {
+          d.warn(`soma watch: ${JSON.stringify(rest[i])} is not an argument it takes — only --interval <seconds> and --all.`);
+          return USAGE_CODE;
+        }
+      }
+      // The watchdog read exactly as `status` reads it: a `null` listing is unmeasured unless tmux
+      // says, in its own words, that no server answers on the socket — then nothing runs there.
+      const liveSessions = N('liveSessions');
+      const serverAbsent = N('serverAbsent');
+      const paneStates = N('paneStates');
+      const watchdogState = () => {
+        const listed = liveSessions();
+        if (listed === null) return serverAbsent() === true ? 'absent' : 'unknown';
+        return listed.has(WATCHDOG) ? 'live' : 'absent';
+      };
+      // The lease's pane, read in `status`'s three states. A listing decides. No listing because tmux
+      // says no server answers on the socket means the pane cannot exist: `status` reads that as an
+      // empty server, and the bus's `hasPane` as a dead server's pane. Any other missing listing is
+      // no evidence the pane is gone.
+      const hasPane = (pane) => {
+        const panes = paneStates();
+        if (panes === null || panes === undefined) return serverAbsent() !== true;
+        for (const rec of panes.values()) if (rec?.panes?.some((x) => x?.pane_id === pane)) return true;
+        return false;
+      };
+      // Monitor stops a command with SIGTERM when it expires, and Ctrl-C is SIGINT: either ends the
+      // loop and the arm exits 0. A reader that went away ends it too, rather than an EPIPE crash.
+      // The handlers come off afterwards, so nothing of this outlives the loop.
+      const ac = d.signal === undefined ? new AbortController() : null;
+      const stop = () => ac.abort();
+      if (ac !== null) {
+        process.on('SIGINT', stop);
+        process.on('SIGTERM', stop);
+        process.stdout.on('error', stop);
+      }
+      try {
+        await runWatch({
+          all,
+          intervalMs: interval * 1000,
+          env: d.env,
+          deps: {
+            readFleet: d.readFleet, readLease: d.readLease, readEvents: d.readEvents, readCursor: d.readCursor, now: d.now,
+            watchdogState, hasPane,
+          },
+          print: d.print,
+          warn: d.warn,
+          signal: ac === null ? d.signal : ac.signal,
+          sleep: d.sleep,
+        });
+      } finally {
+        if (ac !== null) {
+          process.off('SIGINT', stop);
+          process.off('SIGTERM', stop);
+          process.stdout.off('error', stop);
+        }
       }
       return OK;
     }

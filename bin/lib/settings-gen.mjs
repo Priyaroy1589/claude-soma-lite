@@ -8,7 +8,7 @@
  *
  *   leads/<id>/mcp.json            the lead's entire MCP surface: soma and the stateless
  *                                  sequential-thinking server, nothing else.
- *   leads/<id>/settings.json       the base of the lead's `--settings`: model pin and three
+ *   leads/<id>/settings.json       the base of the lead's `--settings`: model pin and four
  *                                  hooks, and DELIBERATELY NO `permissions` BLOCK.
  *                                  NOT the file `--settings` points at — `spawn`'s
  *                                  `writeLaunchSettings` composes this plus the teammate
@@ -516,7 +516,7 @@ export function writeLeadMcpConfig(id, busPath = join(BIN_DIR, 'soma-bus.mjs')) 
  * carry a bare edit deny. The module header has the measurements. `soma doctor`'s
  * `no edit ban in settings files` check is what notices if the key comes back.
  *
- * The three hooks:
+ * The four hooks:
  *
  *   PostToolUse  the heartbeat. `touch` on `heartbeats/<id>` is what the watchdog's
  *                stall detector reads, so it runs on every tool call and must not
@@ -527,6 +527,20 @@ export function writeLeadMcpConfig(id, busPath = join(BIN_DIR, 'soma-bus.mjs')) 
  *                turn-end event nor the HARNESS gate, and this line used to claim both.
  *                See below.
  *   PreToolUse   `lead-gate.mjs` on EVERY tool — the write-idiom and BUDGET_TRIPPED gate.
+ *   SessionStart `lead-postcompact.mjs`, matcher `compact` — the re-orientation note after
+ *                a compaction. On `SessionStart` and NOT on `PostCompact`, the event the hook
+ *                was written for. Measured on Claude Code 2.1.296: `PostCompact` has no
+ *                `additionalContext` channel — its `hookSpecificOutput` fails validation
+ *                (`hookEventName` must be one of PreToolUse, UserPromptSubmit, …,
+ *                SessionStart, …), so the hook reports FAILED; after an auto-compact nothing
+ *                it prints reaches the model, and after a manual `/compact` its output appears
+ *                only as text inside `/compact`'s own command output. SessionStart with
+ *                matcher `compact` fires once per compaction, manual or auto, never on startup
+ *                or resume, with `source: "compact"` and the session id unchanged on stdin, and
+ *                its `additionalContext` reaches the model as a system reminder — the only
+ *                channel that delivered in both modes. Every teammate inherits this file, so
+ *                the hook itself answers only the lead's session id (`SOMA_LEAD_SESSION_UUID`),
+ *                and a teammate's compaction gets nothing.
  *
  * **WHAT THE `Stop` LINE USED TO SAY, AND WHY THE CORRECTION IS HERE RATHER THAN ONLY IN THE
  * HOOK.** It read *"turn-end event, and the HARNESS gate"*, and both halves are false against
@@ -565,7 +579,7 @@ export function writeLeadMcpConfig(id, busPath = join(BIN_DIR, 'soma-bus.mjs')) 
  * Widening costs nothing else: the gate's other two rules test `tool === 'Bash'`
  * and an Edit-tool set explicitly, and everything else falls through to allow.
  *
- * **COST, recorded so a fleet fanning out is not a surprise.** Two of these three
+ * **COST, recorded so a fleet fanning out is not a surprise.** Two of these four
  * matchers are `'*'`, and they are on the two events that fire most, so **every tool
  * call in the lead pays TWO process spawns**: `node lead-gate.mjs` (PreToolUse) and
  * `sh -c 'mkdir -p … && touch …'` (PostToolUse). Measured on this machine: a bare
@@ -607,6 +621,7 @@ export function writeLeadSettings(id) {
       PostToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: `mkdir -p ${shq(dirname(heartbeat))} && touch ${shq(heartbeat)}` }] }],
       Stop: [{ matcher: '', hooks: [{ type: 'command', command: `node ${shq(binPath('hooks', 'lead-stop.mjs'))}` }] }],
       PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: `node ${shq(binPath('hooks', 'lead-gate.mjs'))}` }] }],
+      SessionStart: [{ matcher: 'compact', hooks: [{ type: 'command', command: `node ${shq(binPath('hooks', 'lead-postcompact.mjs'))}` }] }],
     },
   });
 }

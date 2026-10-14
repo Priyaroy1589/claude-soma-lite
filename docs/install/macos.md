@@ -188,8 +188,11 @@ Read the output. These lines matter:
 - `bus: registered at user scope, candidate role, SOMA_HOME=…`: **check that this is the root you
   meant.** The registration pins it. A bus pinned to the wrong root makes a promoted session show
   an empty fleet while your real fleet runs out of sight.
-- `inject hook: …` reports whether the optional prompt-inject hook is registered. `soma init` never
-  installs it. The README explains how to add it by hand.
+- `inject hook: …` reports whether the optional prompt-inject hook is registered, and which state
+  root it pins. Plain `soma init` never registers it: it is opt-in, because it runs on every prompt of
+  every session in this Claude Code config. `soma init --inject-hook` registers it, and the line then
+  reads `inject hook: registered by soma init --inject-hook` (`already registered` on a re-run). The
+  README's inject hook section says what it does.
 - The last line is ``soma initialized. Next: `soma doctor`, then `soma up`.``
 
 Exit codes: 0 means everything was set up. 2 means something could not be established, and the line
@@ -334,7 +337,9 @@ Stay at the terminal for this. It is the use RUNBOOK §11 says the project is re
    `tmux -L soma attach -t orchestrator`. Use the same Claude Code config that `soma init`
    registered the bus in (a session started before `soma init` will not have it). Promotion is
    one tool call, `soma_adopt`; there is no restart. The session then drains events with
-   `soma_inbox` and answers leads with `soma_send`.
+   `soma_inbox` and answers leads with `soma_send`. It also arms `soma watch` under Claude Code's
+   Monitor tool, which wakes it on every event that needs it without a keystroke, and re-arms the
+   watcher each time the Monitor expires (the README's *Driving the fleet* section says how).
 
    **A finished lead keeps its admission slot until the orchestrator drains its `COMPLETED` (or
    `ERROR`) report with `soma_inbox`.** Without a promoted session draining the inbox, finished
@@ -409,7 +414,8 @@ Install
 - [ ] `type soma` says it is a shell function
 - [ ] soma init exit code: ___
 - [ ] its "bus: registered … SOMA_HOME=" line shows the root I meant
-- [ ] its "inject hook:" line said: registered / NOT installed / NOT OBSERVED
+- [ ] its "inject hook:" line said: registered / NOT installed / NOT OBSERVED (with --inject-hook:
+      registered by soma init --inject-hook / already registered)
 - [ ] soma.json written, with max_leads 1 and one repo
 
 Doctor

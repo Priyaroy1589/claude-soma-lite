@@ -66,14 +66,14 @@ bin/
                         with a tool set per role (lead, candidate, orchestrator)
   soma-watchdog.mjs     the watchdog tick that runs the fleet, in its own tmux session
   soma-pr.mjs           the draft-only `gh pr create` wrapper, the team's only PR route
-  hooks/                Claude Code hooks. The spawner registers lead-gate (PreToolUse) and
-                        lead-stop (Stop). lead-postcompact (PostCompact) and orch-inject
-                        (UserPromptSubmit) also ship, but nothing registers either one; they
-                        need manual setup (RUNBOOK §9; the README shows the inject hook)
+  hooks/                Claude Code hooks. The spawner registers lead-gate (PreToolUse),
+                        lead-stop (Stop) and lead-postcompact (SessionStart, matcher
+                        compact) for every lead. orch-inject (UserPromptSubmit) is opt-in:
+                        `soma init --inject-hook` registers it (RUNBOOK §5.1)
   lib/                  the modules: paths, config, fleet, events, lease, queue, filelock,
                         tmux, spawn, worktree, pretrust, settings-gen, tokens, notify,
                         doctor, canary, harness, standing, jsonrpc, bus-tools, seats,
-                        seats-summary
+                        seats-summary, inject-hook, watch
   lib/wd/               the watchdog's pure decision functions: reconcile, revive, budget,
                         backpressure, admission, settle, pane-state, limit-state,
                         rotation-events

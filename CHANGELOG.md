@@ -11,6 +11,44 @@ on `main`.
 
 ## [Unreleased]: to be released as 0.1.0
 
+### After the public launch (from 2026-10-13)
+
+Work tracked as GitHub issues, newest first.
+
+#### Added
+
+- **`soma watch`**, a keystroke-free event poller for the orchestrator (#35). It prints one stdout
+  line per fleet event that asks the orchestrator for a move (`--all`: every event) in the bus's own
+  wake-line words, at most 20 per poll and a freeze's `BACKPRESSURE` once rather than on every
+  re-emit, and a health line when the watchdog goes down or comes back and when the lease is lost,
+  stale or held by nobody. It is written for Claude Code's Monitor tool, which turns each line into
+  a wake with no pane and no keystroke: the promote skill and the orchestrator prompt now arm it as
+  `<node> <soma>/bin/soma.mjs watch` with `SOMA_HOME` and `SOMA_TMUX_SOCKET` pinned, all four values
+  read from `claude mcp get soma`, and re-arm it on every expiry. Not `soma watch`, because a
+  wrapper function's own `SOMA_HOME` wins over a prefix. It reads the `orch` cursor and writes
+  nothing, so `soma_inbox` still returns every event.
+- **`soma init --inject-hook`** registers the orchestrator's inject hook (#13). It appends one
+  `UserPromptSubmit` entry to the config root's `settings.json`, pinned to this fleet's
+  `SOMA_HOME` and to the absolute `node`, and keeps every other key and hook. It is opt-in because
+  the hook spawns `node` on every prompt of every session in that config root. An existing entry is
+  left alone and reported with the state root it pins; a file soma cannot parse is refused
+  untouched; `--seat` with it is refused. Plain `soma init` reports the hook three-state, as before,
+  and now names the root a registered hook pins.
+
+#### Fixed
+
+- **A compacted lead is told how to re-orient again** (#13). `lead-postcompact.mjs` was written for
+  `PostCompact` and nothing registered it, and registering it would not have helped: measured on
+  Claude Code 2.1.296, `PostCompact` has no `additionalContext` channel. Its `hookSpecificOutput`
+  fails validation, so the hook reports FAILED; after an auto-compact nothing it prints reaches the
+  model, and after a manual `/compact` its output appears only as text inside `/compact`'s own
+  command output. Every lead's settings now register it on `SessionStart` with matcher `compact`,
+  which fires once per compaction, manual or auto, and whose note reaches the model as a system
+  reminder in both modes. It speaks only to the lead's
+  own session id, since every teammate inherits the lead's `--settings`, and it no longer calls the
+  lead planning-only. A lead spawned or resumed before this change keeps its old settings until its
+  next spawn or resume.
+
 ### Release preparation
 
 #### Added

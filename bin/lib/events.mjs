@@ -22,8 +22,11 @@ import { dirname } from 'node:path';
 import process from 'node:process';
 import { p } from './paths.mjs';
 
-/** Stream names reaching the filesystem are lead ids (`fleet.enqueue` regex) or `orch`. */
-const streamPath = (stream) => p('events', `${stream}.ndjson`);
+/**
+ * Stream names reaching the filesystem are lead ids (`fleet.enqueue` regex) or `orch`. Exported so
+ * `watch.mjs` can stat a stream without a second spelling of where it lives.
+ */
+export const streamPath = (stream) => p('events', `${stream}.ndjson`);
 const cursorsPath = () => p('events', '.cursors.json');
 
 /** Epoch-ms prefix width: 13 digits from 2001 to 2286. */

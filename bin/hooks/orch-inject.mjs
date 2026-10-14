@@ -10,9 +10,9 @@
  * correctness" is only true while the three do not share state — which is the single
  * most important thing about this file, and the reason for `INJECT_CURSOR` below.
  *
- * Registered at **user scope** by `soma init`, so it runs on every prompt in every
- * Claude Code session on the machine — the orchestrator, the leads, and every
- * unrelated project the operator opens. Two consequences shape everything here:
+ * Opt-in: registered at **user scope** by `soma init --inject-hook`, so it runs on every
+ * prompt in every Claude Code session on that config root — the orchestrator, the leads,
+ * and every unrelated project the operator opens. Two consequences shape everything here:
  *
  * - **Only the lease holder may be injected into**, and every other session must exit
  *   silently and cheaply. A session that is not the orchestrator being handed the

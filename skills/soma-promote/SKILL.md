@@ -54,6 +54,23 @@ It returns unread events and advances your cursor, so treat them as work, not ne
 operator instead. Then `ERROR` / `GAVE_UP`, then `COMPLETED` (writeback), then `HARNESS` (veto
 within one turn if the budget class is wrong). Everything else is context.
 
+**Then arm the watcher, so the next event wakes you** with no keystroke and no pane. Your Bash
+environment carries none of the fleet's pins, so read them off the bus registration:
+
+1. Run `claude mcp get soma`. Its `Command` is `<node>`, its `Args` is `<soma>/bin/soma-bus.mjs`,
+   and its two `Environment` lines are `SOMA_HOME=<root>` and `SOMA_TMUX_SOCKET=<socket>`.
+2. Fill all four into this call (`soma.mjs` sits beside `soma-bus.mjs`):
+
+```
+Monitor({ command: "SOMA_HOME=<root> SOMA_TMUX_SOCKET=<socket> <node> <soma>/bin/soma.mjs watch", description: "soma fleet events", timeout_ms: 1800000 })
+```
+
+Not `soma watch`: a `soma` wrapper function sets its own `SOMA_HOME`, which wins over a prefix, and
+your Bash and Monitor shells load the operator's shell functions, so that watcher would silently
+follow another root. A Monitor expires after 30 minutes at most: **re-arm it on every expiry.** Each
+`[soma] …` line names who and what, never the payload, so a wake still means `soma_inbox`. The
+watcher consumes nothing.
+
 ## 4. Run the orchestrator loop — `prompts/orchestrator.md`
 
 That prompt is the contract; this skill is only the on-ramp. Read it before dispatching:
@@ -117,13 +134,15 @@ re-check the lease; a bare human invocation says "acting as operator" instead of
 
 Two of those rows are not substitutes, so know what you are short of.
 
-**Draining events (§3):** the user-scope `UserPromptSubmit` inject hook feeds the unread event
-*headers* into the lease-holder's next turn and advances the `orch` cursor itself — when it fires
-for you, that injection, not the tool, is why you are not blind here. Do not assume it does: a
-holder with no recorded pane, outside tmux or in a tmux server that is not soma's (the
-`degraded_wake: true` case in §1), may not match the hook's holder test, and then nothing is
-injected at all. Either way the payloads are what you lose, and the tail in the row above is where
-they still are: it reads the files directly, so nothing is consumed and re-reading is free.
+**Draining events (§3):** the user-scope `UserPromptSubmit` inject hook, registered only if the
+operator ran `soma init --inject-hook`, feeds the unread event *headers* into the lease-holder's
+next turn and advances its own `orch-inject` cursor, never your `orch` one, so `soma_inbox` still
+returns every event it showed you. When it fires for you, that injection, not the tool, is why you
+are not blind here. Do not assume it does: a holder with no recorded pane, outside tmux or in a
+tmux server that is not soma's (the `degraded_wake: true` case in §1), may not match the hook's
+holder test, and then nothing is injected at all. Either way the payloads are what you lose, and
+the tail in the row above is where they still are: it reads the files directly, so nothing is
+consumed and re-reading is free.
 
 **Handing the lease back (§5):** there is no CLI handback in v1, and `soma release <lead>` is the
 other verb. So you cannot give the lease up by typing — it passes to the next session that adopts,

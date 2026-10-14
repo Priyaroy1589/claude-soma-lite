@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { closeSync, existsSync, mkdtempSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 
 /**
  * Every test in this file runs with `CLAUDE_CONFIG_DIR` unset, so the default-root
@@ -1240,6 +1240,80 @@ test('the heartbeat hook command survives a SOMA_HOME with a space and a quote',
   const cmd = JSON.parse(readFileSync(s.writeLeadSettings('cr-1'), 'utf8')).hooks.PostToolUse[0].hooks[0].command;
   execFileSync('sh', ['-c', cmd]);                                   // exactly what the hook runner does
   assert.ok(existsSync(join(home, 'heartbeats', 'cr-1')), `hook did not create the heartbeat: ${cmd}`);
+});
+
+/**
+ * The re-orientation note rides `SessionStart` with matcher `compact`, and nothing registers
+ * `PostCompact` any more.
+ *
+ * Measured on Claude Code 2.1.296: PostCompact has no additionalContext channel. Its
+ * `hookSpecificOutput` fails validation and the hook is reported FAILED. After an auto-compact
+ * nothing it prints reaches the model; after a manual /compact it appears only inside /compact's
+ * own command output. `SessionStart` with matcher `compact` fires after manual AND auto
+ * compaction, its stdin carries `source: "compact"` and the unchanged `session_id`, and its
+ * `additionalContext` reaches the model. A PostCompact key left beside it would be a hook that
+ * runs on every compaction to print a note that has no additionalContext channel.
+ *
+ * The command has the Stop and gate entries' exact shape — `node '<abs>/bin/hooks/<script>'` —
+ * which is asserted by deriving it from the Stop command rather than re-spelling the install
+ * path, so a different directory, a missing quote or a relative path all fail here.
+ */
+test('lead settings re-orient a compacted lead through SessionStart(compact), and register no PostCompact hook', async (t) => {
+  somaHome(t);
+  const s = await load('sessionstart');
+  const j = JSON.parse(readFileSync(s.writeLeadSettings('cr-1'), 'utf8'));
+  assert.equal('PostCompact' in j.hooks, false,
+    'PostCompact has no additionalContext channel (measured on 2.1.296): after an auto-compact nothing it prints reaches the model');
+  assert.deepEqual(Object.keys(j.hooks).sort(), ['PostToolUse', 'PreToolUse', 'SessionStart', 'Stop'],
+    'four hook events, no more: the heartbeat, the Stop stamp, the gate and the re-orient note');
+
+  const stop = j.hooks.Stop[0].hooks[0].command;
+  assert.match(stop, /lead-stop\.mjs'$/, 'fixture: the Stop command ends at its quoted script');
+  const expected = stop.replace(/lead-stop\.mjs'$/, "lead-postcompact.mjs'");
+  assert.deepEqual(j.hooks.SessionStart, [{ matcher: 'compact', hooks: [{ type: 'command', command: expected }] }]);
+
+  // The script it names is this install's, absolute, forward-slashed, and really there.
+  const m = /^node '([^']+)'$/.exec(expected);
+  assert.ok(m, `not the node '<path>' shape: ${expected}`);
+  assert.ok(isAbsolute(m[1]) || /^[A-Za-z]:\//.test(m[1]), `a cwd-relative hook path follows the reader home: ${m[1]}`);
+  assert.ok(m[1].endsWith('/bin/hooks/lead-postcompact.mjs'), m[1]);
+  assert.ok(existsSync(m[1]), `the registered hook does not exist: ${m[1]}`);
+
+  // The other three are unchanged: one entry each, one hook each, on their old matchers.
+  for (const [event, matcher, script] of [['PostToolUse', '*', null], ['Stop', '', 'lead-stop.mjs'], ['PreToolUse', '*', 'lead-gate.mjs']]) {
+    assert.equal(j.hooks[event].length, 1, `${event}: one entry`);
+    assert.equal(j.hooks[event][0].matcher, matcher, `${event}: matcher`);
+    assert.equal(j.hooks[event][0].hooks.length, 1, `${event}: one hook`);
+    if (script) assert.ok(j.hooks[event][0].hooks[0].command.endsWith(`/bin/hooks/${script}'`), `${event}: ${j.hooks[event][0].hooks[0].command}`);
+  }
+  assert.match(j.hooks.PostToolUse[0].hooks[0].command, /^mkdir -p .* && touch /, 'PostToolUse is still the heartbeat touch');
+});
+
+/**
+ * The same registration, run the way Claude Code runs it: `sh -c '<command>'` with the hook JSON
+ * on stdin, in the environment a lead and its teammates share. This file reaches every split-pane
+ * teammate through `--settings`, so the hook fires in teammates too, and it must answer the lead
+ * alone: a teammate told to "re-read your task brief" with `soma_task()` calls a tool that
+ * describes its lead's task, not its own.
+ */
+test('the SessionStart command, run as the hook runner runs it, answers the lead after a compaction and nobody else', async (t) => {
+  somaHome(t);
+  const s = await load('sessionstart-run');
+  const cmd = JSON.parse(readFileSync(s.writeLeadSettings('cr-1'), 'utf8')).hooks.SessionStart[0].hooks[0].command;
+  // A scratch env, never the suite's own: this process may itself run inside a lead, with the
+  // SOMA_LEAD_* variables set. `node` must resolve on PATH, as it does for the real runner.
+  const env = { PATH: `${dirname(process.execPath)}:${process.env.PATH ?? ''}`, SOMA_LEAD_NAME: 'cr-1', SOMA_LEAD_SESSION_UUID: 'LEAD-UUID' };
+  const run = (input) => execFileSync('sh', ['-c', cmd], { input: JSON.stringify(input), env, encoding: 'utf8', timeout: 15_000 });
+
+  const lead = run({ session_id: 'LEAD-UUID', hook_event_name: 'SessionStart', source: 'compact' });
+  const out = JSON.parse(lead).hookSpecificOutput;
+  assert.equal(out.hookEventName, 'SessionStart');
+  assert.match(out.additionalContext, /soma_task\(\)/);
+
+  assert.equal(run({ session_id: 'MATE-UUID', hook_event_name: 'SessionStart', source: 'compact' }), '',
+    'a teammate inherits this file through --settings; the note is the lead\'s alone');
+  assert.equal(run({ session_id: 'LEAD-UUID', hook_event_name: 'SessionStart', source: 'startup' }), '',
+    'matcher `compact` is the registration\'s filter, and the hook keeps its own: a fresh start is not a compaction');
 });
 
 test('writeLeadMcpConfig emits a node-run soma server, absolute and forward-slashed, plus only the reasoning server', async (t) => {

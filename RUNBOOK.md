@@ -255,8 +255,10 @@ Does three things and names all of them:
    `SOMA_ROLE`**, so every session on the machine starts as a read-only *candidate* carrying
    `soma_adopt` and `soma_status`.
 
-Exit 2 if the skill or the bus could not be established. Otherwise it prints the state root, the
-claude config root, the node it used, and:
+With `--inject-hook` it also registers the inject hook, which is opt-in (below).
+
+Exit 2 if the skill or the bus could not be established (or, with `--inject-hook`, the hook).
+Otherwise it prints the state root, the claude config root, the node it used, and:
 
 ```
 soma initialized. Next: `soma doctor`, then `soma up`.
@@ -273,30 +275,56 @@ a directory and 2 for one that could not be stat'ed at all (EACCES on a parent) 
 those words rather than telling you to `mkdir` a directory that already exists. Nothing is installed
 or registered on any of those paths.
 
-#### `soma init` tells you it did NOT install the inject hook. Believe it.
+#### The inject hook is opt-in: `soma init --inject-hook`
+
+`bin/hooks/orch-inject.mjs` is the pull you never have to ask for: it staples unread event headers
+onto whatever the lease holder types next. Plain `soma init` does not register it, because a
+user-scope `UserPromptSubmit` hook is a `node` spawn on every prompt of every session using that
+config root (the orchestrator, every lead and teammate, every unrelated project), and every one but
+the lease holder exits having injected nothing. So plain `init` reports it instead, in one of three
+states read from `<claude config root>/settings.json`:
 
 ```
-inject hook: NOT installed — soma init does not write user settings.json in this build, so the
-lease-gated UserPromptSubmit hook (bin/hooks/orch-inject.mjs) is not registered even where the
-file is present. Until something wires it, drain events with `soma digest` (or soma_inbox once
-promoted); see skills/soma-promote/SKILL.md §3.
+inject hook: registered — a UserPromptSubmit entry in <config root>/settings.json runs orch-inject.mjs, … It pins SOMA_HOME=<root>, this fleet's root.
+inject hook: NOT installed — <config root>/settings.json registers no UserPromptSubmit hook running orch-inject.mjs, …
+inject hook: NOT OBSERVED — <config root>/settings.json could not be read (…), …
 ```
 
-**This matters more than it looks.** `bin/hooks/orch-inject.mjs` exists and works; no task in the
-build owned *installing* it, so nothing writes it into user `settings.json`. That hook is the
-**push** half of how a lead's report reaches the orchestrator: it staples unread event headers onto
-whatever you type next. Without it, the orchestrator learns about `NEEDS_INPUT` only when it
-*asks* — `soma_inbox` after a promotion, or `soma digest` from a shell.
+`registered` names the state root the entry pins: this fleet's, another one, or none. `NOT OBSERVED`
+is not "missing": an absent or unparseable file is not evidence either way.
 
-Consequence for you: **an orchestrator that is not polling is blind to a blocked lead.** A lead
-that asked a question sits there holding its slot for `blocked_slot_minutes` (120 by default) and
-then goes `blocked`. If you walk away, nothing is going to tap you on the shoulder except the
-desktop toast the watchdog and the bus fire on the events they do emit. Plan to come back and run
-`soma status` / `soma digest`, or keep a promoted session and open every turn with `soma_inbox`.
+To register it, from the shell that pins your fleet:
 
-> `bin/hooks/orch-inject.mjs`'s own header says "Registered at **user scope** by `soma init`."
-> That sentence is **false on this build** — the `init` arm is right and the hook's comment is
-> stale. Reported, not edited: this branch is documentation only.
+```bash
+soma init --inject-hook
+```
+
+It appends one entry to `hooks.UserPromptSubmit`,
+`SOMA_HOME='<root>' '<node>' '<soma>/bin/hooks/orch-inject.mjs'`, keeps every other key and entry
+in order, and publishes the file tmp+rename. The two pins are the bus registration's: `SOMA_HOME`,
+because your sessions do not export it and an unpinned hook silently reads the default root, and
+the absolute `node`, because `node` off a session's PATH is whatever nvm last selected. It prints
+one of three things:
+
+- `inject hook: registered by soma init --inject-hook — …`: added.
+- `inject hook: already registered — …`: a hook running `orch-inject.mjs` was already there, and
+  the file was not rewritten. If that entry pins another state root, `init` also warns and exits
+  **2**. If it pins none, `init` only warns: a session started from your wrapper carries the right
+  root, but an unpinned hook is one shell away from reading `~/.soma`.
+- `soma init: the inject hook was NOT registered: …`, exit **2**. A `settings.json` that cannot be
+  read or parsed, or whose `hooks` or `hooks.UserPromptSubmit` has the wrong shape, is refused and
+  left exactly as it was, and so is a symlink to a missing file. Only a missing file is created; a
+  symlinked `settings.json` is written at its target, so the link survives.
+
+`--inject-hook` with `--seat` is refused (exit 1) before anything is touched: a seat runs leads,
+and the hook never injects into a lead.
+
+**Without the hook or the `soma watch` Monitor (§6.1), an orchestrator that is not polling is blind
+to a blocked lead.** A lead that asked a question sits there holding its slot for
+`blocked_slot_minutes` (120 by default) and then goes `blocked`. If you walk away, nothing is going
+to tap you on the shoulder except the desktop toast the watchdog and the bus fire on the events they
+do emit. Arm the watcher, register the hook, or plan to come back and run `soma status` /
+`soma digest`, or keep a promoted session and open every turn with `soma_inbox`.
 
 ### 5.2 `soma doctor`
 
@@ -587,6 +615,37 @@ already running and keep running whoever holds it.
   your everyday one), so pushes arrive as desktop toasts and on your next turn rather than as a
   live keystroke wake. Only a pane on soma's own server gets keystroke wakes.
 
+**Arm the watcher.** Right after promotion the skill has the session arm `soma watch` under Claude
+Code's Monitor tool, which turns every stdout line of a command into a wake. The orchestrator then
+hears about a `NEEDS_INPUT`, a `COMPLETED`, a stopped watchdog or a lost lease with no keystroke and
+no pane: the wake comes from the Monitor, not from tmux, so this works in the `degraded_wake` case
+too:
+
+```
+Monitor({ command: "SOMA_HOME=<root> SOMA_TMUX_SOCKET=<socket> <node> <soma>/bin/soma.mjs watch", description: "soma fleet events", timeout_ms: 1800000 })
+```
+
+- **Take every value from the bus registration.** `claude mcp get soma` shows the entry
+  `soma init` wrote: `<node>` is its `Command`, `<soma>/bin/soma-bus.mjs` its `Args` (`soma.mjs`
+  sits beside it), and `<root>` and `<socket>` its two `Environment` lines. A session's Bash
+  environment carries none of them, and an unpinned watcher reads `~/.soma`, where an empty fleet
+  raises nothing. Not `SOMA_HOME=<root> soma watch`: a wrapper function such as the README's sets
+  its own `SOMA_HOME`, which wins over the prefix, and Claude Code's Bash and Monitor shells load
+  your shell functions, so that watcher would silently follow another root.
+- **Re-arm it on every expiry.** A Monitor lives 30 minutes at most, and when it expires the wakes
+  stop with nothing else to say so.
+- **What it says.** One line per event that asks the orchestrator for a move (the wake table in
+  `prompts/orchestrator.md`; `--all` for every event), in the bus's own words:
+  `[soma] cr-1 NEEDS_INPUT. Call soma_inbox.` Who and what, never a payload. At most 20 such lines
+  per poll, then one `…and N more` line. A freeze's `BACKPRESSURE` rings once, not on every re-emit:
+  the watchdog repeats a storm's on every frozen tick, and a repeat (the same `reason` with the same
+  `since`, or within 10 minutes of the last) stays in the mailbox. `[soma] health: …` lines report
+  the watchdog going down or coming back and the lease being lost, stale or held by nobody, once
+  each time the state changes.
+- **What it never does.** It reads the `orch` cursor only to skip what `soma_inbox` already
+  consumed, and writes nothing: no cursor, no event, no keystroke, no toast. `soma_inbox` still
+  returns every event the watcher announced, and any number of watchers may run.
+
 **Keep the lease warm.** It reads **stale after 10 minutes** without a heartbeat, and a stale lease
 is adoptable by the next session *without* `force` — so a live-but-idle orchestrator loses the fleet
 silently. Every orchestrator tool call stamps the heartbeat; open each turn with `soma_inbox` or
@@ -765,7 +824,7 @@ Confirmed against the `switch` in `bin/soma.mjs`. Nothing below is aspirational.
 | verb | does |
 |---|---|
 | `soma` / `soma help` | usage (bare invocation exits **1**, `help` exits 0) |
-| `soma init [--seat <dir>]` | state tree, `/soma-promote` skill, MCP bus — each read back. `--seat <dir>` moves the skill install and the bus registration **into `<dir>`**, with this fleet's `SOMA_HOME` and socket pins — once per seat. It does **not** move the state tree: that is still created under this shell's `$SOMA_HOME`, exactly as a plain `init` does, so run it from a shell pinned to this fleet or you get a second state root *and* a seat pinned to it. See *Provisioning a seat* below |
+| `soma init [--seat <dir> \| --inject-hook]` | state tree, `/soma-promote` skill, MCP bus — each read back — and the inject hook, reported three-state and registered only with `--inject-hook` (opt-in, refused with `--seat`; §5.1). `--seat <dir>` moves the skill install and the bus registration **into `<dir>`**, with this fleet's `SOMA_HOME` and socket pins — once per seat. It does **not** move the state tree: that is still created under this shell's `$SOMA_HOME`, exactly as a plain `init` does, so run it from a shell pinned to this fleet or you get a second state root *and* a seat pinned to it. See *Provisioning a seat* below |
 | `soma doctor` | 48 checks + per-repo rows; stdout |
 | `soma up [--canary] [--ignore-doctor]` | doctor → spend projection → confirm → start watchdog → verify |
 | `soma down` | stop the watchdog. **Leads are NOT stopped** |
@@ -778,6 +837,7 @@ Confirmed against the `switch` in `bin/soma.mjs`. Nothing below is aspirational.
 | `soma retry <lead>` | re-queue a `failed` or `skipped` row |
 | `soma clear-trip <lead>` | clear a budget trip by granting one more allowance of the lead's class (§4, *Budget classes*), and log `TRIP_CLEARED`; **refuses a lead that is not tripped or not metered, exit 3** |
 | `soma digest [--lines N]` | recent events, oldest first, **consuming nothing** |
+| `soma watch [--interval N] [--all]` | the poller for Claude Code's Monitor tool: every N s (default 5, 1–300), one stdout line per event that needs the orchestrator (`--all`: every event) plus health lines; banner on stderr; reads the `orch` cursor and **writes nothing**. Runs until SIGINT/SIGTERM, then exit 0; a bad argument is exit 1. §6.1 |
 | `soma enqueue --file <f>` | add tasks from a JSON array, refusing what `soma_enqueue` refuses (§6.2) |
 | `soma thaw` | clear an org spend-cap freeze (`state/backpressure.json`) and print the record cleared; **refuses a live storm and an unreadable record, exit 3** — see §9 |
 | `soma hold` / `release` / `gc` | **refuse with a reason, exit 3** — see §9 |
@@ -975,6 +1035,7 @@ revival takes over.
 ```bash
 soma status                      # the one-shot table
 soma digest --lines 80           # recent events, cursor untouched
+soma watch                       # one line per event that needs the orchestrator, until Ctrl-C (§6.1)
 soma peek task-42 --lines 120    # what that lead's pane says right now
 soma send task-42 "use the staging bucket, not prod" --as $SID
 soma attach task-42              # last resort: your terminal, its pane
@@ -983,8 +1044,15 @@ soma resume task-42              # after a kill, or after a reboot
 soma retry task-42               # put a failed/skipped row back on the queue
 ```
 
-Four things worth knowing before you use them:
+Five things worth knowing before you use them:
 
+- **`soma watch` is written for a Monitor, not for you.** Its stdout carries wake lines and nothing
+  else, and its banner goes to stderr. It reads the `orch` cursor and writes nothing, so it consumes
+  no event and any number of watchers may run; from a terminal it is a live tail of what would wake
+  the orchestrator. Its `[soma] health: …` lines read the watchdog the way `status` does: a
+  listing without the `soma-watchdog` session, or tmux's own "no server", is down, and a tmux that
+  cannot be read says nothing at all. The lease's pane is read the same way: tmux's "no server"
+  means it is gone, and an unreadable tmux does not make the lease stale.
 - **`status` reports `?`, not `dead`, when tmux cannot be read.** A 5 s timeout on a wedged server
   is byte-identical to a healthy server with nothing on it. No tmux server answering on soma's
   socket at all is a different answer, because tmux says so, and it reads as an empty server:
@@ -1038,16 +1106,27 @@ task row; the RC URL is the one field it lacks), and **watchdog episode semantic
 notification coalescing** (notifications are per-event and chatty at ten leads). The **Claude Code
 version gate** is no longer on this list: it is wired and enforced, see §4.
 
-### Three more gaps, declared here because this is where you would meet them
+### Two more gaps, declared here because this is where you would meet them
 
 Found by the final whole-branch review and **declared rather than fixed** on this branch. Each is
 recorded in `docs/ROADMAP.md` as v1.x.
 
 | gap | what you actually see | what to do |
 |---|---|---|
-| **No `PostCompact` installer.** `bin/hooks/lead-postcompact.mjs` exists; nothing registers it (the generator writes `PostToolUse`, `Stop` and `PreToolUse` only). | After an auto-compact — routine, measured on this build around a ~994k prompt — a lead loses its HARNESS contract and its standing orders with nothing to restore them. It keeps working and stops being the thing you briefed. | `soma_send` the lead a pointer to `soma_task()`, which is the tool the missing injected line would have named. Watch for a lead whose reports change shape mid-run. |
 | **`serialize_with` does not exist.** The orchestrator prompt used to instruct it; `soma_enqueue`'s schema sets `additionalProperties:false` and omits it, and admission is pure FIFO. The instruction is removed as of this branch. | Two tickets touching one module get two leads and two draft PRs that fight. | Enqueue same-module tickets one at a time — the second after the first reports `COMPLETED`. The orchestrator prompt now says so. |
 | **A Claude Code build that prompts under bypass** (the stalled-lead incident). Claude Code 2.1.259 raised a bypass-immune permission prompt on `cd <dir> && grep <relative file>` whenever a `Read()` deny existed — leads carry 13 — and `tested_claude` admits patch releases by design. 2.1.263 fixed it; the fleet cannot tell which build a lead runs from inside a hook. | A lead or teammate sits on `Do you want to proceed?` with nobody at the pane: measured 79 stalls summing 214 hours, the worst 40 hours, all on 2.1.259. `soma doctor`'s `claude cd-compound read runs` check is **FAIL** on such a build. | Cycle the leads onto a fixed build (`soma kill` + `soma_resume` relaunches `claude` from PATH). If the fleet must keep running on the asking build, arm the gate's emergency lever **per lead**: `touch "$SOMA_HOME/leads/<id>/CD_COMPOUND_ASKS"` — the PreToolUse gate then denies the asking shape with a reason that says what to type instead (one retry turn per matching call, ~14% of Bash calls on a 2.1.259-class build) — and `rm` the flag once the lead is on a fixed build. Unarmed it costs nothing and does nothing; never leave it armed on a build that does not ask. |
+
+The `PostCompact` installer that headed this table has shipped, though not on `PostCompact`: every
+lead's settings register `bin/hooks/lead-postcompact.mjs` on `SessionStart` with matcher `compact`.
+Measured on Claude Code 2.1.296, `PostCompact` has no `additionalContext` channel: its
+`hookSpecificOutput` fails validation (`hookSpecificOutput.hookEventName: expected one of …`), so the
+hook reports FAILED; after an auto-compact nothing it prints reaches the model, and after a manual
+`/compact` its output appears only as text inside `/compact`'s own command output.
+`SessionStart(compact)` fires once per compaction, manual or auto, never on startup or resume; its
+stdin carries `source: "compact"` and the unchanged `session_id`, and its `additionalContext` reaches
+the model as a system reminder, the only channel that delivered in both modes. It speaks only to the
+lead's own session id, because every teammate inherits the lead's `--settings`. A lead spawned or resumed before this change keeps its old settings
+until its next spawn or resume: `soma_send` such a lead a pointer to `soma_task()`.
 
 The **revival cooldown** is no longer on this list: it ships, and §6.3 gives the schedule. Nor is
 **clearing a tripped budget**: `soma clear-trip` ships (§4, *Budget classes*).
@@ -1210,12 +1289,12 @@ is a bring-up check like the rest of this section. Confirm them by hand:
 
 - **`session id matches hook payload`** compares the `CLAUDE_CODE_SESSION_ID` a session's
   subprocesses see with the `session_id` Claude Code hands that same session's hooks. It matters
-  because of the inject hook (`bin/hooks/orch-inject.mjs`, which you wire by hand; §5.1 says why
-  `soma init` does not): it treats a prompt as the lease holder's only when the hook payload's
-  `session_id` equals the id the bus recorded in the lease from `CLAUDE_CODE_SESSION_ID`. If the two
-  disagree, a promoted orchestrator silently never gets event headers. Doctor would read the payload
-  from `state/last-hook-payload.json`, which nothing in this build writes. By hand, in a Claude Code
-  session's Bash tool:
+  because of the inject hook (`bin/hooks/orch-inject.mjs`, registered only by
+  `soma init --inject-hook`; §5.1 says why it is opt-in): it treats a prompt as the lease holder's
+  only when the hook payload's `session_id` equals the id the bus recorded in the lease from
+  `CLAUDE_CODE_SESSION_ID`. If the two disagree, a promoted orchestrator silently never gets event
+  headers. Doctor would read the payload from `state/last-hook-payload.json`, which nothing in this
+  build writes. By hand, in a Claude Code session's Bash tool:
 
   ```bash
   echo "$CLAUDE_CODE_SESSION_ID"
@@ -1283,9 +1362,10 @@ weaker than the list:
 still live:
 
 - The single-holder lease is bounded in the design by two compensating controls after a
-  `force: true` steal. One of those controls is the `UserPromptSubmit` inject hook — **which
-  nothing installs** (§5.1), and which is its own separately declared residual. Two items that are
-  each fine alone are jointly load-bearing, and the second one is missing.
+  `force: true` steal. One of those controls is the `UserPromptSubmit` inject hook — **which is
+  opt-in** (`soma init --inject-hook`, §5.1), so a fleet that did not opt in runs without it. Two
+  items that are each fine alone are jointly load-bearing, and the second one is missing unless the
+  operator registered it.
 - Backpressure was two independent gaps and only the first was ever declared: the *evidence
   scraper* was a known stub, and separately `state/backpressure.json` — the file `soma status`
   renders from — **had no writer at all**. Both are closed (§6 item 4): the tick writes the file
@@ -1308,9 +1388,10 @@ nonexistent script, or one whose command is `true`, still reports `PASS`. Treat 
 evidence the gate is *registered*, never as evidence it *runs*. §10's bring-up steps are the only
 thing that observes it running.
 
-**What would move this to "leave it running":** the two Criticals from the final review closed, an
-installer for the inject hook, and a doctor check that reads a hook's command. None of those is
-large; none of them is done as you read this.
+**What would move this to "leave it running":** the two Criticals from the final review closed, the
+inject hook registered on the orchestrator's config root (its installer has shipped:
+`soma init --inject-hook`, §5.1), and a doctor check that reads a hook's command. None of those is
+large; of the three, only the installer is done as you read this.
 
 ### 11.1 The enforcement gate reads command strings, so a subprocess defeats it
 
@@ -1616,7 +1697,7 @@ lease at that server's pane id at once.
 | leads spawn but nothing is committed | `soma peek <lead>` first. If a teammate says it has no write tools, that is §11.9 and your tree is not the shipped one |
 | a teammate says `No such tool available: Write` | §11.9 — a `permissions.deny` in a settings file that propagates down `--settings`, **not** a model limitation. Fixed in the shipped tree: check `git diff bin/lib/settings-gen.mjs`, and run `soma doctor` for `no edit ban in settings files` |
 | a teammate's `git push` is refused | check the branch is `soma/<id>` — pushes to `main`/`develop` are denied by design, and so are force/delete on any branch |
-| orchestrator never hears about a blocked lead | the inject hook is not installed. Poll with `soma digest` / `soma_inbox`. §5.1 |
+| orchestrator never hears about a blocked lead | nothing wakes it. Arm `soma watch` under the Monitor tool, pinned the way §6.1 says, and re-arm it on every expiry; register the inject hook with `soma init --inject-hook` (§5.1). Meanwhile poll with `soma digest` / `soma_inbox` |
 | `soma_spawn`/`soma_enqueue`/`soma_send` missing after promotion | mid-session role upgrade not honoured yet. Look again next turn; meanwhile drive the CLI with `--as`. Do **not** restart or re-register — the lease is already yours on disk. `SKILL.md` §6 |
 | the lease was taken from under you | it reads stale after 10 min without a heartbeat. Open every turn with `soma_inbox` or `soma_status`. §6.1 |
 

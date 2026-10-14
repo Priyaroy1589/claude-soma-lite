@@ -2759,20 +2759,135 @@ test('lead-stop is inert without a usable lead id', async (t) => {
 });
 
 // ---------------------------------------------------------------------------
-// lead-postcompact: the PostCompact hook
+// lead-postcompact: the SessionStart(compact) hook
+//
+// Measured on Claude Code 2.1.296: PostCompact has no additionalContext channel — its
+// hookSpecificOutput fails validation and the hook reports FAILED. After an auto-compact nothing
+// it prints reaches the model; after a manual /compact it appears only inside /compact's own
+// command output. SessionStart with matcher `compact` fires after manual and auto
+// compaction; its stdin carries `source: "compact"` and the UNCHANGED `session_id`, and its
+// additionalContext reaches the model. The lead's `--settings` file is inherited by every
+// split-pane teammate, so the hook must answer the lead alone: the session id is the
+// discriminator, compared against `SOMA_LEAD_SESSION_UUID`, exactly as the gate does.
+//
+// `runHook` builds the child's environment from scratch, so the SOMA_LEAD_* variables of a
+// lead this suite may itself be running in never reach these hooks.
 // ---------------------------------------------------------------------------
 
-test('lead-postcompact tells a compacted lead how to re-orient', async () => {
-  const r = await runHook('lead-postcompact.mjs', { stdin: { session_id: 'LEAD', hook_event_name: 'PostCompact' } });
+const COMPACT_LEAD_ENV = { SOMA_LEAD_NAME: 'cr-1', SOMA_LEAD_SESSION_UUID: 'LEAD-UUID' };
+const compactInput = (over = {}) => ({ session_id: 'LEAD-UUID', hook_event_name: 'SessionStart', source: 'compact', ...over });
+
+test('REORIENT is a short pointer to soma_task() and HARNESS, and no longer calls the lead planning-only', async () => {
+  const { REORIENT } = await import('../bin/hooks/lead-postcompact.mjs');
+  assert.equal(typeof REORIENT, 'string');
+  assert.ok(REORIENT.length < 800, `the re-orientation note is a nudge, not a briefing (${REORIENT.length} chars)`);
+  // Compaction is exactly when a lead forgets what it was asked to do and the plan it declared.
+  assert.match(REORIENT, /soma_task\(\)/);
+  assert.match(REORIENT, /HARNESS/);
+  // The lead's edit ban was lifted (its edit surface now matches a teammate's), so a note that
+  // tells a freshly compacted lead it may not edit is a false standing rule, read at the moment it
+  // has nothing else to check it against.
+  assert.doesNotMatch(REORIENT, /planning-only/i);
+  assert.doesNotMatch(REORIENT, /teammates do every edit/i);
+});
+
+test('lead-postcompact re-orients the lead after a compaction, as a SessionStart answer', async () => {
+  const { REORIENT } = await import('../bin/hooks/lead-postcompact.mjs');
+  const r = await runHook('lead-postcompact.mjs', { env: COMPACT_LEAD_ENV, stdin: compactInput() });
   assert.equal(r.code, 0);
-  assert.deepEqual(Object.keys(r.json), ['hookSpecificOutput']);
-  const out = r.json.hookSpecificOutput;
-  assert.equal(out.hookEventName, 'PostCompact');
-  // Compaction is exactly when a lead forgets the two things it must not: what it was
-  // asked to do, and that it is not allowed to write the answer itself.
-  assert.match(out.additionalContext, /soma_task\(\)/);
-  assert.match(out.additionalContext, /HARNESS/);
-  assert.ok(out.additionalContext.length < 800, 'the re-orientation note is a nudge, not a briefing');
+  assert.deepEqual(r.json, { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: REORIENT } },
+    `not the SessionStart answer: ${JSON.stringify(r.out)}`);
+  const ctx = r.json.hookSpecificOutput.additionalContext;
+  assert.match(ctx, /soma_task\(\)/);
+  assert.match(ctx, /HARNESS/);
+  assert.ok(ctx.length < 800);
+  assert.doesNotMatch(ctx, /planning-only/i);
+});
+
+test('lead-postcompact says nothing to a teammate, which inherits the lead\'s --settings and so this hook', async () => {
+  const r = await runHook('lead-postcompact.mjs', { env: COMPACT_LEAD_ENV, stdin: compactInput({ session_id: 'MATE-UUID' }) });
+  assert.equal(r.code, 0);
+  assert.equal(r.out, '', 'a teammate told to call soma_task() reads its lead\'s brief as its own');
+});
+
+test('lead-postcompact is silent on every SessionStart that is not a compaction', async () => {
+  // `undefined` is the payload with no `source` at all: JSON.stringify drops the key.
+  for (const source of ['startup', 'resume', 'clear', 'COMPACT', '', undefined, 1]) {
+    const r = await runHook('lead-postcompact.mjs', { env: COMPACT_LEAD_ENV, stdin: compactInput({ source }) });
+    assert.equal(r.code, 0, `source ${JSON.stringify(source)}`);
+    assert.equal(r.out, '', `source ${JSON.stringify(source)} is not a compaction, yet the note was printed`);
+  }
+});
+
+test('lead-postcompact is silent when it cannot prove the session is the lead', async () => {
+  const cases = [
+    ['no SOMA_LEAD_SESSION_UUID in the env', { SOMA_LEAD_NAME: 'cr-1' }, compactInput()],
+    ['an empty SOMA_LEAD_SESSION_UUID', { SOMA_LEAD_NAME: 'cr-1', SOMA_LEAD_SESSION_UUID: '' }, compactInput()],
+    ['both ids empty — equal, and still no proof', { SOMA_LEAD_SESSION_UUID: '' }, compactInput({ session_id: '' })],
+    ['no session_id in the payload', COMPACT_LEAD_ENV, compactInput({ session_id: undefined })],
+    ['a non-string session_id', { SOMA_LEAD_SESSION_UUID: '123' }, compactInput({ session_id: 123 })],
+    ['an empty env altogether', {}, compactInput()],
+  ];
+  for (const [what, env, stdin] of cases) {
+    const r = await runHook('lead-postcompact.mjs', { env, stdin });
+    assert.equal(r.code, 0, what);
+    assert.equal(r.out, '', `${what}: printed ${JSON.stringify(r.out)}`);
+  }
+});
+
+test('lead-postcompact fails open and silent on garbage stdin', async () => {
+  for (const stdin of ['', 'not json', '{"source":"compact","session_id":', 'null', '[]', '42', '"compact"',
+    JSON.stringify([compactInput()]), '\u0000\u0001'.repeat(64)]) {
+    const r = await runHook('lead-postcompact.mjs', { env: COMPACT_LEAD_ENV, stdin });
+    assert.equal(r.code, 0, `stdin ${JSON.stringify(stdin).slice(0, 60)}`);
+    assert.equal(r.out, '', `stdin ${JSON.stringify(stdin).slice(0, 60)} printed ${JSON.stringify(r.out)}`);
+  }
+});
+
+test('lead-postcompact never blocks on a stdin that never ends: SOMA_HOOK_TIMEOUT_MS bounds it', async () => {
+  // It now reads stdin (the session id is the discriminator), so a pipe nobody closes is a hang
+  // in the session start of a compacted lead unless a deadline ends it. 200 ms here, against a
+  // 5 s default: the elapsed bound below is what shows the override was honoured.
+  const t0 = Date.now();
+  const r = await runHook('lead-postcompact.mjs', {
+    keepOpen: true,
+    env: { ...COMPACT_LEAD_ENV, SOMA_HOOK_TIMEOUT_MS: '200' },
+    timeoutMs: 10_000,
+  });
+  const elapsed = Date.now() - t0;
+  assert.equal(r.code, 0);
+  assert.equal(r.out, '', 'nothing was read, so nothing may be claimed');
+  assert.ok(elapsed < 4_000, `exited after ${elapsed} ms: SOMA_HOOK_TIMEOUT_MS=200 was not honoured`);
+});
+
+test('reorientation() is the whole decision: the lead, after a compaction, and nothing else — and it never throws', async () => {
+  const { reorientation, REORIENT } = await import('../bin/hooks/lead-postcompact.mjs');
+  const env = { SOMA_LEAD_SESSION_UUID: 'LEAD-UUID' };
+  assert.equal(reorientation({ source: 'compact', session_id: 'LEAD-UUID' }, env), REORIENT);
+  assert.equal(reorientation({ source: 'compact', session_id: 'LEAD-UUID', hook_event_name: 'SessionStart', cwd: '/w' }, env), REORIENT,
+    'extra payload fields change nothing');
+
+  assert.equal(reorientation({ source: 'compact', session_id: 'MATE-UUID' }, env), null, 'a teammate');
+  for (const source of ['startup', 'resume', 'clear', 'COMPACT', '', undefined, null, 1, ['compact']]) {
+    assert.equal(reorientation({ source, session_id: 'LEAD-UUID' }, env), null, `source ${JSON.stringify(source)}`);
+  }
+  assert.equal(reorientation({ source: 'compact', session_id: 'LEAD-UUID' }, {}), null, 'no lead uuid in the env');
+  assert.equal(reorientation({ source: 'compact', session_id: '' }, { SOMA_LEAD_SESSION_UUID: '' }), null, 'two empty ids are not a match');
+  assert.equal(reorientation({ source: 'compact' }, env), null, 'no session_id');
+  assert.equal(reorientation({ source: 'compact', session_id: 123 }, { SOMA_LEAD_SESSION_UUID: '123' }), null, 'a non-string session_id');
+
+  for (const input of [null, undefined, 'compact', 42, true, [], [{ source: 'compact', session_id: 'LEAD-UUID' }], {}]) {
+    for (const e of [null, undefined, {}, 'LEAD-UUID', 7, env]) {
+      let got;
+      assert.doesNotThrow(() => { got = reorientation(input, e); }, `${JSON.stringify(input)} / ${JSON.stringify(e)}`);
+      assert.equal(got, null, `${JSON.stringify(input)} / ${JSON.stringify(e)}`);
+    }
+  }
+  for (const e of [null, undefined, 'LEAD-UUID', 7]) {
+    let got;
+    assert.doesNotThrow(() => { got = reorientation({ source: 'compact', session_id: 'LEAD-UUID' }, e); });
+    assert.equal(got, null, `env ${JSON.stringify(e)}`);
+  }
 });
 
 // ---------------------------------------------------------------------------
