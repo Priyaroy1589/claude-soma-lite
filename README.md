@@ -931,9 +931,8 @@ build. Re-prove the RUNBOOK §10 invariants after every upgrade.
 
 Contributions are welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first: the dev setup is Node 24
 and `npm test`, with no dependencies, and the culture is safety-first. Report security problems
-privately as [`SECURITY.md`](SECURITY.md) describes, never in a public issue. Every commit needs a
-Developer Certificate of Origin sign-off (`git commit -s`). Everyone taking part agrees to the
-[Code of Conduct](CODE_OF_CONDUCT.md).
+privately as [`SECURITY.md`](SECURITY.md) describes, never in a public issue. Signing off commits is
+optional. Everyone taking part agrees to the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
