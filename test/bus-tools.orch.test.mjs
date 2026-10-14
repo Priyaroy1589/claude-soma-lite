@@ -1796,7 +1796,9 @@ test('a pinned lead shows its pin whatever harness it declares; a pin soma.json 
     config: structuredClone(CLASSES),
     tasks: [
       { id: 'cr-1', status: 'spawned', harness: 'H4', budget_class: 'babysit', budget_override: 'babysit', lead_session_uuid: 'u1' },
-      // `soma enqueue --file` stores what the file says; the breaker passes this pin over.
+      // Both enqueue doors refuse a class soma.json does not define, so this pin came from a
+      // hand-edited checkpoint, an enqueue with no class to check it against, or a class removed
+      // from soma.json later. The breaker passes it over.
       { id: 'cr-2', status: 'spawned', harness: 'H4', budget_class: 'premium', budget_override: 'premium', lead_session_uuid: 'u2' },
     ],
     events: [{ type: 'HARNESS', lead: 'cr-1', payload: { harness_id: 'H4' } }, { type: 'HARNESS', lead: 'cr-2', payload: { harness_id: 'H4' } }],
