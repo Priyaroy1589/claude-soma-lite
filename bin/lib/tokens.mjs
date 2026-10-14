@@ -809,10 +809,16 @@ export function resumeContextLimit(cfg) {
  * without breaking leads are `max_leads` and the wall clock — a `tokens_cap` low enough to feel
  * safe is one that guarantees no lead ever finishes, which is the failure that produced these
  * numbers in the first place.
+ *
+ * **It throws on a `max_leads` its enforcer would not accept**, rather than reading it as 0. A 0
+ * here is the warning that lies: `max_leads: "ten"` once projected "0 leads × … = 0" and asked to
+ * open the queue to 0 leads, and `"10"` did the same while admission started ten. So it is read
+ * as `fleet.admit` reads it — a non-negative integer, tolerating a numeric string — and anything
+ * else is named.
  */
 export function projectFleetSpend(cfg) {
   const o = cfg !== null && typeof cfg === 'object' ? cfg : {};
-  const maxLeads = Math.max(0, Math.floor(count(o.max_leads)));
+  const maxLeads = spendNum('max_leads', o.max_leads);
   const budgets = o.budgets !== null && typeof o.budgets === 'object' ? o.budgets : {};
   const classes = Object.entries(budgets)
     .map(([name, cls]) => {
@@ -834,6 +840,26 @@ export function projectFleetSpend(cfg) {
     + ' never fires on ordinary work. Lower max_leads to lower this.');
   return { max_leads: maxLeads, classes, worst, message: lines.join('\n') };
 }
+
+/**
+ * A config count for the spend projection: a non-negative integer, tolerating the one string worth
+ * keeping. The same rule as `fleet.admit`, and deliberately not `count()`, which turns every
+ * refusal into a 0 nobody sees.
+ */
+function spendNum(key, raw) {
+  const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+  if (!Number.isInteger(n) || n < 0) {
+    throw new TypeError(`projectFleetSpend: ${key} must be a non-negative integer, got ${show(raw)}`);
+  }
+  return n;
+}
+
+/**
+ * A value for an error message: quoted if a string, named by type if not. Not `JSON.stringify`,
+ * which throws on a BigInt and on a hostile `toJSON` — the same helper as `wd/budget.mjs`.
+ */
+const show = (v) =>
+  typeof v === 'string' ? JSON.stringify(v) : v !== null && typeof v === 'object' ? (Array.isArray(v) ? 'array' : 'object') : String(v);
 
 /**
  * Hyphen-delimited segments of a model id or pin, lowercased. `'claude-Opus-5'` → `['claude','opus','5']`.

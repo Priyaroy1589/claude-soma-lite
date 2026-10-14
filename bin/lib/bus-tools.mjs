@@ -1554,6 +1554,16 @@ export function orchTools(ctx) {
     return names.length ? new Set(names) : null;
   };
 
+  const configForEnqueue = async () => {
+    if (!has('loadConfig')) return { cfg: null, unreadable: false };
+    try {
+      const cfg = await deps.loadConfig();
+      return { cfg: isRecord(cfg) ? cfg : null, unreadable: false };
+    } catch {
+      return { cfg: null, unreadable: true };
+    }
+  };
+
   def('soma_enqueue', async ({ tasks } = {}) => {
     if (!Array.isArray(tasks)) {
       return refuse('tasks must be an array of task objects, e.g. [{"id":"task-42","title":"…","repo":"…","brief":"…"}]');
@@ -1564,7 +1574,7 @@ export function orchTools(ctx) {
     // One read of soma.json for every use: the repo names and budget classes gate intake below,
     // and the repo map itself goes to `enqueue`, which never reads the config and needs it for a
     // repo's `verify_hint`.
-    const cfg = await configOf();
+    const { cfg, unreadable } = await configForEnqueue();
     const repos = cfg?.repos;
     const known = knownRepos(repos);
     const classes = knownBudgetClasses(cfg?.budgets);
@@ -1615,7 +1625,13 @@ export function orchTools(ctx) {
     const fromFleet = Array.isArray(result.skipped)
       ? result.skipped.map((row) => ({ id: cut(row?.id, MAX_ECHO), reason: cut(row?.reason, MAX_ECHO) }))
       : [];
-    const out = { queued: Array.isArray(result.queued) ? result.queued : [], skipped: [...fromFleet, ...rejected] };
+    const out = {
+      queued: Array.isArray(result.queued) ? result.queued : [],
+      skipped: [...fromFleet, ...rejected],
+      ...(unreadable
+        ? { warning: 'soma.json could not be read, so repository and budget-class checks were skipped and no repo verify_hint was applied' }
+        : {}),
+    };
     if (known && rejected.some((row) => row.reason === 'unknown-repo')) out.known_repos = [...known].slice(0, 50);
     if (classes && rejected.some((row) => row.reason === 'unknown-budget-class')) out.known_budget_classes = [...classes].slice(0, 50);
     return out;

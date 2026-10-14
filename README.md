@@ -392,9 +392,10 @@ soma2() {
 `$SOMA_HOME/soma.json` is optional. soma loads its defaults and layers your file over them key by
 key (objects merge; arrays such as `seats` replace). Unknown keys are kept. The file is re-read on
 every watchdog tick, so most edits apply on the next tick. An unreadable file is an error, never a
-silent fall-back to the defaults, and so is a `seats` that is not an array: `soma up` exits 2 naming
-the key, whether or not a watchdog is already running, and a running watchdog logs `WATCHDOG_ERROR`
-every tick and does nothing until the file is fixed. soma never writes this file.
+silent fall-back to the defaults, and so are a `seats` that is not an array and a `max_leads` that
+is not a non-negative integer (a numeric string such as `"10"` is read as its number): `soma up`
+exits 2 naming the key, whether or not a watchdog is already running, and a running watchdog logs
+`WATCHDOG_ERROR` every tick and does nothing until the file is fixed. soma never writes this file.
 
 **`repos` is the key you must fill in.** A task's `repo` field is a key into this map, not a path.
 With `repos` empty, a task cannot spawn: the watchdog retries it three times and then marks it
@@ -414,7 +415,7 @@ With `repos` empty, a task cannot spawn: the watchdog retries it three times and
 
 | key | default | what it does |
 |---|---|---|
-| `max_leads` | `10` | Concurrency cap, and the multiplier on worst-case spend. Start at `1`. |
+| `max_leads` | `10` | Concurrency cap, and the multiplier on worst-case spend. Start at `1`. Must be a non-negative integer; a numeric string such as `"10"` is read as its number. |
 | `stagger_s` | `90` | Minimum seconds between admissions. At most one admission per tick regardless. |
 | `tick_ms` | `30000` | Watchdog cadence. A value below 1000 (or not a number) falls back to 30000. |
 | `blocked_slot_minutes` | `120` | How long a lead that asked a question keeps its slot before its row turns `blocked` and the slot frees. |
