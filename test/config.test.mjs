@@ -574,3 +574,57 @@ test('a seats patch replaces the pool rather than merging into it, so a seat can
   // account was handed back (and the path the bus's config patch takes).
   assert.deepEqual(c.writeConfig({ seats: [{ config_dir: '~/.claude-seat-b', label: 'seat-b' }] }).seats.map((s) => s.label), ['seat-b']);
 });
+
+// ---------------------------------------------------------------------------
+// Issue #21: max_leads is judged at load time. A numeric string is handed back as its number, so
+// every reader sees one value; anything else is refused, naming the file and key.
+// ---------------------------------------------------------------------------
+
+test('loadConfig hands back a numeric-string max_leads as a number (#21)', async (t) => {
+  const { c, p } = await fresh(t, 'numeric-strings');
+  // The spend projection read `"10"` as 0 while admission read it as 10: `soma up` asked to open
+  // the queue to 0 leads, and ten started.
+  seed(p, { max_leads: '10' });
+  assert.equal(c.loadConfig().max_leads, 10);
+  seed(p, { max_leads: ' 4 ' });
+  assert.equal(c.loadConfig().max_leads, 4, 'trimmed, as fleet.admit trims it');
+  // Normalising the merged copy must not reach the frozen DEFAULTS (it would throw if it tried).
+  assert.equal(c.DEFAULTS.max_leads, 10);
+});
+
+test('loadConfig refuses a max_leads that is not a non-negative integer, naming the file and the key (#21)', async (t) => {
+  const { c, p } = await fresh(t, 'maxleads-refused');
+  for (const value of [null, '', '  ', 'ten', 2.5, '2.5', -1, '-1', [], {}, true, 'Infinity']) {
+    seed(p, { max_leads: value });
+    assert.throws(() => c.loadConfig(), (e) => {
+      assert.match(e.message, /soma\.json/, `${JSON.stringify(value)}: the refusal must name the file`);
+      assert.match(e.message, /\bmax_leads must be a non-negative integer\b/, `${JSON.stringify(value)}: the key and the shape`);
+      assert.match(e.message, /got /, `${JSON.stringify(value)}: and what it got`);
+      return true;
+    }, `max_leads ${JSON.stringify(value)} was accepted`);
+  }
+  seed(p, { max_leads: 'ten' });
+  assert.throws(() => c.loadConfig(), /got "ten"$/);
+  seed(p, { max_leads: 0 });
+  assert.equal(c.loadConfig().max_leads, 0, 'a cap of 0 is a real setting: admit nothing');
+});
+
+test('loadConfig normalises max_leads whatever budgets holds, null and arrays included (#21)', async (t) => {
+  const { c, p } = await fresh(t, 'budgets-shapes');
+  // Not judged here: the shape of `budgets` is its readers' to refuse. Whatever it holds, the
+  // max_leads beside it is still read and handed back as its number.
+  for (const budgets of [null, [], 'x', { weird: null }, { weird: 5 }, { weird: ['5'] }, { capless: { turn_cap: 9 } }]) {
+    seed(p, { max_leads: '3', budgets });
+    let cfg;
+    assert.doesNotThrow(() => { cfg = c.loadConfig(); }, `budgets ${JSON.stringify(budgets)} threw`);
+    assert.equal(cfg.max_leads, 3);
+  }
+});
+
+test('the DEFAULTS config still loads as DEFAULTS, and loading it leaves DEFAULTS as it was (#21)', async (t) => {
+  const { c } = await fresh(t, 'defaults-validated');
+  const before = structuredClone(c.DEFAULTS);
+  assert.deepEqual(c.loadConfig(), c.DEFAULTS);
+  assert.deepEqual(c.DEFAULTS, before);
+  assert.ok(Object.isFrozen(c.DEFAULTS.budgets.standard));
+});

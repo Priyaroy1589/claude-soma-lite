@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import process from 'node:process';
 import { resolveBudgetClass } from '../bin/lib/wd/budget-class.mjs';
 import { rotated, seatClosed } from '../bin/lib/wd/rotation-events.mjs';
+import * as fleetMod from '../bin/lib/fleet.mjs';
 
 /**
  * The orchestrator + candidate halves of the bus.
@@ -58,7 +59,7 @@ const T0 = Date.now() - 60_000;
 const rowsOf = (tasks) => tasks.map((t) => ({
   id: t.id, title: null, repo: 'r', source: {}, brief: 'b', status: 'queued', base_branch: null,
   budget_class: null, budget_override: null, lead_session_uuid: null, tmux_session: null, attempts: 0, base_sha: null, seat: null, rotations: [],
-  created: T0, updated: T0, ...t,
+  launching_at: null, created: T0, updated: T0, ...t,
 }));
 
 /**
@@ -165,6 +166,9 @@ function orch(opts = {}) {
       if (f.tasks.filter((t) => t.status === 'spawned').length >= cfg.max_leads) return null;
       return f.tasks.find((t) => t.status === 'queued')?.id ?? null;
     },
+    // The real predicate, as `soma-bus.mjs` wires it: the one the watchdog's reconcile and `soma status`
+    // read too, so a transcription here could agree with itself and disagree with them.
+    launching: fleetMod.launching,
     loadConfig: () => s.config,
     unread: (consumer, streams) => s.events
       .filter((e) => streams.includes(e.lead ?? 'orch'))
@@ -936,14 +940,21 @@ test('enqueue hands the fleet the configured repo map, so a repo-level verify_hi
   assert.deepEqual(seen[0]?.repos, repos, 'soma_enqueue must pass soma.json\'s repos as enqueue(tasks, { repos })');
 
   // No config to read, unwired or unparseable, means no repo map. It does not mean a failed
-  // enqueue: the task still queues, with nothing to fall back on.
-  for (const [why, loadConfig] of [['unwired', undefined], ['throws', () => { throw new SyntaxError('Unexpected token } in JSON'); }]]) {
+  // enqueue: the task still queues, with nothing to fall back on. When loadConfig threw, the
+  // reply explicitly warns that repo and budget-class checks were skipped.
+  for (const [why, loadConfig, hasWarn] of [['unwired', undefined, false], ['throws', () => { throw new SyntaxError('Unexpected token } in JSON'); }, true]]) {
     const calls = [];
     const bare = orch({ deps: { loadConfig, enqueue: recording(calls) } });
     const r2 = await bt.orchTools(bare).get('soma_enqueue')({ tasks: [{ id: 'cr-2', repo: 'r', brief: 'b' }] });
     assert.deepEqual(r2.queued, ['cr-2'], `loadConfig ${why}: the task must still queue`);
     assert.equal(calls.length, 1, `loadConfig ${why}`);
     assert.equal(calls[0]?.repos ?? null, null, `loadConfig ${why}: there is no repo map to pass`);
+    if (hasWarn) {
+      assert.equal(typeof r2.warning, 'string');
+      assert.match(r2.warning, /repository and budget-class checks were skipped/);
+    } else {
+      assert.equal(r2.warning, undefined);
+    }
   }
 });
 
@@ -975,6 +986,7 @@ test('a budget class soma.json does not define is refused at intake, and the rep
   const fine = await bt.orchTools(c).get('soma_enqueue')({ tasks: [{ id: 'cr-12', budget_class: 'standard' }] });
   assert.deepEqual(fine.queued, ['cr-12']);
   assert.equal(fine.known_budget_classes, undefined);
+  assert.equal(fine.warning, undefined);
 });
 
 test('the class check reads own keys only, and stands down when there is nothing to check against', async () => {
@@ -986,12 +998,17 @@ test('the class check reads own keys only, and stands down when there is nothing
   const r = await bt.orchTools(proto).get('soma_enqueue')({ tasks: [{ id: 'cr-1', budget_class: 'premium' }] });
   assert.deepEqual(r.skipped, [{ id: 'cr-1', reason: 'unknown-budget-class' }]);
   assert.deepEqual(r.known_budget_classes, ['standard']);
+  assert.equal(r.warning, undefined);
 
   // As with an unknown repo: a config that cannot be read, or that defines no class at all,
-  // validates nothing rather than refusing every pin.
+  // validates nothing rather than refusing every pin. An unreadable config warns.
   const unreadable = orch({ deps: { loadConfig: () => { throw new Error('Unexpected token } in JSON at position 9'); } } });
+  const outUnreadable = await bt.orchTools(unreadable).get('soma_enqueue')({ tasks: [{ id: 'cr-1', budget_class: 'anything' }] });
+  assert.deepEqual(outUnreadable.queued, ['cr-1']);
+  assert.equal(outUnreadable.known_budget_classes, undefined);
+  assert.match(outUnreadable.warning, /repository and budget-class checks were skipped/);
+
   for (const c of [
-    unreadable,
     orch({ config: { max_leads: 10, repos: {} } }),
     orch({ config: { max_leads: 10, repos: {}, budgets: null } }),
     orch({ config: { max_leads: 10, repos: {}, budgets: {} } }),
@@ -999,6 +1016,7 @@ test('the class check reads own keys only, and stands down when there is nothing
     const out = await bt.orchTools(c).get('soma_enqueue')({ tasks: [{ id: 'cr-1', budget_class: 'anything' }] });
     assert.deepEqual(out.queued, ['cr-1']);
     assert.equal(out.known_budget_classes, undefined);
+    assert.equal(out.warning, undefined);
   }
 });
 
@@ -1034,6 +1052,28 @@ test('a checkpoint that will not take the tasks is a refusal that names no file'
   assert.equal(r.ok, false);
   assert.ok(!/[/\\]/.test(r.error), r.error);
 });
+
+test('a config-loading failure warns that repo and budget-class checks were skipped without leaking paths', async () => {
+  const bt = await load();
+  const c = orch({
+    deps: {
+      loadConfig: () => {
+        throw new Error('cannot read /Users/secret/soma.json: SyntaxError: Unexpected token');
+      },
+    },
+  });
+  const r = await bt.orchTools(c).get('soma_enqueue')({
+    tasks: [{ id: 'cr-1', repo: 'unknown-repo', budget_class: 'unknown-class', brief: 'b' }],
+  });
+  assert.deepEqual(r.queued, ['cr-1']);
+  assert.equal(typeof r.warning, 'string', 'must include a warning when soma.json fails to load');
+  assert.match(r.warning, /repo/i, 'warning must mention repo checks');
+  assert.match(r.warning, /budget-class/i, 'warning must mention budget-class checks');
+  assert.match(r.warning, /skip|not performed/i, 'warning must state checks were skipped');
+  assert.ok(!r.warning.includes('/Users/secret'), 'must not expose the filesystem path of soma.json');
+  assert.ok(!/[/\\]/.test(r.warning), 'must not expose any filesystem path separators');
+});
+
 
 // ---------------------------------------------------------------------------
 // soma_queue
@@ -1171,6 +1211,78 @@ test('the spawn records the session uuid and tmux session — nothing else in v1
   assert.equal(st.leads[0].model, 'claude-fable-5');
 });
 
+/**
+ * Wraps a fixture's `updateFleet` and `setTaskStatus` so a test can see which transaction each
+ * status write ran inside (`depths`) and what each transaction left on the row (`commits`).
+ */
+const transactions = (c, id) => {
+  const seen = { depths: [], commits: [] };
+  let depth = 0;
+  const inner = c.deps.updateFleet;
+  c.deps.updateFleet = (mutate) => {
+    depth += 1;
+    try {
+      return inner(mutate);
+    } finally {
+      depth -= 1;
+      seen.commits.push(structuredClone(c.s.fleet.tasks.find((t) => t.id === id)));
+    }
+  };
+  const set = c.deps.setTaskStatus;
+  c.deps.setTaskStatus = (tid, st) => { seen.depths.push([st, depth]); return set(tid, st); };
+  return seen;
+};
+
+test('soma_spawn marks the launch in its claim, and the write that records the session clears it', async () => {
+  const bt = await load();
+  const c = orch({ tasks: [{ id: 'cr-1' }] });
+  let during = null;
+  const spawn = c.deps.spawnLead;
+  // The row as any reader finds it while the spawner runs outside the lock: the watchdog's reconcile,
+  // `soma status`, `soma_status`.
+  c.deps.spawnLead = (t) => { during = structuredClone(c.s.fleet.tasks[0]); return spawn(t); };
+  const tx = transactions(c, 'cr-1');
+  const before = Date.now();
+  const r = await bt.orchTools(c).get('soma_spawn')({ task_id: 'cr-1' });
+  const after = Date.now();
+
+  assert.equal(r.spawned, true);
+  assert.equal(during?.status, 'spawned');
+  assert.ok(Number.isFinite(during?.launching_at) && during.launching_at >= before && during.launching_at <= after,
+    `the claimed row carries the launch mark, stamped at the claim (got ${during?.launching_at})`);
+  // In the claim's own transaction: a status write with the mark following separately leaves a
+  // moment in which the row is spawned, unmarked and sessionless — a dead lead to every reader.
+  assert.deepEqual(tx.depths, [['spawned', 1]]);
+  assert.equal(tx.commits[0].status, 'spawned');
+  assert.equal(tx.commits[0].launching_at, during.launching_at);
+  // Cleared by the write that names the session, never before it.
+  assert.equal(tx.commits.length, 2, 'the claim and the record');
+  assert.equal(tx.commits[1].lead_session_uuid, 'u-cr-1');
+  assert.equal(tx.commits[1].launching_at, null);
+});
+
+test('a soma_spawn that fails clears the mark in the same write that puts the task back in the queue', async () => {
+  const bt = await load();
+  const c = orch({ tasks: [{ id: 'cr-1' }] });
+  let during = null;
+  c.deps.spawnLead = () => {
+    during = c.s.fleet.tasks[0].launching_at;
+    throw Object.assign(new Error('fetch timed out'), { code: 'ETIMEDOUT' });
+  };
+  const tx = transactions(c, 'cr-1');
+  const r = await bt.orchTools(c).get('soma_spawn')({ task_id: 'cr-1' });
+
+  assert.equal(r.ok, false);
+  assert.equal(r.requeued, true);
+  assert.ok(Number.isFinite(during), 'the claim marked the row before the spawner ran');
+  assert.equal(c.s.fleet.tasks[0].status, 'queued');
+  assert.equal(c.s.fleet.tasks[0].launching_at, null, 'a queued row is not starting');
+  // One write: the status back to queued and the mark gone together.
+  assert.deepEqual(tx.depths, [['spawned', 1], ['queued', 1]]);
+  assert.equal(tx.commits.at(-1).status, 'queued');
+  assert.equal(tx.commits.at(-1).launching_at, null);
+});
+
 test('spawn will not admit a task without a transactional fleet, or without a spawner', async () => {
   const bt = await load();
   for (const dep of ['updateFleet', 'spawnLead']) {
@@ -1273,6 +1385,45 @@ test('status liveness is unknown, never absent, when the pane could not be obser
   assert.equal(rr.leads[0].pane_state_source, 'recorded');
   assert.equal(rr.leads[0].pane_fine, null);
   assert.equal(rr.leads[0].liveness, 'alive', 'no pane reader: the session-name probe still answers');
+});
+
+test('soma_status says starting for a lead whose spawn has claimed its row and not yet made its session; an unobservable pane, a live session and an expired mark read as before', async () => {
+  const bt = await load();
+  const marked = (age) => [{ id: 'cr-1', status: 'spawned', launching_at: Date.now() - age }];
+  const rowOf = async (tasks, deps, sessions = []) => (await bt.orchTools(orch({ tasks, deps, sessions })).get('soma_status')({})).leads[0];
+
+  // Thirty seconds into the fetch: tmux answers, and the lead's session is not on it yet.
+  const starting = await rowOf(marked(30_000), paneDeps(new Map(), IDLE_FRAME));
+  assert.equal(starting.liveness, 'starting');
+  assert.equal(starting.pane_state, 'absent', 'the pane field still says what tmux said');
+  assert.deepEqual(starting.team, [], 'no session, so no team to list');
+  // A tmux hiccup is never `starting`: an unobservable pane is `unknown` whatever the row says.
+  assert.equal((await rowOf(marked(30_000), paneDeps(null, ''))).liveness, 'unknown');
+  // The session beats the mark: a record write that failed leaves a mark on a lead that is up.
+  assert.equal((await rowOf(marked(30_000), paneDeps(new Map([['lead-cr-1', paneOf()]]), IDLE_FRAME), ['lead-cr-1'])).liveness, 'alive');
+  // A pane that is THERE and dead, or a bare shell, is a lead that died, mark or no mark: only an
+  // absent pane can be a launch that has not made its session yet.
+  for (const [what, pane] of [['a dead pane', paneOf({ dead: true, cmd: 'env', title: '' })], ['a bare shell', paneOf({ cmd: 'zsh', title: '◐ lead-task-7' })]]) {
+    const read = await rowOf(marked(30_000), paneDeps(new Map([['lead-cr-1', pane]]), ''), ['lead-cr-1']);
+    assert.equal(read.liveness, 'absent', what);
+  }
+  // Past the bound the row reads as it did before the mark, `absent`, and it is revival's to deal with.
+  assert.equal((await rowOf(marked(fleetMod.LAUNCH_GRACE_MS), paneDeps(new Map(), IDLE_FRAME))).liveness, 'absent');
+  // Unmarked, as every row read before the mark existed.
+  assert.equal((await rowOf([{ id: 'cr-1', status: 'spawned' }], paneDeps(new Map(), IDLE_FRAME))).liveness, 'absent');
+});
+
+test('soma_status without a pane reader: the session-name probe stands in, and a lead still launching is starting there too', async () => {
+  const bt = await load();
+  const marked = (age) => [{ id: 'cr-1', status: 'spawned', launching_at: Date.now() - age }];
+  const livenessOf = async (tasks, sessions = [], deps = {}) => (await bt.orchTools(orch({ tasks, sessions, deps })).get('soma_status')({})).leads[0].liveness;
+  assert.equal(await livenessOf(marked(30_000)), 'starting');
+  assert.equal(await livenessOf(marked(30_000), ['lead-cr-1']), 'alive');
+  assert.equal(await livenessOf(marked(fleetMod.LAUNCH_GRACE_MS)), 'absent');
+  // A bus with no predicate wired keeps the old answer rather than guessing at one.
+  assert.equal(await livenessOf(marked(30_000), [], { launching: undefined }), 'absent');
+  // Only a running row is ever starting: a blocked or finished row is not-running, mark or no mark.
+  assert.equal(await livenessOf([{ id: 'cr-1', status: 'blocked', launching_at: Date.now() - 30_000 }]), 'not-running');
 });
 
 // ---------------------------------------------------------------------------

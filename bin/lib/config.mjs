@@ -316,6 +316,18 @@ function dropLegacyKeys(cfg) {
  * dead lead through to a relaunch that reads the same value through `seats.loadSeats` and
  * throws — after the pane was killed and the revival attempt charged. Its entries are not
  * judged here: that is `loadSeats`' job, and `soma doctor` names a bad one.
+ *
+ * `max_leads` must be a non-negative integer. A hand-edited numeric string (`"10"`, `" 4 "`) is
+ * the one string worth keeping, read with `fleet.admit`'s parse and handed back as the number, so
+ * every reader sees the same value. Anything else (`"ten"`, `""`, `null`, `2.5`) is refused rather
+ * than coerced, because a value two readers read two ways is a spend gate that lies: the
+ * projection read `"10"` as 0 while admission read it as 10, so `soma up` asked to open the queue
+ * to 0 leads and ten started.
+ *
+ * The cost, stated because it is the same one `seats` already pays: the watchdog's `tick()` calls
+ * `loadConfig()` on its first line, outside every phase's try, so while soma.json holds a refused
+ * value no tick runs — and the budget breakers of leads already running are skipped until the
+ * file is fixed.
  */
 function validated(cfg) {
   const pool = cfg.seats;
@@ -323,8 +335,29 @@ function validated(cfg) {
     const got = pool === null ? 'null' : typeof pool === 'object' ? 'an object' : JSON.stringify(pool);
     throw new Error(`${configPath()}: seats must be an array of { "config_dir": …, "label": … } entries, or [] (or no seats key) for no rotation, got ${got}`);
   }
+  cfg.max_leads = counted('max_leads', cfg.max_leads);
   return cfg;
 }
+
+/**
+ * `raw` as a non-negative integer, or a throw naming the file and `key`. A trimmed, non-empty
+ * numeric string is read by `Number(raw)`, exactly as `fleet.admit` reads it, so the value handed
+ * back is the one it would have computed.
+ */
+function counted(key, raw) {
+  const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error(`${configPath()}: ${key} must be a non-negative integer (a numeric string such as "10" is read as its number), got ${shown(raw)}`);
+  }
+  return n;
+}
+
+/**
+ * A value for an error message: quoted if a string, named by type if not. Not a bare
+ * `JSON.stringify`, which throws on a BigInt — an error path that fails while explaining itself.
+ */
+const shown = (v) =>
+  typeof v === 'string' ? JSON.stringify(v) : v !== null && typeof v === 'object' ? (Array.isArray(v) ? 'an array' : 'an object') : String(v);
 
 /**
  * The effective config: DEFAULTS with `soma.json` layered over it.
