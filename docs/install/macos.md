@@ -307,9 +307,9 @@ Stay at the terminal for this. It is the use RUNBOOK §11 says the project is re
    soma up
    ```
 
-   `up` prints a worst-case token projection and asks you to type `yes`. There is no `--yes` flag,
-   and it refuses to run without a terminal. Do **not** use `--canary`: it cannot pass on this
-   build.
+   `up` runs doctor first and refuses on a `FAIL` row (exit 3), then prints a worst-case token
+   projection and asks you to type `yes`. There is no `--yes` flag, and it refuses to run without a
+   terminal. Do **not** use `--canary`: it cannot pass on this build.
 
 3. **Watch.**
 

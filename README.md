@@ -215,8 +215,8 @@ Every lead and teammate runs with permission prompts bypassed, so soma puts thes
 - **A scrubbed environment**: `env -i` plus `HOME`, `PATH`, `SHELL`, `TERM`, `LANG`, `TMPDIR`,
   `CLAUDE_CONFIG_DIR` and `USER`, and the few variables soma sets itself. API keys exported in your
   shell do not reach a lead.
-- **`soma doctor`**, which checks these on your machine. Run it before you open the queue; `soma up`
-  does not run it for you.
+- **`soma doctor`**, which checks these on your machine. `soma up` runs it first and refuses to open
+  the queue on a `FAIL` row.
 
 The ceiling, stated in [RUNBOOK §11](RUNBOOK.md#11-what-is-not-guaranteed): the gate and the deny
 rules read **command strings**, so a subprocess (`python -c`, `node -e`, a script a teammate writes)
@@ -473,7 +473,7 @@ The retired key `resume_token_guard` is stripped with a warning if your file sti
   the team multiplier is an estimate (about 2.5×, in a 1.5× to 4× band). RUNBOOK §10 describes the
   measurement run that settles it.
 
-With the defaults, `soma up` prints this before asking anything:
+With the defaults, `soma up` prints this after doctor's report and before asking anything:
 
 ```
 Fleet worst case: 10 leads × 38,000,000 est_tokens (iterate, the largest budget class) = 380,000,000 est_tokens.
@@ -534,9 +534,12 @@ run `soma doctor` until every check with `seat` in its name reads `ok`.
    bus on `~/.soma` and shows you an empty fleet while your real fleet runs out of sight.
 2. **`soma doctor`.** Read the rows and the verdict word, not only the exit code (see
    [Reading `soma doctor`](#reading-soma-doctor)).
-3. **`soma up`**, without `--canary`. It prints the spend projection and waits for `yes`.
+3. **`soma up`**, without `--canary`. It runs doctor and refuses on a `FAIL` row, before any
+   projection; then it prints the spend projection and waits for `yes`.
 
-`soma up` does **not** run doctor for you. Run all three, every time.
+`soma up` runs doctor itself: a `FAIL` row stops it with exit 3 unless you pass `--ignore-doctor`,
+and `INCOMPLETE` does not stop it. Running `soma doctor` yourself first still pays, because you read
+the report with no spend question waiting under it.
 
 ### Reading `soma doctor`
 
@@ -591,7 +594,7 @@ soma retry my-task-1            # put a failed or skipped row back on the queue
 | `soma` / `soma help` | Print usage. Bare `soma` exits 1; `help`, `--help` and `-h` exit 0. |
 | `soma init [--seat <dir>]` | Create the state tree, install the `/soma-promote` skill, register the bus at user scope with this fleet's `SOMA_HOME` and tmux socket pinned, and read both back. Reports whether the inject hook is registered (it never installs it). `--seat <dir>` does the skill and the registration in a rotation seat's config dir instead. Idempotent. |
 | `soma doctor` | Run every environment check and print what it observed. Exit 0 on PASS or INCOMPLETE, 3 on FAIL. |
-| `soma up [--canary]` | Print the worst-case spend projection, ask for `yes` on a terminal, start the watchdog in tmux, and read it back. No `--yes`; anything other than `y` or `yes`, including Ctrl-D, declines with exit 1. If a watchdog is already live, start nothing. If tmux cannot be read, or says no server answers while a tmux process for soma's socket is still alive (or while the process table cannot be read), refuse with exit 3 before asking anything. `--canary` cannot pass on this build. |
+| `soma up [--canary] [--ignore-doctor]` | Run doctor, and refuse with exit 3 on a `FAIL` row unless `--ignore-doctor`. Then print the worst-case spend projection, ask for `yes` on a terminal, start the watchdog in tmux, and read it back. No `--yes`; anything other than `y` or `yes`, including Ctrl-D, declines with exit 1. If a watchdog is already live, start nothing and run no doctor. If tmux cannot be read, or says no server answers while a tmux process for soma's socket is still alive (or while the process table cannot be read), refuse with exit 3 before running doctor or asking anything. `--canary` cannot pass on this build. |
 | `soma down` | Stop the watchdog. **Running leads are not stopped**: they continue unsupervised until `soma up`. |
 | `soma status` | State root, queue, backpressure, lease, watchdog, seat pool, and one row per lead with its pane state and seat. Read-only. |
 | `soma enqueue --file <tasks.json>` | Add tasks from a JSON array. Invalid and duplicate ids are skipped and listed; exit 3 if nothing was queued. |
@@ -796,7 +799,6 @@ details.
   in about 90 seconds and lands on `GAVE_UP`. Read the death screen in the `LEAD_DEAD` event.
 - **A tripped budget cannot be cleared by any verb or tool.** `rm "$SOMA_HOME/leads/<id>/BUDGET_TRIPPED"`
   or kill the lead.
-- **`soma up` does not run doctor.** A fleet can open on a machine with a failing check.
 - **Rate-limit storm detection is a stub.** The organisation spend-cap freeze works; a storm freeze
   cannot occur yet.
 - **No stall detector and no teammate monitoring.** `STALLED` and `TEAMMATE_DOWN` have no producer,
@@ -831,6 +833,7 @@ details.
 | every lead shows `0` tokens | the wrong Claude Code config root, so no transcript matches. The budget breaker is welded open | doctor's `claude config root` row; use your wrapper |
 | `soma status` shows `LIVE ?` everywhere | tmux could not be read, which is not a dead fleet | `tmux -L soma ls` |
 | `soma kill` or `soma down` exits 3 | soma could not confirm the session stopped, so it changed nothing | `soma status`, then try again |
+| `soma up` exits 3: *doctor reported FAIL* | a doctor row is `FAIL` on this machine, so the queue was not opened and nothing was asked | fix the `FAIL` rows printed above the refusal (each names what it read) and run `soma up` again. `--ignore-doctor` opens the queue anyway and fixes nothing |
 | `soma up` refuses with *no terminal here to confirm* | stdin is not a TTY. There is no `--yes` | run it from an interactive shell |
 | `soma up` exits 3: *whether a watchdog is already running is UNKNOWN* | tmux could not be read, so `up` cannot see a watchdog that may be running | `soma status` and `soma doctor`; see [RUNBOOK §11.10](RUNBOOK.md#1110-a-live-tmux-server-can-say-no-server-and-status-and-down-then-believe-it) |
 | `soma up` exits 3: *a tmux process for that socket is still alive (pid …)* | no server answers on the socket, but its server process is alive: its socket file was deleted, or it is wedged | `kill -USR1 <pid>` (deleted socket) or `kill -CONT <pid>` (stopped server), then `soma status` before `soma up`; [RUNBOOK §11.10](RUNBOOK.md#1110-a-live-tmux-server-can-say-no-server-and-status-and-down-then-believe-it) |
@@ -891,10 +894,9 @@ build. Re-prove the RUNBOOK §10 invariants after every upgrade.
 `docs/ROADMAP.md` records what is deliberately deferred and why. In short:
 
 - **Finishing the operator experience (v1.x):** the digest composer; `hold`/`release` and `gc`; a way
-  to clear a tripped budget; installers for the inject and `PostCompact` hooks; `soma up` running
-  doctor; a revival cooldown; the live canary driver; a writeback ledger; case- and
-  quote-insensitive credential matching in the gate; notification coalescing; `meta.json` and the
-  per-task `base_sha`.
+  to clear a tripped budget; installers for the inject and `PostCompact` hooks; a revival cooldown;
+  the live canary driver; a writeback ledger; case- and quote-insensitive credential matching in the
+  gate; notification coalescing; `meta.json` and the per-task `base_sha`.
 - **Account rotation, declared out of scope for now:** detecting the orchestrator's own usage
   limit; two fleets sharing a seat; seats from different organisations; and a doctor check that
   each seat has the bus registered. Proving `crossSeatResume` on a real rotation is a bring-up step
