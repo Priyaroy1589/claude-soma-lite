@@ -514,6 +514,170 @@ test('detectStorm fails toward not-freezing on unusable input', async () => {
   assert.deepEqual(detectStorm(new Set([{ lead: 'a', paneHit: true }, { lead: 'b', paneHit: true }])), { frozen: false, evidence: [] });
 });
 
+// The second list (issue #10). The pane rule above is the design's, and in production it never
+// fires: `paneSignals` is a documented stub. A usage-limit hit does leave a line on the pane
+// (`You've hit your <limit name>`, above an idle composer), but the account-rotation design calls
+// that line corroboration and the transcript row the reliable signal, and no scraper pattern has
+// been built or measured against it. What IS measured, and machine-written, is Claude Code's
+// synthetic `rate_limit` row at the end of the limited lead's own transcript, which the limits
+// phase already reads through `classifyLimit`. So the tick hands `detectStorm` a second list, one
+// `{lead}` per lead whose own tail ends on a LIVE hit (`test/watchdog.tick.test.mjs` pins which
+// hits are live), and it is a separate rule with its own quorum: STORM_MIN_LEADS distinct leads.
+// The two rules never corroborate each other.
+
+/** Two pane-only hits in two distinct leads: a freeze by the pane rule alone. */
+const PANE_PAIR = () => [{ lead: 'x', paneHit: true }, { lead: 'y', paneHit: true }];
+/** No storm and no evidence: the one answer every refusal below must give. */
+const CALM = { frozen: false, evidence: [] };
+
+test('detectStorm freezes on STORM_MIN_LEADS distinct leads whose own transcripts end on a live limit hit, with no pane evidence at all', async () => {
+  const { STORM_MIN_LEADS, detectStorm } = await import('../bin/lib/wd/backpressure.mjs?limited-' + Date.now());
+  // A fixed constant, exported so there is one spelling of the number: an operator decision, not a
+  // config key.
+  assert.equal(STORM_MIN_LEADS, 2);
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }, { lead: 'b' }]), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] });
+  // One lead on its limit is that seat's limit, and rotation is its remedy. A freeze stalls every
+  // lead and every queued task behind them, so one witness is never a storm.
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }]), CALM);
+  // Two rows naming one lead are one lead: "distinct" is the dedup.
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }, { lead: 'a' }]), CALM);
+  // Deduped by a Set, never an object keyed by lead id: `constructor` is a legal task id, and an
+  // object registry would call it already-seen and drop a real storm's second witness.
+  assert.deepEqual(detectStorm([], [{ lead: '__proto__' }, { lead: '__proto__' }]), CALM);
+  assert.deepEqual(detectStorm([], [{ lead: 'constructor' }, { lead: 'toString' }]), { frozen: true, evidence: [{ lead: 'constructor' }, { lead: 'toString' }] });
+  assert.deepEqual(detectStorm([], PROTO_KEYS.map((lead) => ({ lead }))), { frozen: true, evidence: PROTO_KEYS.map((lead) => ({ lead })) });
+  // One evidence row per lead, in first-seen order: what BACKPRESSURE carries to the digest.
+  assert.deepEqual(detectStorm([], [{ lead: 'b' }, { lead: 'a' }, { lead: 'b' }]), { frozen: true, evidence: [{ lead: 'b' }, { lead: 'a' }] });
+});
+
+test('detectStorm: a pane hit and a limit hit never corroborate each other, on one lead or on two', async () => {
+  const { detectStorm } = await import('../bin/lib/wd/backpressure.mjs?cross-' + Date.now());
+  // Two rules, two quorums, and no exchange rate between them. A pane match is a string a lead's own
+  // work can produce (the backlog holds tickets about HTTP 429); a limit hit is one seat's state. A
+  // lead with both is still ONE lead, and a limit hit is not the transcript stanza that corroborates
+  // a pane match: that stanza is the scraper's to report, on the pane's own row.
+  for (const [signals, limited, why] of [
+    [[{ lead: 'a', paneHit: true }], [{ lead: 'a' }], 'a pane hit and a limit hit on the same lead'],
+    [[{ lead: 'a', paneHit: true }], [{ lead: 'b' }], 'a pane hit on a and a limit hit on b: one witness to each rule, two to neither'],
+    [[{ lead: 'a', transcriptHit: true }], [{ lead: 'a' }], 'a limit hit does not stand in for the pane match a transcript stanza needs'],
+    [[{ lead: 'a', transcriptHit: true }], [{ lead: 'b' }], 'nor does a limit hit on another lead'],
+    [[{ lead: 'a', paneHit: true }, { lead: 'a', paneHit: true }], [{ lead: 'a' }, { lead: 'a' }], 'four rows, one lead'],
+  ]) {
+    assert.deepEqual(detectStorm(signals, limited), CALM, why);
+  }
+  // The control, and it is what makes the refusals above a property of the RULES rather than of the
+  // witnesses: the same two leads in ONE list freeze, whichever list it is.
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }, { lead: 'b' }]), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] });
+  assert.deepEqual(detectStorm([{ lead: 'a', paneHit: true }, { lead: 'b', paneHit: true }], []), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] });
+  assert.deepEqual(detectStorm([{ lead: 'a', paneHit: true, transcriptHit: true }], []), { frozen: true, evidence: [{ lead: 'a' }] });
+});
+
+test('detectStorm: a limited row that names no lead is no evidence, never pairs with a real lead, and is never reported', async () => {
+  const { detectStorm } = await import('../bin/lib/wd/backpressure.mjs?limited-unattributable-' + Date.now());
+  // The pane rule's attribution guard, for the second list. The real lead is `b` so that no shape
+  // below can collide with it: a reader that coerced `lead` would read `['a']` as 'a' and 42 as '42',
+  // a second lead either way, and freeze the fleet on one witness.
+  for (const bad of [{}, { lead: undefined }, { lead: '' }, { lead: null }, { lead: 42 }, { lead: {} }, { lead: ['a'] }, null, undefined, 7, 'a']) {
+    const label = JSON.stringify(bad) ?? 'undefined';
+    assert.deepEqual(detectStorm([], [bad, { lead: 'b' }]), CALM, `${label}, then a real lead`);
+    assert.deepEqual(detectStorm([], [{ lead: 'b' }, bad]), CALM, `a real lead, then ${label}`);
+    // Two of one unattributable shape are not two leads. A clone, not the same row twice: `{lead: {}}`
+    // and its copy are two distinct keys to a Set, so here the guard is the only thing standing.
+    assert.deepEqual(detectStorm([], [bad, structuredClone(bad)]), CALM, `${label} twice`);
+    // And never in the evidence of a freeze the pane rule made: `evidence` names leads.
+    assert.deepEqual(detectStorm([{ lead: 'x', paneHit: true, transcriptHit: true }], [bad]), { frozen: true, evidence: [{ lead: 'x' }] }, `${label} beside a pane freeze`);
+  }
+  // The control: a REAL second lead in the same position is a storm.
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }, { lead: 'b' }]), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] });
+});
+
+test('detectStorm: a limited list that is not an array is no evidence, and leaves the pane rule exactly as it was', async () => {
+  const { detectStorm } = await import('../bin/lib/wd/backpressure.mjs?limited-container-' + Date.now());
+  // `limited` is an ARRAY, as `signals` is. The Set and the array-like are the two containers that
+  // tell an array check from "read whatever arrived": each holds two real leads, a storm if read.
+  const arrayLike = { length: 2, 0: { lead: 'a' }, 1: { lead: 'b' } };
+  for (const [label, bad] of [
+    ['no list (undefined)', undefined], ['null', null], ['a string', 'ab'], ['a number', 42], ['a bare row', { lead: 'a' }],
+    ['a Set of two rows', new Set([{ lead: 'a' }, { lead: 'b' }])], ['an array-like of two rows', arrayLike],
+  ]) {
+    assert.deepEqual(detectStorm([], bad), CALM, label);
+    assert.deepEqual(detectStorm([{ lead: 'x', paneHit: true }], bad), CALM, `${label}: one pane hit is still no storm`);
+    assert.deepEqual(detectStorm(PANE_PAIR(), bad), { frozen: true, evidence: [{ lead: 'x' }, { lead: 'y' }] }, `${label}: two pane hits still are`);
+    assert.deepEqual(detectStorm([{ lead: 'x', paneHit: true, transcriptHit: true }], bad), { frozen: true, evidence: [{ lead: 'x' }] }, `${label}: and so is a corroborated one`);
+  }
+  // The control: the same two rows in an array are a storm.
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }, { lead: 'b' }]), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] });
+});
+
+test('detectStorm: a hostile limited list never throws, never erases the pane rule\'s evidence, and keeps what it gave before it broke', async () => {
+  const { detectStorm } = await import('../bin/lib/wd/backpressure.mjs?limited-hostile-' + Date.now());
+  // Each list is read in its OWN try. A throw out of here ends the tick before admission, on every
+  // tick the bad list recurs: a freeze in all but name. And one try around both lists would let a bad
+  // second list erase the first one's evidence.
+  const boom = () => { throw new Error('boom'); };
+  const throwingIterator = [];
+  throwingIterator[Symbol.iterator] = boom;                                   // what it holds is beside the point: nothing can be read
+  const unreadable = new Proxy([{ lead: 'a' }, { lead: 'b' }], { get: boom }); // Array.isArray says array; every read of it throws
+  const proxyRow = new Proxy({}, { get: boom });
+  const throwingLead = { get lead() { throw new Error('boom'); } };
+  for (const [label, hostile] of [
+    ['an iterator that throws', throwingIterator],
+    ['an array no read of which succeeds', unreadable],
+    ['a Proxy row', [proxyRow]],
+    ['a row whose lead getter throws', [throwingLead]],
+  ]) {
+    assert.deepEqual(detectStorm([], hostile), CALM, label);
+    assert.deepEqual(detectStorm(PANE_PAIR(), hostile), { frozen: true, evidence: [{ lead: 'x' }, { lead: 'y' }] }, `${label}: the pane rule's freeze stands`);
+    assert.deepEqual(detectStorm([{ lead: 'x', paneHit: true, transcriptHit: true }], hostile), { frozen: true, evidence: [{ lead: 'x' }] }, `${label}: and so does a corroborated one`);
+  }
+  // Evidence gathered BEFORE an unreadable row is real and still counts; what comes after it is lost,
+  // which fails toward not freezing: the pane list's rule, and this module's direction.
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }, { lead: 'b' }, proxyRow]), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] });
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }, { lead: 'b' }, throwingLead]), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] });
+  assert.deepEqual(detectStorm([], [proxyRow, { lead: 'a' }, { lead: 'b' }]), CALM);
+});
+
+test('detectStorm: a hostile or non-array signals list never erases the limits phase\'s evidence', async () => {
+  const { detectStorm } = await import('../bin/lib/wd/backpressure.mjs?signals-hostile-' + Date.now());
+  const boom = () => { throw new Error('boom'); };
+  const throwingIterator = [];
+  throwingIterator[Symbol.iterator] = boom;
+  const STORM = { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] };
+  for (const [label, signals] of [
+    ['no list (undefined)', undefined], ['null', null], ['a string', 'xy'], ['a number', 42], ['a bare row', { lead: 'x', paneHit: true }],
+    ['a Set of two pane hits', new Set(PANE_PAIR())],
+    ['an iterator that throws', throwingIterator],
+    ['an array no read of which succeeds', new Proxy(PANE_PAIR(), { get: boom })],
+    ['a Proxy row', [new Proxy({}, { get: boom })]],
+    ['a row whose paneHit getter throws', [{ lead: 'x', get paneHit() { throw new Error('boom'); } }]],
+  ]) {
+    assert.deepEqual(detectStorm(signals, [{ lead: 'a' }, { lead: 'b' }]), STORM, label);
+  }
+  // A pane hit read before the bad row stands, and is named after the limited leads.
+  const tail = [{ lead: 'x', paneHit: true }, { get paneHit() { throw new Error('boom'); } }];
+  assert.deepEqual(detectStorm(tail, [{ lead: 'a' }, { lead: 'b' }]), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }, { lead: 'x' }] });
+});
+
+test('detectStorm: a freeze names every attributable lead from both lists once, limited leads first, then pane leads, each in first-seen order', async () => {
+  const { detectStorm } = await import('../bin/lib/wd/backpressure.mjs?union-' + Date.now());
+  const leads = (...ids) => ids.map((lead) => ({ lead }));
+  // Frozen by the limit rule while one pane hit is present: the pane hit is named too, after.
+  assert.deepEqual(detectStorm([{ lead: 'c', paneHit: true }], leads('b', 'a')), { frozen: true, evidence: leads('b', 'a', 'c') });
+  // Frozen by the pane rule while one limited lead is present: the limited lead is named too, first.
+  assert.deepEqual(detectStorm([{ lead: 'y', paneHit: true }, { lead: 'x', paneHit: true }], leads('a')), { frozen: true, evidence: leads('a', 'y', 'x') });
+  assert.deepEqual(detectStorm([{ lead: 'x', paneHit: true, transcriptHit: true }], leads('a')), { frozen: true, evidence: leads('a', 'x') });
+  // A corroborated pane row is a pane lead, never a limited one: its transcript stanza corroborates
+  // the pane rule and is not the limits phase's row, so `x` keeps its first-seen place after `y`.
+  assert.deepEqual(detectStorm([{ lead: 'y', paneHit: true }, { lead: 'x', paneHit: true, transcriptHit: true }]), { frozen: true, evidence: leads('y', 'x') });
+  // Both rules at once.
+  assert.deepEqual(detectStorm([{ lead: 'd', paneHit: true }, { lead: 'c', paneHit: true }], leads('b', 'a')), { frozen: true, evidence: leads('b', 'a', 'd', 'c') });
+  // A lead in both lists is named once, where the limited list first named it.
+  assert.deepEqual(detectStorm([{ lead: 'b', paneHit: true }, { lead: 'a', paneHit: true }], leads('a')), { frozen: true, evidence: leads('a', 'b') });
+  assert.deepEqual(detectStorm([{ lead: 'a', paneHit: true }], leads('b', 'a')), { frozen: true, evidence: leads('b', 'a') });
+  // A signals row that is not a pane hit names nobody: a transcript stanza alone, an explicit `paneHit: false`.
+  assert.deepEqual(detectStorm([{ lead: 't', transcriptHit: true }, { lead: 'u', paneHit: false }], leads('a', 'b')), { frozen: true, evidence: leads('a', 'b') });
+});
+
 // ─────────────────────────── admission ───────────────────────────
 
 test('nextAdmission holds the stagger for stagger_s SECONDS, at the boundary', async () => {
