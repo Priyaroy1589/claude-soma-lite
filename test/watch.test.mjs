@@ -29,6 +29,7 @@ const { ensureTree } = await import('../bin/lib/paths.mjs');
 const { enqueue } = await import('../bin/lib/fleet.mjs');
 const { appendEvent, readEvents: realReadEvents, unread, writeCursor } = await import('../bin/lib/events.mjs');
 const { acquireLease } = await import('../bin/lib/lease.mjs');
+const { readFleet: realReadFleet } = await import('../bin/lib/fleet.mjs');
 // The watchdog's own BACKPRESSURE builder and storm reason, so the freeze tests carry the payload
 // exactly as the tick emits it.
 const { backpressure } = await import('../bin/lib/wd/rotation-events.mjs');
@@ -691,6 +692,30 @@ test('what soma_inbox is past is forgotten: if the cursor then moves back, the e
   // wake is the cheap direction (events.mjs: replaying costs a wake, losing costs a task).
   writeFileSync(join(home, 'events', '.cursors.json'), '{"orch": ');
   assert.deepEqual(w.events(), [W('cr-1', 'NEEDS_INPUT')]);
+});
+
+test('only the orch cursor forgets: a poll that cannot read the fleet, or a row gone for a poll, re-announces nothing', async (t) => {
+  const home = stateRoot(t);
+  seed('cr-1', 'cr-2');
+  const { watcher } = await mod();
+  let fleetDown = false;
+  const w = watcher({ deps: { readFleet: () => { if (fleetDown) throw new Error('EIO: the checkpoint could not be read'); return realReadFleet(); } } });
+  emit('cr-1', 'NEEDS_INPUT');
+  emit('cr-2', 'ERROR');
+  assert.deepEqual(w.events(), [W('cr-1', 'NEEDS_INPUT'), W('cr-2', 'ERROR')]);
+  // One poll reads orch alone. Both events are still unread, and both stay said.
+  fleetDown = true;
+  assert.deepEqual(w.events(), []);
+  fleetDown = false;
+  assert.deepEqual(w.events(), [], 'an event already said was said again after one poll that could not read the fleet');
+  // A hand-edited checkpoint that drops a row for a poll and puts it back is the same.
+  writeFleetRows(home, [{ id: 'cr-1' }]);
+  assert.deepEqual(w.events(), []);
+  writeFleetRows(home, [{ id: 'cr-1' }, { id: 'cr-2' }]);
+  assert.deepEqual(w.events(), [], 'an event already said was said again when its row came back');
+  // A new event still rings.
+  emit('cr-2', 'COMPLETED');
+  assert.deepEqual(w.events(), [W('cr-2', 'COMPLETED')]);
 });
 
 // ------------------------------------------------------------------------------------- health()
