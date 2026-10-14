@@ -978,8 +978,8 @@ test('a lead already warned in the log is not warned again', async () => {
 // The BUDGET event lands on the orchestrator's stream, which the lead never reads. So at the 80%
 // verdict the watchdog also writes `leads/<id>/BUDGET_WARNED`, and the PreToolUse gate hands the lead
 // a note on its next allowed tool call (`bin/hooks/lead-gate.mjs`, job 5). The flag goes FIRST: the
-// logged BUDGET is the once-per-session dedupe, so a write that failed after it landed would never
-// be retried and the lead would never be told.
+// logged BUDGET is the dedupe, once per lead SESSION and ALLOWANCE, so a write that failed after it
+// landed would never be retried and the lead would never be told.
 
 test('at 80% the watchdog writes the lead its flag, then logs the BUDGET', async () => {
   const { tick } = await load('warnflag-' + Date.now());

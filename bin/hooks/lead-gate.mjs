@@ -47,7 +47,7 @@
  *      not be a write target** (exact match, never a prefix — `worktrees/` lives under it), because
  *      `chmod 000 $SOMA_HOME` disarms the breaker by the identical mechanism. See the `leads/`
  *      section below for the ruling and its edge cases.
- *   5. **The 80% warning, delivered to the lead.** At 80% of the budget class the watchdog
+ *   5. **The 80% warning, delivered to the lead.** At 80% of the lead's allowance the watchdog
  *      writes `leads/<id>/BUDGET_WARNED` beside `BUDGET_TRIPPED`; the BUDGET event it also
  *      logs goes to the orchestrator's stream, which the lead never reads. This process runs
  *      on every tool call and is the one place that can tell the lead from a teammate, so it
@@ -56,7 +56,7 @@
  *      `BUDGET_WARNED.delivered` and, only if that rename won, prints the note as
  *      `additionalContext`. **That rename is the gate's one write, of a flag the watchdog
  *      wrote for it**; everything else here only reads. Teammates never see or consume the
- *      note. `budgetWarning` has the rules.
+ *      note. `budgetWarning` has the rules. The allowance is (1 + grants) times the budget class.
  *
  * **Fail-open is the design, not a concession.** Every path that is not a decided
  * deny exits 0 with nothing on stdout, which Claude Code reads as "this hook has no
