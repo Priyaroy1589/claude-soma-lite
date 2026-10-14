@@ -20,7 +20,8 @@
  *
  * Phase 1, the limits phase, is newer still and is the account-rotation design's one foothold in
  * the tick: it reads each spawned lead's transcript tail and, on a usage-limit hit, closes the
- * lead's seat and moves the lead to an open one (`limitsPhase`, `rotate`); on the org spend cap it
+ * lead's seat and moves the lead to an open one (`limitsPhase`, `rotate`), and hands phase 5 each
+ * live hit as storm evidence; on the org spend cap it
  * freezes admission through `state/backpressure.json`, whose only lift is `soma thaw`. It types
  * into no pane and holds no lease: BACKPRESSURE reaches the orchestrator by toast and by its next
  * `soma_inbox` drain.
@@ -754,10 +755,11 @@ export async function tick(deps) {
   // was written nowhere and displayed from a file nobody wrote.
   //
   // Two writers share the file: this branch (`STORM_REASON`) and the limits phase's spend cap
-  // (`reason: 'org_level_disabled_until'`). One rule keeps them apart: a branch writes only its
-  // own reason and clears only its own reason. So a storm ending cannot thaw a spend-cap freeze,
-  // and a storm cannot relabel one — the foreign record and its `since` stand. The spend-cap
-  // record is lifted by a human, through `soma thaw`; nothing in this tick clears it.
+  // (`reason: 'org_level_disabled_until'`). A branch writes only its own reason and clears only
+  // its own reason, and the spend cap outranks a storm. So a storm ending cannot thaw a spend-cap
+  // freeze, and a storm cannot relabel one (the foreign record and its `since` stand), while a
+  // spend-cap hit writes over a storm's record (`freeze`). The spend-cap record is lifted by a
+  // human, through `soma thaw`; nothing in this tick clears it.
   //
   // Deliberately re-emitted on every frozen tick and deliberately silent on the desktop. A storm's
   // END has no event, so the repetition is what records the freeze's duration for the digest; and
@@ -769,9 +771,10 @@ export async function tick(deps) {
   // date the tick rather than the storm. Pinned as such in `test/watchdog.tick.test.mjs`. Carrying
   // the foreign `since` instead would date a storm from a spend cap's start, which is a different
   // freeze; the alternative — remembering a storm's start across ticks — needs state this tick does
-  // not have. Unreachable today (`paneSignals` is a stub) and the limits phase owns the branch
-  // that makes it reachable, so the choice is left here where its cost is written down.
-  const storm = detectStorm(deps.paneSignals());
+  // not have. Reachable, if rare, now that the limits phase hands this phase its evidence: one
+  // lead's spend-cap row and two other leads' live limit hits can stand in the same tick. So the
+  // choice is left here, where its cost is written down.
+  const storm = detectStorm(deps.paneSignals(), limits.limited);
   const before = deps.readBackpressure();
   if (before.unreadable === true && !history.backpressureUnreadable) {
     // The third state, said once. Read as "not frozen" — the tolerant direction, and the bus's —
@@ -1486,11 +1489,16 @@ const seatsConfigured = (cfg) => cfg?.seats != null && (!Array.isArray(cfg.seats
  * refusing a mis-shaped event — each costs one lead its rotation this tick, not the other nine
  * theirs. Returns whether a session was launched (a rotation is a launch). Whether admission is
  * frozen is NOT returned: phase 5 reads the FILE, which is the one switch `soma status` also reads.
+ * What IS returned beside `launched` is phase 5's storm evidence, `limited`: one `{lead}` per row
+ * whose hit passed the stale-row guard and is still LIVE (`resetsAt > now`; a reset at exactly
+ * `now` is over). A hit is collected BEFORE the close, because a pool that cannot be written does
+ * not un-happen a limit hit.
  * `fail` is the tick's `fail(where, e, lead)` closure, threaded here so the revert's refusals
  * (`where: 'revert'`) are said through the one WATCHDOG_ERROR builder and not a literal.
  */
 function limitsPhase(deps, cfg, tasks, history, now, census, fail) {
   let didLaunch = false;
+  const limited = [];
   for (const t of tasks) {
     if (t?.status !== 'spawned') continue;
     try {
@@ -1509,6 +1517,7 @@ function limitsPhase(deps, cfg, tasks, history, now, census, fail) {
         // the one place seconds become milliseconds). Refused by name rather than compared as NaN,
         // which `close()` would floor to five minutes and silently call a closure.
         const resetsAt = reqNum('tick: classifyLimit verdict.resetsAt', verdict.resetsAt);
+        if (resetsAt > now) limited.push({ lead: t.id });   // storm evidence, before the close (doc above)
         const closeReason = kind === 'seat_cap' ? 'seat_cap' : verdict.rateLimitType;
         closeSeatOf(deps, cfg, t, resetsAt, closeReason, now);
         if (!didLaunch && rotate(t, { deps, cfg, history, now, verdict, pane })) didLaunch = true;
@@ -1540,7 +1549,7 @@ function limitsPhase(deps, cfg, tasks, history, now, census, fail) {
       deps.appendEvent(ORCH, { type: 'WATCHDOG_ERROR', payload: { where: 'limits', error: reason(e) }, lead: null });
     }
   }
-  return { launched: didLaunch };
+  return { launched: didLaunch, limited };
 }
 
 /**
@@ -1788,15 +1797,19 @@ function rotate(task, { deps, cfg, history, now, verdict, pane }) {
  * (`clearBackpressure`), which is a human's act — and BACKPRESSURE is URGENT in the bus, so a
  * repeat every 30 s for the days a monthly cap lasts would be a wake every 30 s for days. It
  * reaches the orchestrator by this toast and by its next `soma_inbox` drain; the watchdog types
- * into no pane. Already-active is read off the FILE, so a freeze written by an earlier tick, or
- * by hand, is not re-announced — and an active record of ANY reason stands: a storm's record is
- * the storm branch's to clear when the storm ends, and the cap row is re-read next tick. `until`
+ * into no pane. Already-active is read off the FILE, so a spend-cap freeze written by an earlier
+ * tick, or by hand, stands and is not re-announced: once per freeze. So does any active record
+ * but a storm's. A STORM record does not stand, because the spend cap outranks a storm: the org
+ * cap is the alarm only a human can act on, and a storm can hold for hours. The cap replaces the
+ * storm's record and is said and toasted at once, and the storm branch, finding a foreign record,
+ * neither writes over it nor clears it. `until`
  * is null: the org cap carries no reset time (9 of 9 real rows), and `until` is descriptive in
  * any case — nothing expires a freeze by its own clock. Through `writeBackpressure`, which refuses
  * a seconds stamp, and the `backpressure` builder, which pins the payload.
  */
 function freeze(deps, verdict, now) {
-  if (deps.readBackpressure()?.active === true) return;
+  const rec = deps.readBackpressure();
+  if (rec?.active === true && rec.reason !== STORM_REASON) return;
   const state = { active: true, reason: verdict.rateLimitType, since: now, until: null };
   deps.writeBackpressure(state);
   deps.appendEvent(ORCH, backpressure({ reason: state.reason, since: state.since, until: state.until }));
@@ -2099,17 +2112,20 @@ function versionGate() {
 }
 
 /**
- * Rate-limit evidence per lead — **a documented stub, and the one duty this tick cannot yet do.**
+ * Pane rate-limit evidence per lead — **a documented stub: the PANE half of storm detection.**
  *
- * `detectStorm` needs `{lead, paneHit, transcriptHit}` per live lead, which means matching real
+ * `detectStorm`'s pane list is `{lead, paneHit, transcriptHit}` per live lead, which means matching real
  * strings in a real pane and a real transcript. Those strings are not established anywhere on
  * this build, and inventing them would be worse than returning nothing: `backpressure.mjs`'s
  * whole asymmetry is that a missed storm costs some retried requests while a FALSE freeze stalls
  * all ten leads and every queued task behind them. A pattern nobody measured is a false-freeze
  * generator.
  *
- * So STORM detection is inert in production until the scraper is built against measured strings,
- * and it is inert *visibly*: this function is named, commented and returns `[]`.
+ * So the PANE half is inert in production until the scraper is built against measured strings,
+ * and it is inert *visibly*: this function is named, commented and returns `[]`. Storm detection
+ * itself is live through the limits phase: `detectStorm`'s second list is `limitsPhase`'s
+ * `limited`, the spawned leads whose own transcripts end on a live usage-limit hit, and two of
+ * those freeze admission while this stub returns `[]`.
  *
  * What is NOT missing any more — and an earlier version of this comment denied it was missing at
  * all — is the layer downstream: a freeze is a FILE. The tick's backpressure phase writes
@@ -2117,8 +2133,8 @@ function versionGate() {
  * fleet lock), `soma_status` and `soma status` render it three-state, admission obeys the file, and
  * `soma thaw` lifts a spend-cap record — which is how the limits phase's spend-cap freeze holds the
  * queue with no scraper at all. Measured: `detectStorm([])` → `{"frozen":false,"evidence":[]}`, so
- * with this stub the storm branch never writes; the spend-cap writer does not need it. Whoever
- * builds the scraper builds ONLY the scraper.
+ * this stub's empty list adds nothing: the storm branch freezes on the limits phase's list alone,
+ * and the spend-cap writer needs neither. Whoever builds the scraper builds ONLY the pane half.
  */
 const paneSignals = () => [];
 

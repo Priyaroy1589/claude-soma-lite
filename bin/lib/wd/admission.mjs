@@ -3,8 +3,9 @@
  *
  * Three governors, in order of how badly they must not fail:
  *
- * - **Backpressure.** A storm freezes admission entirely; leads 3 through 10 never start
- *   while lead 2 is being rate-limited (design §11).
+ * - **Backpressure.** A storm — two leads holding a live usage-limit hit at once — freezes
+ *   admission entirely: leads 3 through 10 never start while leads 1 and 2 sit on a closed
+ *   window (design §11).
  * - **The 90 s stagger.** `stagger_s` exists so ten leads do not hit the API in the same
  *   second, and so that a fleet ramping up reveals a rate-limit problem at lead 2 rather
  *   than at lead 10. Its clock is `fleet.last_spawn_at`, stamped inside

@@ -953,7 +953,7 @@ export async function dispatch(argv, deps = {}) {
               ? `until ${whenMs(bp.until)}${bp.until < Date.now() ? ' — that end has PASSED, and nothing expires a record by its own clock' : ''}`
               : 'no known end'}). `
             + (bp.reason === STORM_REASON
-              ? 'A storm clears itself when the watchdog stops corroborating it.'
+              ? 'A storm clears itself once fewer than two leads still hold a live usage-limit hit.'
               : 'A spend-cap record holds until `soma thaw` clears it — nothing inside the fleet lifts it.')
           : 'backpressure: none');
 
@@ -2108,7 +2108,7 @@ export async function dispatch(argv, deps = {}) {
       // has been raised or the month has turned is a fact only a human has. Three refusals, then the
       // one action. An unreadable record is not cleared blind (the bytes are the evidence — fix or
       // delete the file by hand); a live storm is the watchdog's to end (it re-writes its record on
-      // every tick it corroborates the storm, so a clear here would be undone within a tick and would
+      // every tick the storm holds, so a clear here would be undone within a tick and would
       // hide the storm from `soma status` meanwhile); an inactive record is nothing to do, said so.
       const act = actor();
       if (!act.ok) {
@@ -2133,9 +2133,9 @@ export async function dispatch(argv, deps = {}) {
       }
       if (rec.reason === STORM_REASON) {
         d.warn('soma thaw: the freeze is a rate-limit STORM, and a live storm is the watchdog\'s: it re-writes this record'
-          + ' on every tick it corroborates the storm and clears it itself when the panes stop matching, so a clear here'
-          + ' would be undone within a tick and would hide the storm from `soma status` meanwhile. Wait it out;'
-          + ' `soma digest` carries the BACKPRESSURE events with the leads whose panes matched.');
+          + ' on every tick the storm holds and clears it itself once fewer than two leads still hold a live usage-limit'
+          + ' hit, so a clear here would be undone within a tick and would hide the storm from `soma status` meanwhile.'
+          + ' Wait it out; `soma digest` carries the BACKPRESSURE events with the leads whose limit hits make up the storm.');
         return REFUSED;
       }
       d.print(act.note);
@@ -2147,7 +2147,7 @@ export async function dispatch(argv, deps = {}) {
         return REFUSED;
       }
       d.print(`thawed: cleared ${JSON.stringify({ reason: rec.reason ?? null, since: rec.since ?? null, until: rec.until ?? null })}`
-        + ` (frozen since ${whenMs(rec.since)}). Admission resumes on the watchdog's next tick. If the record comes back`
+        + ` (frozen since ${whenMs(rec.since)}). Admission resumes on the watchdog's next tick unless a rate-limit storm still holds (\`soma status\` names the reason). If a spend-cap record comes back`
         + ' within a tick, a spawned lead\'s transcript still ends on the spend-cap row: the tick reads tails, not calendars,'
         + ' so move or kill those leads first (RUNBOOK §9).');
       return OK;

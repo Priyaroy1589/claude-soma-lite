@@ -4957,3 +4957,311 @@ test('revert: a ROTATION_FAILED at the top of the launch fold is not a rotation 
   // a fact in this tick and a lie in the one before it.
   assert.deepEqual(oneEvent(rotated, 'ROTATION_FAILED').payload, { lead: 'a', from: 'seat-a', to: 'seat-b', why: 'server_error' });
 });
+
+// ═══════════════ Storm evidence from the limits phase (issue #10) ═══════════════
+//
+// `paneSignals` is a documented stub, so the pane rule alone has never frozen anything in production.
+// The limits phase already reads every spawned lead's transcript tail, and the synthetic `rate_limit` row
+// `classifyLimit` reads there is the one measured, machine-written signal of a usage-limit hit (the
+// pane's limit line, above an idle composer, is corroboration in the account-rotation design, and no
+// scraper pattern has been built or measured against it). So phase 1 hands phase 5 one `{lead}` per
+// lead whose OWN tail ends on a LIVE hit (a `spawned` row, a `seat_window` or `seat_cap` verdict, not
+// stale, a `resetsAt` still ahead of the clock), and two such leads are a storm. Downstream of
+// `detectStorm` nothing is new: the branch the tests above pin writes the record, re-emits
+// BACKPRESSURE and lifts.
+
+/** `a` (session `ua`) and `b` (session `ub`) spawned, `c` queued. `over` lands on `a` and `b`. */
+const stormRows = (over = {}) => [
+  row({ id: 'a', status: 'spawned', lead_session_uuid: 'ua', ...over }),
+  row({ id: 'b', status: 'spawned', lead_session_uuid: 'ub', ...over }),
+  row({ id: 'c', status: 'queued' }),
+];
+/**
+ * Two leads alive on the idle composer a limit hit leaves, and a queued `c` that admission launches
+ * this tick unless something holds it, so `c` is what a freeze is read off. `TAILS` maps a session
+ * uuid to its rows, oldest first; a uuid it does not name reads an empty tail. `cfg.seats` is `[]`,
+ * the value production passes: a limit-hit lead is told `no_open_seat`, nothing is launched, and
+ * admission runs. `over` layers on top.
+ */
+const twoLeads = (TAILS, over = {}) => ctx({
+  cfg: cfgOf({ seats: [] }),
+  fleet: { tasks: stormRows() },
+  alive: new Set(['lead-a', 'lead-b']),
+  capturePane: () => IDLE_FRAME,
+  readTail: (uuid) => ({ rows: TAILS[uuid] ?? [], bad_lines: 0, transcript: '/t/' + uuid + '.jsonl', uuid }),
+  ...over,
+});
+/** The record the storm branch writes on the tick a storm starts. */
+const STORM_RECORD = { active: true, reason: 'storm', since: NOW, until: null };
+/** The BACKPRESSURE a storm of `a` and `b` says on that tick: the contract's three fields plus `evidence`. */
+const STORM_EVENT = { reason: 'storm', since: NOW, until: null, evidence: [{ lead: 'a' }, { lead: 'b' }] };
+
+test('two spawned leads whose own transcripts end on a live limit hit are a storm: the record, one BACKPRESSURE naming both, and admission held', async () => {
+  const { tick } = await load('storm-lim-' + Date.now());
+  const c = twoLeads({ ua: [FIVE_HOUR_ROW], ub: [FIVE_HOUR_ROW] });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.writeBackpressure, [STORM_RECORD], 'all four fields, through the one writer');
+  assert.deepEqual(c.backpressure(), STORM_RECORD);
+  const said = oneEvent(c, 'BACKPRESSURE');
+  assert.deepEqual(said.payload, STORM_EVENT, 'both leads named, in the order phase 1 read them');
+  assert.equal(said.lead, null, 'a fleet-level event: no lead');
+  assert.deepEqual(c.calls.spawnLead, [], 'admission is held');
+  assert.equal(c.task('c').status, 'queued');
+  assert.deepEqual(c.calls.notify, [], 'and silently: a storm tick never toasts');
+  // The control: one lead on its limit is that seat's business, rotation's and not a freeze's, and
+  // the same fixture admits when only one hit is live.
+  const one = twoLeads({ ua: [FIVE_HOUR_ROW], ub: [HEALTHY_ROW] });
+  await tick(one.deps);
+  assert.deepEqual(eventsOf(one, 'BACKPRESSURE'), []);
+  assert.deepEqual(one.calls.writeBackpressure, []);
+  assert.deepEqual(one.calls.spawnLead, ['c']);
+});
+
+test('a storm never gates rotation: the tick that freezes admission still rotates one limit-hit lead, and only admission waits', async () => {
+  const { tick } = await load('storm-rotate-' + Date.now());
+  const c = twoLeads({ ua: [FIVE_HOUR_ROW], ub: [FIVE_HOUR_ROW] }, {
+    cfg: cfgOf({ seats: SEATS }),
+    fleet: { tasks: stormRows({ seat: 'seat-a' }) },
+    ...seatPool(SEATS).over,
+  });
+  await tick(c.deps);
+  // Phase 1 is untouched by the storm: seat-a closes and `a` moves to seat-b. One launch per tick,
+  // so `b` waits for the next one, as it would behind any rotation.
+  assert.deepEqual(oneEvent(c, 'ROTATED').payload, { lead: 'a', from: 'seat-a', to: 'seat-b', rateLimitType: 'five_hour', resetsAt: RESETS_AT_MS });
+  assert.deepEqual(c.calls.killSession, ['lead-a']);
+  assert.deepEqual(c.calls.resumeOpts, [{ configDir: '/s/b' }]);
+  // ...and phase 5 still counts both: `a`'s hit was live when phase 1 read it, before the rotation.
+  assert.deepEqual(c.calls.writeBackpressure, [STORM_RECORD]);
+  assert.deepEqual(oneEvent(c, 'BACKPRESSURE').payload, STORM_EVENT);
+  ranBefore(c.order, 'event:ROTATED', 'event:BACKPRESSURE');
+  assert.deepEqual(c.calls.spawnLead, []);
+  assert.equal(c.task('c').status, 'queued');
+});
+
+test('a stale hit, older than its lead\'s newest launch, is not storm evidence: the process that hit the limit is gone', async () => {
+  const { tick } = await load('storm-stale-' + Date.now());
+  // `a`'s hit is re-stamped onto the tick's clock so a launch can be placed on either side of it;
+  // `b` has no launch at all, so its hit is live throughout. A ROTATED after the hit is a lead
+  // rotated on an earlier tick: its resumed process has not written yet, and the tail still ends on
+  // the hit the rotation answered.
+  const hitAt = NOW - 10 * MIN;
+  const LAUNCHES = {
+    SPAWNED: { session_uuid: 'ua', tmux_target: 'lead-a', cwd: '/w/a' },
+    REVIVED: { plan: 'resume', attempt: 1, session_uuid: 'ua' },
+    ROTATED: { lead: 'a', from: 'seat-a', to: 'seat-b', rateLimitType: 'five_hour', resetsAt: RESETS_AT_MS },
+    ROTATION_FAILED: { lead: 'a', from: 'seat-b', to: 'seat-a', why: 'server_error' },
+  };
+  for (const [type, payload] of Object.entries(LAUNCHES)) {
+    const mk = (launchAt) => twoLeads({ ua: [stamped(FIVE_HOUR_ROW, hitAt)], ub: [FIVE_HOUR_ROW] }, { orchEvents: [ev(type, 'a', launchAt, payload)] });
+    const stale = mk(hitAt + 5 * MIN);
+    await tick(stale.deps);
+    assert.deepEqual(eventsOf(stale, 'BACKPRESSURE'), [], `${type} after the hit: the hit is the replaced process's, so b is alone`);
+    assert.deepEqual(stale.calls.writeBackpressure, [], type);
+    assert.deepEqual(stale.calls.spawnLead, ['c'], `${type}: one live hit holds nothing`);
+    // The control, ONE STAMP apart: the same launch BEFORE the hit leaves the hit a's own, and a storm.
+    const live = mk(hitAt - 5 * MIN);
+    await tick(live.deps);
+    assert.deepEqual(oneEvent(live, 'BACKPRESSURE').payload, STORM_EVENT, `${type} before the hit`);
+    assert.deepEqual(live.calls.spawnLead, [], type);
+  }
+});
+
+test('an expired hit is not storm evidence: a reset at or before the tick\'s clock is a window already open again', async () => {
+  const { tick } = await load('storm-expired-' + Date.now());
+  const NOW_S = NOW / 1000;                                   // `quotaLimits.resetsAt` is epoch SECONDS
+  const resetting = (secs) => withQuota(FIVE_HOUR_ROW, { ...FIVE_HOUR_ROW.quotaLimits, resetsAt: secs });
+  // The boundary row says what this test needs it to: a seat_window whose reset IS the tick's instant.
+  assert.deepEqual(realClassify([resetting(NOW_S)]), { kind: 'seat_window', rateLimitType: 'five_hour', resetsAt: NOW });
+  for (const [label, secs] of [['an hour ago', NOW_S - 3600], ['a second ago', NOW_S - 1], ['exactly now', NOW_S]]) {
+    const c = twoLeads({ ua: [resetting(secs)], ub: [FIVE_HOUR_ROW] });
+    await tick(c.deps);
+    assert.deepEqual(eventsOf(c, 'BACKPRESSURE'), [], `a reset ${label} is over, so b is alone`);
+    assert.deepEqual(c.calls.writeBackpressure, [], label);
+    assert.deepEqual(c.calls.spawnLead, ['c'], label);
+  }
+  // The control: one second AHEAD of the clock is a live hit, and the pair is a storm.
+  const live = twoLeads({ ua: [resetting(NOW_S + 1)], ub: [FIVE_HOUR_ROW] });
+  await tick(live.deps);
+  assert.deepEqual(oneEvent(live, 'BACKPRESSURE').payload, STORM_EVENT);
+  assert.deepEqual(live.calls.spawnLead, []);
+});
+
+test('a spend cap is not storm evidence and keeps its own freeze; a seat cap is a seat\'s limit, and two of them are a storm', async () => {
+  const { tick } = await load('storm-caps-' + Date.now());
+  // The org cap refuses every seat at once, so it has its own freeze, said ONCE and lifted by `soma
+  // thaw`. Counted as storm evidence it would add a storm BACKPRESSURE every 30 s for as long as the
+  // cap lasts: the urgent repeat its own freeze is written once to avoid.
+  const spend = twoLeads({ ua: [SPEND_CAP_ROW], ub: [SPEND_CAP_ROW] });
+  await tick(spend.deps);
+  assert.deepEqual(spend.calls.writeBackpressure, [{ active: true, reason: 'org_level_disabled_until', since: NOW, until: null }]);
+  assert.deepEqual(oneEvent(spend, 'BACKPRESSURE').payload, { reason: 'org_level_disabled_until', since: NOW, until: null },
+    'the spend cap\'s own event, and no storm beside it');
+  assert.deepEqual(spend.calls.spawnLead, [], 'held, by the spend cap\'s record');
+  // A seat's own cap closes that seat until the 1st after the hit (2015-09-01, ahead of the clock):
+  // a live limit like any window.
+  const seat = twoLeads({ ua: [SEAT_CAP_ROW], ub: [SEAT_CAP_ROW] });
+  await tick(seat.deps);
+  assert.deepEqual(seat.calls.writeBackpressure, [STORM_RECORD]);
+  assert.deepEqual(oneEvent(seat, 'BACKPRESSURE').payload, STORM_EVENT);
+  assert.deepEqual(seat.calls.spawnLead, []);
+});
+
+test('an unobservable tail is not storm evidence: a rate_limit row with no quotaLimits, an empty tail, a torn tail', async () => {
+  const { tick } = await load('storm-unobservable-' + Date.now());
+  // What `readTailRows` hands over for a file whose last line would not parse: the hit, then `null`.
+  const torn = (uuid) => ({ rows: [FIVE_HOUR_ROW, null], bad_lines: 1, transcript: '/t/' + uuid + '.jsonl', uuid });
+  for (const [label, c] of [
+    ['a 2.1.220 rate_limit row with no quotaLimits', twoLeads({ ua: [ORG_CAP_ROW], ub: [ORG_CAP_ROW] })],
+    ['an empty tail', twoLeads({ ua: [], ub: [] })],
+    ['a torn tail', twoLeads({}, { readTail: torn })],
+  ]) {
+    await tick(c.deps);
+    assert.deepEqual(eventsOf(c, 'BACKPRESSURE'), [], label);
+    assert.deepEqual(c.calls.writeBackpressure, [], label);
+    assert.deepEqual(c.calls.spawnLead, ['c'], `${label}: a non-verdict holds nothing`);
+  }
+  // The control: the same two leads on a readable hit.
+  const hit = twoLeads({ ua: [FIVE_HOUR_ROW], ub: [FIVE_HOUR_ROW] });
+  await tick(hit.deps);
+  assert.deepEqual(oneEvent(hit, 'BACKPRESSURE').payload, STORM_EVENT);
+});
+
+test('only spawned rows are storm evidence: blocked, done and failed leads whose tails end on a live hit hold nothing', async () => {
+  const { tick } = await load('storm-spawned-' + Date.now());
+  // A lead that failed on its limit keeps that row at the end of its transcript, live until its window
+  // resets. Read as evidence, two of them would hold the whole queue with nobody running on either seat.
+  for (const status of ['blocked', 'done', 'failed']) {
+    const c = twoLeads({ ua: [FIVE_HOUR_ROW], ub: [FIVE_HOUR_ROW] }, { fleet: { tasks: stormRows({ status }) } });
+    await tick(c.deps);
+    assert.deepEqual(c.calls.readTail, [], `${status}: the limits phase reads spawned rows only`);
+    assert.deepEqual(eventsOf(c, 'BACKPRESSURE'), [], status);
+    assert.deepEqual(c.calls.writeBackpressure, [], status);
+    assert.deepEqual(c.calls.spawnLead, ['c'], status);
+  }
+  // The control: the same two rows `spawned`.
+  const spawned = twoLeads({ ua: [FIVE_HOUR_ROW], ub: [FIVE_HOUR_ROW] });
+  await tick(spawned.deps);
+  assert.deepEqual(oneEvent(spawned, 'BACKPRESSURE').payload, STORM_EVENT);
+});
+
+test('storm evidence is taken after the verdict is validated and before anything is spent: a seat close that throws still counts, a refused verdict does not', async () => {
+  const { tick } = await load('storm-close-' + Date.now());
+  const LOCKED = 'fleet.lock is still held by pid 7 — gave up after 5000ms';
+  const seated = (TAILS, over = {}) => twoLeads(TAILS, {
+    cfg: cfgOf({ seats: SEATS }),
+    fleet: { tasks: stormRows({ seat: 'seat-a' }) },
+    ...seatPool(SEATS).over,
+    closeSeat: () => { throw new Error(LOCKED); },
+    ...over,
+  });
+  const c = seated({ ua: [FIVE_HOUR_ROW], ub: [FIVE_HOUR_ROW] });
+  await tick(c.deps);
+  assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR').map((e) => [e.lead, e.payload.where, e.payload.error]),
+    [['a', 'limits', LOCKED], ['b', 'limits', LOCKED]], 'each failed close is reported against its own lead');
+  assert.deepEqual(eventsOf(c, 'ROTATED'), [], 'a close that throws costs the lead its rotation this tick...');
+  assert.deepEqual(oneEvent(c, 'BACKPRESSURE').payload, STORM_EVENT, '...but not its witness: the hit was read before the close');
+  assert.deepEqual(c.calls.writeBackpressure, [STORM_RECORD]);
+  assert.deepEqual(c.calls.spawnLead, []);
+  // A verdict the phase refuses is no evidence. An infinite `resetsAt` is ahead of every clock, so
+  // only the order tells: `reqNum` refuses it by name before the hit can be counted.
+  const refused = seated({ ua: [{ ...FIVE_HOUR_ROW, refused: true }], ub: [FIVE_HOUR_ROW] }, {
+    classifyLimit: (rows) => (rows[0]?.refused === true ? { kind: 'seat_window', rateLimitType: 'five_hour', resetsAt: Infinity } : realClassify(rows)),
+  });
+  await tick(refused.deps);
+  assert.match(eventsOf(refused, 'WATCHDOG_ERROR').find((e) => e.lead === 'a')?.payload.error ?? '', /verdict\.resetsAt must be a non-negative finite number/);
+  assert.deepEqual(eventsOf(refused, 'BACKPRESSURE'), [], 'one witness left: no storm');
+  assert.deepEqual(refused.calls.spawnLead, ['c']);
+});
+
+test('a storm the limits phase holds keeps the since it started with, and lifts itself, silently, on the first tick with one live hit left', async () => {
+  const { tick } = await load('storm-lift-' + Date.now());
+  const ours = { active: true, reason: 'storm', since: NOW - 5 * MIN, until: null };
+  // Two live hits: our record is re-written with the since it started with, and the event agrees.
+  const held = twoLeads({ ua: [FIVE_HOUR_ROW], ub: [FIVE_HOUR_ROW] }, { backpressure: ours });
+  await tick(held.deps);
+  assert.deepEqual(held.calls.writeBackpressure, [ours], 'carried, not re-stamped');
+  assert.deepEqual(oneEvent(held, 'BACKPRESSURE').payload, { ...STORM_EVENT, since: NOW - 5 * MIN });
+  assert.equal(held.calls.clearBackpressure, 0);
+  assert.deepEqual(held.calls.spawnLead, []);
+  // One live hit left (`b` resumed, so its tail now ends healthy): the branch clears its own record,
+  // says nothing, and admission reads the cleared file on the same tick.
+  const lifted = twoLeads({ ua: [FIVE_HOUR_ROW], ub: [FIVE_HOUR_ROW, HEALTHY_ROW] }, { backpressure: held.backpressure() });
+  await tick(lifted.deps);
+  assert.equal(lifted.calls.clearBackpressure, 1);
+  assert.deepEqual(lifted.backpressure(), { active: false });
+  assert.deepEqual(eventsOf(lifted, 'BACKPRESSURE'), [], 'a storm\'s end has no event');
+  assert.deepEqual(lifted.calls.writeBackpressure, []);
+  assert.deepEqual(lifted.calls.spawnLead, ['c']);
+  ranBefore(lifted.order, 'clearBackpressure', 'spawnLead:c');
+});
+
+test('a pane-only hit and one limited lead are not a storm: the two rules never corroborate each other in the tick either', async () => {
+  const { tick } = await load('storm-cross-' + Date.now());
+  for (const [label, lead] of [['on another lead', 'x'], ['on the limited lead itself', 'a']]) {
+    const c = twoLeads({ ua: [FIVE_HOUR_ROW], ub: [HEALTHY_ROW] }, { paneSignals: [{ lead, paneHit: true }] });
+    await tick(c.deps);
+    assert.deepEqual(eventsOf(c, 'BACKPRESSURE'), [], `a pane hit ${label}`);
+    assert.deepEqual(c.calls.spawnLead, ['c'], label);
+  }
+  // The controls, which also pin that phase 5 hands `detectStorm` BOTH lists. A second limited lead
+  // is a storm by the limit rule, and the pane hit is named after the limited leads...
+  const limitRule = twoLeads({ ua: [FIVE_HOUR_ROW], ub: [FIVE_HOUR_ROW] }, { paneSignals: [{ lead: 'x', paneHit: true }] });
+  await tick(limitRule.deps);
+  assert.deepEqual(oneEvent(limitRule, 'BACKPRESSURE').payload.evidence, [{ lead: 'a' }, { lead: 'b' }, { lead: 'x' }]);
+  // ...and a corroborated pane hit is a storm by the pane rule, with the one limited lead named first.
+  const paneRule = twoLeads({ ua: [FIVE_HOUR_ROW], ub: [HEALTHY_ROW] }, { paneSignals: [{ lead: 'x', paneHit: true, transcriptHit: true }] });
+  await tick(paneRule.deps);
+  assert.deepEqual(oneEvent(paneRule, 'BACKPRESSURE').payload.evidence, [{ lead: 'a' }, { lead: 'x' }]);
+});
+
+test('an org spend cap supersedes a live storm record: written, said and toasted at once, the storm defers to it, and the tick the storm lifts admits nothing', async () => {
+  const { tick } = await load('storm-spend-cap-' + Date.now());
+  // The spend cap outranks a storm, and the storm branch already defers to a foreign record (the
+  // backpressure section above). This is the same precedence, seen from the cap's side. `freeze()`
+  // used to stand down on ANY active record, so while `a` and `b` held a storm, `s` hitting the org cap
+  // wrote no record, said nothing and toasted nobody. On the tick the storm lifted (its leads' tails
+  // ending on the cap too, which is not storm evidence), the storm branch cleared its own record and
+  // admission launched `c` onto a capped org.
+  const SPEND_CAP_RECORD = { active: true, reason: 'org_level_disabled_until', since: NOW, until: null };
+  /** `twoLeads` plus a third spawned lead `s` (session `us`), alive, so nothing here is a revival. */
+  const withS = (TAILS, backpressure) => twoLeads(TAILS, {
+    fleet: { tasks: [...stormRows(), row({ id: 's', status: 'spawned', lead_session_uuid: 'us' })] },
+    alive: new Set(['lead-a', 'lead-b', 'lead-s']),
+    backpressure,
+  });
+  // (a) Our storm record, `a` and `b` on live hits, `s` on the org cap: the cap replaces the record.
+  const storm = { active: true, reason: 'storm', since: NOW - 5 * MIN, until: null };
+  const c = withS({ ua: [FIVE_HOUR_ROW], ub: [FIVE_HOUR_ROW], us: [SPEND_CAP_ROW] }, storm);
+  await tick(c.deps);
+  assert.deepEqual(c.calls.writeBackpressure, [SPEND_CAP_RECORD], 'the cap\'s record, and nothing written over it');
+  assert.deepEqual(c.backpressure(), SPEND_CAP_RECORD);
+  // Said at once, then the storm's re-emit, under a record that is no longer its own, so it dates the tick.
+  assert.deepEqual(eventsOf(c, 'BACKPRESSURE').map((e) => e.payload), [
+    { reason: 'org_level_disabled_until', since: NOW, until: null },
+    STORM_EVENT,
+  ]);
+  assert.equal(c.calls.notify.length, 1, 'toasted at once: the one freeze no machine action lifts');
+  assert.equal(c.calls.clearBackpressure, 0);
+  assert.deepEqual(c.calls.spawnLead, []);
+  assert.equal(c.task('c').status, 'queued');
+  // (b) The tick the storm lifts: `a` and `b` end on the cap as well. The cap's record stands (it is
+  // nobody's to clear inside the tick), admission stays shut, and the freeze is not said again.
+  const lifted = withS({ ua: [SPEND_CAP_ROW], ub: [SPEND_CAP_ROW], us: [SPEND_CAP_ROW] }, c.backpressure());
+  await tick(lifted.deps);
+  assert.equal(lifted.calls.clearBackpressure, 0, 'a storm ending clears no spend-cap record');
+  assert.deepEqual(lifted.calls.spawnLead, [], 'and admits nothing onto a capped org');
+  assert.deepEqual(lifted.calls.writeBackpressure, []);
+  assert.deepEqual(eventsOf(lifted, 'BACKPRESSURE'), [], 'once per freeze');
+  assert.deepEqual(lifted.calls.notify, []);
+  assert.deepEqual(lifted.backpressure(), SPEND_CAP_RECORD);
+  // (c) The control, one reason apart from (a): the same three leads under a SPEND-CAP record. The cap is
+  // not announced again, so what (a) pins is the storm record's case and nothing else.
+  const capped = { active: true, reason: 'org_level_disabled_until', since: NOW - 5 * MIN, until: null };
+  const control = withS({ ua: [FIVE_HOUR_ROW], ub: [FIVE_HOUR_ROW], us: [SPEND_CAP_ROW] }, capped);
+  await tick(control.deps);
+  assert.deepEqual(control.calls.writeBackpressure, []);
+  assert.deepEqual(eventsOf(control, 'BACKPRESSURE').map((e) => e.payload), [STORM_EVENT], 'the storm\'s re-emit alone: the cap is not said twice');
+  assert.deepEqual(control.calls.notify, []);
+  assert.deepEqual(control.backpressure(), capped);
+  assert.deepEqual(control.calls.spawnLead, []);
+});

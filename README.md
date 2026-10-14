@@ -243,6 +243,9 @@ classifies it (`bin/lib/wd/limit-state.mjs`):
   the original seat (`ROTATION_FAILED`).
 - **No open seat** leaves the lead where it is (`ROTATION_UNAVAILABLE`). Every lead's settings
   carry `autoContinueAtUsageLimit: true`, so Claude Code's own auto-continue is the fallback.
+- **Two or more leads limited at once** is a rate-limit storm. The watchdog keeps rotating, but
+  admits no new lead (`BACKPRESSURE`, reason `storm`) until fewer than two leads still hold a live
+  hit. It lifts that freeze itself; `soma thaw` refuses it.
 - **An organisation spend cap** hits every seat at once, so rotating would not help. The watchdog
   freezes admission instead, through `state/backpressure.json` (`BACKPRESSURE`), until you run
   `soma thaw`.
@@ -799,8 +802,13 @@ details.
   in about 90 seconds and lands on `GAVE_UP`. Read the death screen in the `LEAD_DEAD` event.
 - **A tripped budget cannot be cleared by any verb or tool.** `rm "$SOMA_HOME/leads/<id>/BUDGET_TRIPPED"`
   or kill the lead.
-- **Rate-limit storm detection is a stub.** The organisation spend-cap freeze works; a storm freeze
-  cannot occur yet.
+- **A rate-limit storm is announced on every tick it holds.** When two or more leads hold a live
+  usage-limit hit at once, the watchdog freezes admission and lifts the freeze itself, but repeats
+  `BACKPRESSURE` on every tick meanwhile (every 30 s by default). On a fleet with no seats a storm
+  can last until the limits reset: at the default tick, up to about 600 lines in `soma_inbox` for a
+  five-hour window. A weekly (`seven_day`) window can hold a storm, and its per-tick re-emit, for
+  days, and a seat's own monthly cap until the 1st. Storm detection reads transcripts only; the pane
+  half is still a stub.
 - **No stall detector and no teammate monitoring.** `STALLED` and `TEAMMATE_DOWN` have no producer,
   so silence is not health. Use `soma_status` heartbeat age and `soma_transcript`.
 - **`serialize_with` does not exist.** Admission is strict FIFO. Enqueue a second ticket for the same
@@ -828,6 +836,7 @@ details.
 | `soma status` header shows `seat-2 closed until …`, or a `SEAT_CLOSED` event | that seat's usage window closed (`closed_reason` says which) | usually nothing: leads on it rotate (`ROTATED`) or auto-continue at the reset. `unverified` means `CLAUDE_CONFIG_DIR=<dir> claude auth login` |
 | admission stopped after a Claude Code upgrade; `VERSION_GATE` event | the new version is outside `tested_claude` | re-prove the invariants on the new build, widen `tested_claude.max` in `soma.json`, then `soma down` and `soma up` |
 | `backpressure: FROZEN … org_level_disabled_until` | the organisation's spend cap was reached | once the cap is lifted, move or kill leads whose transcript still ends on the cap, then `soma thaw` |
+| `backpressure: FROZEN … storm` | two or more leads hold a live usage-limit hit at once | nothing: the watchdog keeps rotating and lifts the freeze once fewer than two still hold one, at the latest when their resets pass. `soma thaw` refuses it |
 | a promoted session shows an empty fleet | the bus is pinned to the wrong state root | re-run `soma init` from the right shell; check the `SOMA_HOME=` it prints |
 | `soma doctor` says `INCOMPLETE`, never `PASS` | expected: two checks are always unobserved on this build, three from a plain shell | read the `????` rows against [Reading `soma doctor`](#reading-soma-doctor), and confirm those by hand ([RUNBOOK §10](RUNBOOK.md#the-rows-soma-doctor-cannot-take-and-how-to-confirm-them-by-hand)) |
 | every lead shows `0` tokens | the wrong Claude Code config root, so no transcript matches. The budget breaker is welded open | doctor's `claude config root` row; use your wrapper |
