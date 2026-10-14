@@ -128,12 +128,14 @@ export const rotationsWithin = (rotations, now = Date.now()) => (Array.isArray(r
  * long it is believed. Past it, a row that still has no session is treated as dead, as every
  * launching row was for its whole window before the mark. Usually that is a spawner that crashed
  * before recording a session: a lost mark costs one bound of revival latency and never holds a
- * slot. A launch that is only slower than the bound gets the same treatment — a `LEAD_DEAD` and a
- * charged revival attempt every tick until its session appears, `GAVE_UP` after three — and if its
- * session appears between a tick's liveness read and `revive`'s kill, that fresh session is killed
- * and a replacement spawned. Two sessions never run at once: the spawner holds the repo lock across
- * the worktree and the launch, and checks for the session again under it. A literal rather than a
- * sum of the two imports, because the bus imports this module statically and reaches `worktree.mjs`
+ * slot. A launch that is only slower than the bound gets the same treatment: it is revived like any
+ * dead lead, on the backoff `wd/revive.mjs` keeps (`REVIVAL_BACKOFF_MS`), where a first revival is
+ * immediate and each later one waits out its step. A `LEAD_DEAD` and a charged attempt come with
+ * each revival, none on a tick spent waiting, and `GAVE_UP` comes after the third. If its session
+ * appears between a tick's liveness read and `revive`'s kill, that fresh session is killed and a
+ * replacement spawned. Two sessions never run at once: the spawner holds the repo lock across the
+ * worktree and the launch, and checks for the session again under it. A literal rather than a sum
+ * of the two imports, because the bus imports this module statically and reaches `worktree.mjs`
  * only through its optional spawner import; the relation is pinned in `test/fleet.test.mjs` instead.
  */
 export const LAUNCH_GRACE_MS = 30_000 + 120_000 + 60_000;

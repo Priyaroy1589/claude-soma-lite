@@ -20,7 +20,8 @@
  *
  * Phase 1, the limits phase, is newer still and is the account-rotation design's one foothold in
  * the tick: it reads each spawned lead's transcript tail and, on a usage-limit hit, closes the
- * lead's seat and moves the lead to an open one (`limitsPhase`, `rotate`); on the org spend cap it
+ * lead's seat and moves the lead to an open one (`limitsPhase`, `rotate`), and hands phase 5 each
+ * live hit as storm evidence; on the org spend cap it
  * freezes admission through `state/backpressure.json`, whose only lift is `soma thaw`. It types
  * into no pane and holds no lease: BACKPRESSURE reaches the orchestrator by toast and by its next
  * `soma_inbox` drain.
@@ -44,9 +45,9 @@
  *   lead. `checkBudget` is called unconditionally here, and a class that cannot be resolved is
  *   defaulted-and-announced or refused, never skipped.
  * - **Nothing is announced twice.** `drained` needs no quiet window, a tripped lead stays over
- *   cap forever, a given-up row stays `spawned` until the orchestrator folds it — so every
- *   emit here is idempotent against the durable log or against a flag file. An alarm that
- *   fires every 30 s is one an operator mutes, which is the same thing as no alarm.
+ *   cap until a clear grants it more, a given-up row stays `spawned` until the orchestrator folds
+ *   it — so every emit here is idempotent against the durable log or against a flag file. An
+ *   alarm that fires every 30 s is one an operator mutes, which is the same thing as no alarm.
  * - **A degraded reading is loud and local.** One lead whose transcript is mid-rotation must not
  *   cost the other nine their breaker, so per-lead work is wrapped and reported as
  *   WATCHDOG_ERROR against that lead. Reported, not swallowed.
@@ -95,11 +96,12 @@ import * as tmux from './lib/tmux.mjs';
 import { modelDeviation, readDirUsage, readTailRows, readUsage } from './lib/tokens.mjs';
 import { nextAdmission } from './lib/wd/admission.mjs';
 import { MIN_EPOCH_MS, STORM_REASON, clearBackpressure, detectStorm, readBackpressure, writeBackpressure } from './lib/wd/backpressure.mjs';
-import { checkBudget, tripPath, warnPath } from './lib/wd/budget.mjs';
+import { resolveBudgetClass } from './lib/wd/budget-class.mjs';
+import { METERED, checkBudget, grantCount, grantedClass, grantsOf, tripPath, warnPath } from './lib/wd/budget.mjs';
 import { classifyLimit } from './lib/wd/limit-state.mjs';
 import { CAPTURE_TIMEOUT_MS, CENSUS_LINES, takeCensus } from './lib/wd/pane-state.mjs';
 import { reconcile } from './lib/wd/reconcile.mjs';
-import { planRevival } from './lib/wd/revive.mjs';
+import { planRevival, revivalWaitMs } from './lib/wd/revive.mjs';
 // Every rotation event this file writes goes through these builders. `rotationFailed` is
 // consumed by the revert's `revertRotation`; it is imported here so the line is written once and
 // the revert needs no import of its own.
@@ -124,20 +126,6 @@ const TRIP_PCT = 100;
  */
 const DEATH_SCENE_LINES = 12;
 const DEATH_SCENE_CHARS = 800;
-
-/**
- * The harness a lead that has declared nothing is priced at: no class pinned at enqueue, and no
- * HARNESS on its stream or its row. Every lead spends its first minutes like this, before its
- * step-1 report, and it is not announced (`budgetClassOf`, rule 3).
- */
-const DEFAULT_HARNESS = 'H1';
-
-/**
- * The class bound when something was declared and nothing declared can be priced, and the class
- * `HARNESS_DEFAULTED` names when it binds one (`budgetClassOf`, rule 4). The same class H1 reserves,
- * as shipped.
- */
-const DEFAULT_CLASS = 'standard';
 
 /** Floor and fallback for the loop's own cadence, so a bad `tick_ms` cannot spin the process. */
 const MIN_TICK_MS = 1000;
@@ -220,9 +208,10 @@ const PANE_ALARMS = new Set(['blocked_on_prompt', 'dead_shell']);
 /**
  * When an event happened, in the same milliseconds `task.updated` is stamped in.
  *
- * A copy of `bus-tools.stampOf`'s rule, and it has to agree with it: `events.mjs` guarantees a
- * record's `ts` is exactly the numeric prefix of its own id, so a hand-written line with no `ts`
- * can still be placed in time. One that cannot be placed returns null and decides nothing.
+ * A copy of `bus-tools.stampOf`'s rule, and it has to agree with it and with the copy in
+ * `wd/budget-class.mjs`: `events.mjs` guarantees a record's `ts` is exactly the numeric prefix of
+ * its own id, so a hand-written line with no `ts` can still be placed in time. One that cannot be
+ * placed returns null and decides nothing.
  */
 const stampOf = (event) => {
   if (Number.isFinite(event?.ts)) return event.ts;
@@ -247,11 +236,11 @@ function newestOf(rows, types) {
 const NEEDS_INPUT = new Set(['NEEDS_INPUT']);
 /** The three that mean a lead stopped needing anybody. Mirrors `bus-tools.TERMINAL_STATUS`. */
 const TERMINAL_EVENTS = new Set(['COMPLETED', 'ERROR', 'GAVE_UP']);
-/** A lead's own plan of record; the newest one that names a harness prices it (`budgetClassOf`). */
-const HARNESS_EVENTS = new Set(['HARNESS']);
 
-/**
- * The statuses in which a lead holds a live, answerable session — the rows the breaker owns.
+/*
+ * `METERED`, imported from `wd/budget.mjs`: the statuses in which a lead holds a live, answerable
+ * session — the rows the breaker owns. One set, shared with `clearTrip`, so a clear grants an
+ * allowance to exactly the rows this meter judges.
  *
  * **`blocked` is in this set, and its absence is what let a lead run with no token cap, no turn
  * cap and no wall cap while its row and `soma_status` both looked healthy.** The chain, and
@@ -283,12 +272,13 @@ const HARNESS_EVENTS = new Set(['HARNESS']);
  *
  * **Terminal rows are out, deliberately.** A `done`/`failed`/`skipped` lead has reported that it
  * stopped; its transcript is not growing, and `BUDGET_TRIPPED` written against it is a flag only
- * an explicit unlink clears. Their panes do linger — there is no `linger_minutes` reaper on this
- * build — but a finished lead's lingering pane is that reaper's business, and metering every
- * terminal row would grow per-tick I/O with the fleet's whole history, since v1 never removes a
- * task. `queued` rows have no session, and no worktree whose transcripts could be read.
+ * an explicit unlink clears (`clearTrip` refuses those rows: nothing meters them, so there is no
+ * allowance to grant, and nothing re-trips them either). Their panes do linger — there is no
+ * `linger_minutes` reaper on this build — but a finished lead's lingering pane is that reaper's
+ * business, and metering every terminal row would grow per-tick I/O with the fleet's whole
+ * history, since v1 never removes a task. `queued` rows have no session, and no worktree whose
+ * transcripts could be read.
  */
-const METERED = new Set(['spawned', 'blocked']);
 
 /**
  * What the orchestrator stream already says, so nothing is announced twice.
@@ -324,7 +314,22 @@ function orchHistory(deps) {
       revertRefusedAt: NEVER_FRESH,
     };
   }
-  const budget = new Set();
+  // BUDGET is said once per lead SESSION and ALLOWANCE, not once per lead. Spend is the worktree
+  // directory's, so it carries across revivals, and a lead revived `fresh` is a new session with none
+  // of the old context: deduped per lead, it started past 80% of the same budget and was never told.
+  // And a cleared trip grants a new allowance (`budget_grants` on the row), whose own 80% the lead has
+  // not been told about either. So each BUDGET names the session it covers (`session_uuid`, null for
+  // a row with no uuid) and the allowance it judged (`grants`). A BUDGET with no own `grants` was
+  // logged before allowances existed and counts as grants 0. One with no own `session_uuid` at all
+  // was logged before events named a session: it covers every session of its lead, at grants 0 only,
+  // so a lead in flight at the upgrade is not told twice, and a clear still re-arms its note. Maps
+  // and Sets keyed by lead id, never objects (the `constructor` reason above).
+  const budgetSeen = new Map();
+  const budgetEverySession = new Set();
+  const budget = {
+    has: (lead, session, grants) => (grants === 0 && budgetEverySession.has(lead))
+      || budgetSeen.get(lead)?.get(grants)?.has(session) === true,
+  };
   const deviation = new Set();
   const defaulted = new Set();
   const gaveUp = new Set();
@@ -353,7 +358,23 @@ function orchHistory(deps) {
     const lead = typeof e?.lead === 'string' && e.lead !== '' ? e.lead : null;
     const at = stampOf(e);
     switch (e?.type) {
-      case 'BUDGET': if (lead) budget.add(lead); break;
+      case 'BUDGET': {
+        if (!lead) break;
+        const p = e?.payload;
+        if (p === null || typeof p !== 'object' || !Object.hasOwn(p, 'session_uuid')) {
+          budgetEverySession.add(lead);
+          break;
+        }
+        // Read back with the rules `meter` writes them with — `declaredName` for the session,
+        // `grantCount` for the allowance — so a row and its own event can never disagree about
+        // which session, or which allowance, is meant.
+        const grants = Object.hasOwn(p, 'grants') ? grantCount(p.grants) : 0;
+        if (!budgetSeen.has(lead)) budgetSeen.set(lead, new Map());
+        const byGrants = budgetSeen.get(lead);
+        if (!byGrants.has(grants)) byGrants.set(grants, new Set());
+        byGrants.get(grants).add(declaredName(p.session_uuid));
+        break;
+      }
       case 'MODEL_DEVIATION': if (lead) deviation.add(lead); break;
       case 'HARNESS_DEFAULTED': if (lead) defaulted.add(lead); break;
       case 'TURNS_UNMEASURED': if (lead) unmeasured.add(lead); break;
@@ -456,121 +477,30 @@ const reason = (e) => {
   }
 };
 
-/**
- * The `standard` budget class off a config, or null.
- *
- * `Object.hasOwn`, never truthiness and never `in`, for `wd/budget.mjs`'s reason: a class
- * inherited from `Object.prototype` is a class nobody wrote in soma.json, and one resolving to
- * "no caps" is a lead running with no breaker.
- */
-function fallbackClass(cfg) {
-  const budgets = cfg?.budgets;
-  if (budgets === null || typeof budgets !== 'object') return null;
-  return Object.hasOwn(budgets, DEFAULT_CLASS) ? budgets[DEFAULT_CLASS] : null;
-}
-
 /** A name as a row or a payload declares one: a string with something in it, else null. */
 const declaredName = (value) => (typeof value === 'string' && value !== '' ? value : null);
 
 /**
- * The pin on a row as a HARNESS_DEFAULTED payload names it, cut to 32, or null when there is none.
- *
- * Any value but undefined, null and '' is a pin. Both enqueue doors refuse a pin that names no
- * class, so 42 or `{}` reaches a row only through a hand-edited checkpoint or an enqueue that had no
- * class to check it against (soma.json unreadable, or defining none); a class name can also lose
- * its class to a later soma.json edit. Reading one as "nothing declared" priced that lead as H1
- * without a word. A string keeps its spelling; anything else is named by `show`, which names an
- * object by its type and never calls `String()` on it: JSON can carry `{"toString": 1}`, `String()`
- * of that throws, and a throw in `meter` costs the lead its verdict for the tick.
- */
-const pinName = (pin) => (pin === undefined || pin === null || pin === '' ? null : (typeof pin === 'string' ? pin : show(pin)).slice(0, 32));
-
-/**
- * The class soma.json defines under exactly `name`, or null.
- *
- * Own key and record value, never truthiness and never `in`, for `fallbackClass`'s reason:
- * `constructor` resolves through `Object.prototype` to a function nobody wrote in soma.json. The
- * record check is `harness.readBudgets`'s, and it matters more here than in `fallbackClass`. A
- * pinned class that cannot be bound still has the lead's harness behind it, so it is passed over;
- * handed to `checkBudget` instead, it would be refused on every tick, and the lead would go
- * unmetered for as long as the row exists.
- */
-function definedClass(cfg, name) {
-  const budgets = cfg?.budgets;
-  if (name === null || budgets === null || typeof budgets !== 'object' || Array.isArray(budgets) || !Object.hasOwn(budgets, name)) return null;
-  const cls = budgets[name];
-  return cls !== null && typeof cls === 'object' && !Array.isArray(cls) ? cls : null;
-}
-
-/**
  * The budget class that prices `task`, as `{cls, defaulted}`: `defaulted` is the HARNESS_DEFAULTED
  * payload when the fallback class was bound or a pin was passed over, and null when there is
- * nothing to announce.
+ * nothing to announce. `meter` says it once per lead, off the durable log.
  *
- * The first rule that prices the lead wins:
+ * The rule is `resolveBudgetClass` in `wd/budget-class.mjs`, whose doc has its four steps: a class
+ * pinned at enqueue, then the newest HARNESS on the lead's OWN stream, then the row's harness, then
+ * H1, with the fallback class when something was declared and nothing declared prices. It lives
+ * there because `soma_status` calls it too, so the class an orchestrator is shown is the class
+ * bound here (issue #59). This function only hands it this file's reads.
  *
- * 1. **The class the operator pinned at enqueue**, when soma.json defines it. Only a string pin
- *    can name a class: `Object.hasOwn(budgets, 42)` would find a class named "42", and `['babysit']`
- *    would find babysit. Read from `budget_override`, which only `fleet.enqueue` writes, and never
- *    from `budget_class`. The inbox fold keeps `budget_class` following the lead's newest harness,
- *    so on a row nobody pinned it is the harness's class restated. On a row folded before
- *    `budget_override` existed it is the class of the FIRST report: after the documented H1 -> H4
- *    degrade, a resolver reading it as a pin prices a review lead at standard.
- * 2. **The harness the lead declared**: the newest HARNESS on its OWN stream that names one, else
- *    the row's `harness`. The stream comes first because the row learns the harness only when the
- *    orchestrator drains its inbox, and until that drain this file priced every lead as H1: an
- *    iterate lead tripped at standard's cap with its reservation already on disk. A stream that
- *    cannot be read leaves the row's harness standing and is not reported here. For a `spawned`
- *    lead, phase 4 reads the same stream on the same tick and reports the failure. For a `blocked`
- *    lead nothing does: it is priced at its row's harness until a later tick reads the stream.
- * 3. **Nothing declared at all**: H1's class, and nothing is announced. Every lead spends its first
- *    minutes here, before its step-1 HARNESS, and an event on every spawn is an alarm an operator
- *    learns to mute.
- * 4. **Something declared, and nothing declared can be priced**: a harness the registry does not
- *    carry or soma.json cannot price, a pin no class can be bound from with no priceable harness
- *    behind it, or H1 itself unpriceable. The fallback class is bound, and the payload names what
- *    was declared with `budget_class: 'standard'`, each name cut to 32 characters because one event
- *    is one atomic append.
- *
- * A pin no class can be bound from (a string soma.json does not define, or not a string at all) on a
- * lead whose harness prices is passed over, and said: the payload carries `budget_class: null`,
- * because no fallback was bound and the lead's own harness prices it. An operator who pinned
- * babysit and is billed at review's cap is exactly the failure this resolver ends.
- * Both enqueue doors refuse such a class (`bus-tools.intake`); one still reaches a row when soma.json
- * could not be read at enqueue, by being removed from soma.json after it, or through a hand-edited
- * checkpoint. A pin already announced under rule 4 is not announced again when a harness later
- * prices the lead: `HARNESS_DEFAULTED` is said once per lead.
- *
- * `cls` can still be null (rule 4 with no `standard` defined either), and the caller hands it to
+ * `budgetClassFor` answers with caps alone, so it goes over as a lookup that names nothing. This
+ * file never reads the class's name, and the resolver reports none rather than guess one. `cls`
+ * can still be null (rule 4 with no `standard` defined either), and the caller hands it to
  * `checkBudget` regardless, which refuses it out loud.
  */
 function budgetClassOf(deps, cfg, task) {
-  const pinned = definedClass(cfg, declaredName(task.budget_override));
-  if (pinned !== null) return { cls: pinned, defaulted: null };
-  const override = pinName(task.budget_override);
-
-  let harness = declaredName(task.harness);
-  try {
-    const rows = deps.leadEvents(task.id);
-    const newest = newestOf((Array.isArray(rows) ? rows : []).filter((e) => declaredName(e?.payload?.harness_id) !== null), HARNESS_EVENTS);
-    if (newest !== null) harness = newest.event.payload.harness_id;
-  } catch {
-    // The row's harness stands; rule 2 above says why this is not reported.
-  }
-
-  // Rules 2 and 3. A pin that could not be bound is a declaration too, so a row carrying one never
-  // reaches H1 silently. With a pin present here, `harness` is not null, and the pin it was priced
-  // over is said with a null class.
-  if (harness !== null || override === null) {
-    const cls = deps.budgetClassFor(harness ?? DEFAULT_HARNESS);
-    if (cls !== null && cls !== undefined) {
-      return { cls, defaulted: override === null ? null : { harness: harness.slice(0, 32), budget_override: override, budget_class: null } };
-    }
-  }
-  return {
-    cls: fallbackClass(cfg),
-    defaulted: { harness: harness === null ? null : harness.slice(0, 32), budget_override: override, budget_class: DEFAULT_CLASS },
-  };
+  return resolveBudgetClass(task, (id) => deps.leadEvents(id), cfg, (harness) => {
+    const cls = deps.budgetClassFor(harness);
+    return cls === null || cls === undefined ? null : { name: null, cls };
+  });
 }
 
 /**
@@ -756,10 +686,11 @@ export async function tick(deps) {
   // was written nowhere and displayed from a file nobody wrote.
   //
   // Two writers share the file: this branch (`STORM_REASON`) and the limits phase's spend cap
-  // (`reason: 'org_level_disabled_until'`). One rule keeps them apart: a branch writes only its
-  // own reason and clears only its own reason. So a storm ending cannot thaw a spend-cap freeze,
-  // and a storm cannot relabel one — the foreign record and its `since` stand. The spend-cap
-  // record is lifted by a human, through `soma thaw`; nothing in this tick clears it.
+  // (`reason: 'org_level_disabled_until'`). A branch writes only its own reason and clears only
+  // its own reason, and the spend cap outranks a storm. So a storm ending cannot thaw a spend-cap
+  // freeze, and a storm cannot relabel one (the foreign record and its `since` stand), while a
+  // spend-cap hit writes over a storm's record (`freeze`). The spend-cap record is lifted by a
+  // human, through `soma thaw`; nothing in this tick clears it.
   //
   // Deliberately re-emitted on every frozen tick and deliberately silent on the desktop. A storm's
   // END has no event, so the repetition is what records the freeze's duration for the digest; and
@@ -771,9 +702,10 @@ export async function tick(deps) {
   // date the tick rather than the storm. Pinned as such in `test/watchdog.tick.test.mjs`. Carrying
   // the foreign `since` instead would date a storm from a spend cap's start, which is a different
   // freeze; the alternative — remembering a storm's start across ticks — needs state this tick does
-  // not have. Unreachable today (`paneSignals` is a stub) and the limits phase owns the branch
-  // that makes it reachable, so the choice is left here where its cost is written down.
-  const storm = detectStorm(deps.paneSignals());
+  // not have. Reachable, if rare, now that the limits phase hands this phase its evidence: one
+  // lead's spend-cap row and two other leads' live limit hits can stand in the same tick. So the
+  // choice is left here, where its cost is written down.
+  const storm = detectStorm(deps.paneSignals(), limits.limited);
   const before = deps.readBackpressure();
   if (before.unreadable === true && !history.backpressureUnreadable) {
     // The third state, said once. Read as "not frozen" — the tolerant direction, and the bus's —
@@ -852,11 +784,11 @@ export async function tick(deps) {
 }
 
 /**
- * Bring one dead lead back, or give up on it. Returns whether a session was launched.
+ * Bring one dead lead back, wait, or give up on it. Returns whether a session was launched.
  *
  * Ordering is the whole of the kill-before-respawn rule and every step of it is forced:
  *
- *   capture → LEAD_DEAD → attempts → killSession → respawn
+ *   giveup? → backoff → seat → capture → LEAD_DEAD → attempts + revived_at → killSession → respawn
  *
  * The kill destroys the pane, so the final screen must be read BEFORE it (`logs/<id>.log` is a
  * real file written by `pipe-pane` and survives; the live screen does not). The kill must come
@@ -865,7 +797,8 @@ export async function tick(deps) {
  * silently reusing a session name makes the pane, the log target, the heartbeat and the
  * liveness read ambiguous at once — and `remain-on-exit` means it exists for a *dead* lead too,
  * so without this kill every revival respawn is blocked permanently. `attempts` is stamped
- * before the launch so a launch that throws still counts toward the three.
+ * before the launch so a launch that throws still counts toward the three, and `revived_at` is
+ * stamped in the same transaction, so a launch that throws still times the next attempt.
  */
 function revive(deps, cfg, task, history, now, paneState = null) {
   const id = task.id;
@@ -897,6 +830,18 @@ function revive(deps, cfg, task, history, now, paneState = null) {
     }
     return false;
   }
+
+  // The backoff (`wd/revive.mjs`): the second revival comes no sooner than 15 minutes after the
+  // first and the third no sooner than an hour after the second, timed from the row's `revived_at`
+  // (a stamp in the future holds nothing). Without it every 30 s tick could revive, and a lead
+  // dying for a persistent reason gave up in about 90 s, before anyone could look. AFTER the giveup
+  // branch, so GAVE_UP is never held, and BEFORE anything is spent: while the lead waits, nothing
+  // is captured, logged, charged or killed, so its dead pane stays up as the death screen
+  // `soma peek` shows, and the LEAD_DEAD that reads it comes at the relaunch. The row stays
+  // `spawned` and keeps its slot, and the false hands this tick's one launch back to admission. A
+  // stamp `revivalWaitMs` cannot read throws here, before the seat pick, and costs the lead the
+  // same nothing.
+  if (revivalWaitMs(task, now) > 0) return false;
 
   // Where the relaunch will go, decided BEFORE anything is spent. Onto an open seat, like every
   // launch (design §4); with every seat closed the row's OWN seat is used, closed as it is — the
@@ -938,13 +883,19 @@ function revive(deps, cfg, task, history, now, paneState = null) {
     lead: id,
   });
 
+  // ONE transaction for the charge and the stamp. Two would leave a window in which the attempt is
+  // charged with no stamp beside it, and a revival read in it would go at once.
   const attempt = attempts + 1;
   deps.updateFleet((live) => {
     const r = (Array.isArray(live?.tasks) ? live.tasks : []).find((x) => x?.id === id);
-    if (r) r.attempts = attempt;
+    if (r) {
+      r.attempts = attempt;
+      r.revived_at = now;
+    }
     return true;
   });
   task.attempts = attempt;
+  task.revived_at = now;
 
   deps.killSession(sessionName(id));
 
@@ -1189,7 +1140,13 @@ function meter(deps, cfg, task, history, now) {
   if (defaulted !== null && !history.defaulted.has(task.id)) {
     deps.appendEvent(ORCH, { type: 'HARNESS_DEFAULTED', payload: defaulted, lead: task.id });
   }
-  const caps = { tokens_cap: cls?.tokens_cap ?? null, turn_cap: cls?.turn_cap ?? null, wall_ms: cls?.wall_ms ?? null };
+  // The allowance: every cap the class carries, times 1 + the clears granted on this row
+  // (`wd/budget.clearTrip`, behind `soma clear-trip` and `soma_clear_trip`). Read off the tick's
+  // snapshot, so the trip write below re-checks it on the live row. Garbage reads as 0, the strict
+  // direction, and a class `grantedClass` cannot price passes through to `checkBudget`'s refusal.
+  const grants = grantsOf(task);
+  const allowance = grantedClass(cls, grants);
+  const caps = { tokens_cap: allowance?.tokens_cap ?? null, turn_cap: allowance?.turn_cap ?? null, wall_ms: allowance?.wall_ms ?? null };
 
   // `ownSession` returning null has TWO causes and they are not the same subject, which is how
   // one silent 0 came to stand for both. A row WITH a uuid whose session is not in the
@@ -1220,28 +1177,53 @@ function meter(deps, cfg, task, history, now) {
   // to whichever lead started most recently and would trip a one-minute-old lead because a
   // sibling started nine hours ago. It is deliberately NOT reset by a revival: the wall cap asks
   // how long the operator has been paying for this task.
-  const verdict = checkBudget(usage, cls, { now, startedAt: startedAtOf(deps, task, now) });
+  const verdict = checkBudget(usage, allowance, { now, startedAt: startedAtOf(deps, task, now) });
+
+  // The session this verdict is for, and the one every BUDGET below names: the row's own uuid, or
+  // null for a row with none. The 80% note is deduped per session and allowance (`orchHistory`), so
+  // this is read after phase 2, off the row a fresh revival has just written its new uuid onto.
+  const session = declaredName(task.lead_session_uuid);
 
   if (verdict === 'trip') {
     // Presence is the whole protocol for `BUDGET_TRIPPED`, so the flag file is also the
-    // dedupe. A tripped lead stays over its cap forever; unguarded, this toasts every 30 s
-    // for as long as the row exists, which is how a real alarm becomes one people mute.
+    // dedupe. A tripped lead stays over its cap until a clear grants it more; unguarded, this
+    // toasts every 30 s for as long as the row exists, which is how a real alarm becomes one
+    // people mute.
+    //
+    // The write goes INSIDE a fleet transaction, and only while the live row still has the grants
+    // this verdict used. The snapshot is the tick's start, and phases 0-2 can take seconds: a clear
+    // that lands in that window removes the flag and raises `budget_grants`, and judged on the old
+    // allowance this verdict is still 'trip'. Written unguarded, it would undo the clear with a
+    // second BUDGET 100 and a second toast. `clearTrip` holds the same lock, so the two cannot
+    // interleave; on a mismatch nothing is written this tick, and the next one judges the new
+    // allowance. The BUDGET and the toast follow only a write that happened.
     if (!deps.tripped(task.id)) {
-      deps.tripBudget(task.id);
-      deps.appendEvent(ORCH, { type: 'BUDGET', payload: { pct: TRIP_PCT, ...usage, ...caps }, lead: task.id });
-      deps.notify('soma', `${task.id} budget tripped: it can report but not act`);
+      const wrote = deps.updateFleet((live) => {
+        const r = (Array.isArray(live?.tasks) ? live.tasks : []).find((x) => x?.id === task.id);
+        if (!r || grantsOf(r) !== grants) return false;
+        deps.tripBudget(task.id);
+        return true;
+      });
+      if (wrote === true) {
+        deps.appendEvent(ORCH, { type: 'BUDGET', payload: { pct: TRIP_PCT, ...usage, ...caps, grants, session_uuid: session }, lead: task.id });
+        deps.notify('soma', `${task.id} budget tripped: it can report but not act`);
+      }
     }
-  } else if (verdict === 'warn' && !history.budget.has(task.id)) {
+  } else if (verdict === 'warn' && !history.budget.has(task.id, session, grants)) {
     // No toast: `prompts/orchestrator.md` says a BUDGET at 80 % is usually nothing to do, and
-    // the once-per-lead dedupe comes off the durable log. `BUDGET_WARNED` is not a dedupe: the
-    // BUDGET event lands on the orchestrator's stream, which the lead never reads, so this flag is
-    // the lead's copy — the PreToolUse gate hands the lead a note on its next allowed tool call
-    // and renames the flag to `.delivered`. The flag goes FIRST because the logged BUDGET is the
-    // dedupe: a write that throws here logs nothing, the throw becomes this lead's WATCHDOG_ERROR,
-    // and the next tick tries both again. Logged first, a failed write would be deduped away and
-    // the lead never told.
+    // the once-per-session dedupe comes off the durable log. Once per SESSION, not per lead: the
+    // spend is the directory's and carries across a revival, so a lead revived `fresh` (a new
+    // uuid, none of the old context) starts past 80% and is told again, on the tick it relaunches,
+    // while a `resume` keeps its uuid and the note it already had. And once per ALLOWANCE: a
+    // cleared trip is a new allowance with an 80% of its own, so the payload's `grants` is part of
+    // the key. `BUDGET_WARNED` is not a dedupe: the BUDGET event lands on the orchestrator's
+    // stream, which the lead never reads, so this flag is the lead's copy — the PreToolUse gate
+    // hands the lead a note on its next allowed tool call and renames the flag to `.delivered`.
+    // The flag goes FIRST because the logged BUDGET is the dedupe: a write that throws here logs
+    // nothing, the throw becomes this lead's WATCHDOG_ERROR, and the next tick tries both again.
+    // Logged first, a failed write would be deduped away and the lead never told.
     deps.warnBudget(task.id);
-    deps.appendEvent(ORCH, { type: 'BUDGET', payload: { pct: WARN_PCT, ...usage, ...caps }, lead: task.id });
+    deps.appendEvent(ORCH, { type: 'BUDGET', payload: { pct: WARN_PCT, ...usage, ...caps, grants, session_uuid: session }, lead: task.id });
   }
 
   // Deviation is judged on the LEAD's own session, never the directory's model union: nothing
@@ -1498,11 +1480,16 @@ const seatsConfigured = (cfg) => cfg?.seats != null && (!Array.isArray(cfg.seats
  * refusing a mis-shaped event — each costs one lead its rotation this tick, not the other nine
  * theirs. Returns whether a session was launched (a rotation is a launch). Whether admission is
  * frozen is NOT returned: phase 5 reads the FILE, which is the one switch `soma status` also reads.
+ * What IS returned beside `launched` is phase 5's storm evidence, `limited`: one `{lead}` per row
+ * whose hit passed the stale-row guard and is still LIVE (`resetsAt > now`; a reset at exactly
+ * `now` is over). A hit is collected BEFORE the close, because a pool that cannot be written does
+ * not un-happen a limit hit.
  * `fail` is the tick's `fail(where, e, lead)` closure, threaded here so the revert's refusals
  * (`where: 'revert'`) are said through the one WATCHDOG_ERROR builder and not a literal.
  */
 function limitsPhase(deps, cfg, tasks, history, now, census, fail) {
   let didLaunch = false;
+  const limited = [];
   for (const t of tasks) {
     if (t?.status !== 'spawned') continue;
     try {
@@ -1521,6 +1508,7 @@ function limitsPhase(deps, cfg, tasks, history, now, census, fail) {
         // the one place seconds become milliseconds). Refused by name rather than compared as NaN,
         // which `close()` would floor to five minutes and silently call a closure.
         const resetsAt = reqNum('tick: classifyLimit verdict.resetsAt', verdict.resetsAt);
+        if (resetsAt > now) limited.push({ lead: t.id });   // storm evidence, before the close (doc above)
         const closeReason = kind === 'seat_cap' ? 'seat_cap' : verdict.rateLimitType;
         closeSeatOf(deps, cfg, t, resetsAt, closeReason, now);
         if (!didLaunch && rotate(t, { deps, cfg, history, now, verdict, pane })) didLaunch = true;
@@ -1552,7 +1540,7 @@ function limitsPhase(deps, cfg, tasks, history, now, census, fail) {
       deps.appendEvent(ORCH, { type: 'WATCHDOG_ERROR', payload: { where: 'limits', error: reason(e) }, lead: null });
     }
   }
-  return { launched: didLaunch };
+  return { launched: didLaunch, limited };
 }
 
 /**
@@ -1800,15 +1788,19 @@ function rotate(task, { deps, cfg, history, now, verdict, pane }) {
  * (`clearBackpressure`), which is a human's act — and BACKPRESSURE is URGENT in the bus, so a
  * repeat every 30 s for the days a monthly cap lasts would be a wake every 30 s for days. It
  * reaches the orchestrator by this toast and by its next `soma_inbox` drain; the watchdog types
- * into no pane. Already-active is read off the FILE, so a freeze written by an earlier tick, or
- * by hand, is not re-announced — and an active record of ANY reason stands: a storm's record is
- * the storm branch's to clear when the storm ends, and the cap row is re-read next tick. `until`
+ * into no pane. Already-active is read off the FILE, so a spend-cap freeze written by an earlier
+ * tick, or by hand, stands and is not re-announced: once per freeze. So does any active record
+ * but a storm's. A STORM record does not stand, because the spend cap outranks a storm: the org
+ * cap is the alarm only a human can act on, and a storm can hold for hours. The cap replaces the
+ * storm's record and is said and toasted at once, and the storm branch, finding a foreign record,
+ * neither writes over it nor clears it. `until`
  * is null: the org cap carries no reset time (9 of 9 real rows), and `until` is descriptive in
  * any case — nothing expires a freeze by its own clock. Through `writeBackpressure`, which refuses
  * a seconds stamp, and the `backpressure` builder, which pins the payload.
  */
 function freeze(deps, verdict, now) {
-  if (deps.readBackpressure()?.active === true) return;
+  const rec = deps.readBackpressure();
+  if (rec?.active === true && rec.reason !== STORM_REASON) return;
   const state = { active: true, reason: verdict.rateLimitType, since: now, until: null };
   deps.writeBackpressure(state);
   deps.appendEvent(ORCH, backpressure({ reason: state.reason, since: state.since, until: state.until }));
@@ -2111,17 +2103,20 @@ function versionGate() {
 }
 
 /**
- * Rate-limit evidence per lead — **a documented stub, and the one duty this tick cannot yet do.**
+ * Pane rate-limit evidence per lead — **a documented stub: the PANE half of storm detection.**
  *
- * `detectStorm` needs `{lead, paneHit, transcriptHit}` per live lead, which means matching real
+ * `detectStorm`'s pane list is `{lead, paneHit, transcriptHit}` per live lead, which means matching real
  * strings in a real pane and a real transcript. Those strings are not established anywhere on
  * this build, and inventing them would be worse than returning nothing: `backpressure.mjs`'s
  * whole asymmetry is that a missed storm costs some retried requests while a FALSE freeze stalls
  * all ten leads and every queued task behind them. A pattern nobody measured is a false-freeze
  * generator.
  *
- * So STORM detection is inert in production until the scraper is built against measured strings,
- * and it is inert *visibly*: this function is named, commented and returns `[]`.
+ * So the PANE half is inert in production until the scraper is built against measured strings,
+ * and it is inert *visibly*: this function is named, commented and returns `[]`. Storm detection
+ * itself is live through the limits phase: `detectStorm`'s second list is `limitsPhase`'s
+ * `limited`, the spawned leads whose own transcripts end on a live usage-limit hit, and two of
+ * those freeze admission while this stub returns `[]`.
  *
  * What is NOT missing any more — and an earlier version of this comment denied it was missing at
  * all — is the layer downstream: a freeze is a FILE. The tick's backpressure phase writes
@@ -2129,8 +2124,8 @@ function versionGate() {
  * fleet lock), `soma_status` and `soma status` render it three-state, admission obeys the file, and
  * `soma thaw` lifts a spend-cap record — which is how the limits phase's spend-cap freeze holds the
  * queue with no scraper at all. Measured: `detectStorm([])` → `{"frozen":false,"evidence":[]}`, so
- * with this stub the storm branch never writes; the spend-cap writer does not need it. Whoever
- * builds the scraper builds ONLY the scraper.
+ * this stub's empty list adds nothing: the storm branch freezes on the limits phase's list alone,
+ * and the spend-cap writer needs neither. Whoever builds the scraper builds ONLY the pane half.
  */
 const paneSignals = () => [];
 

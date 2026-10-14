@@ -1,9 +1,9 @@
 import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { DEFAULTS } from '../bin/lib/config.mjs';
 
 /**
@@ -229,6 +229,70 @@ test('planRevival reads zero_tail_rows without letting it move the verdict', asy
   assert.throws(() => planRevival({ attempts: 0 }, { zero_tail_rows: 3 }, cfg), /live_context is missing/);
 });
 
+// The backoff between revivals. Without it every 30 s tick could revive, so a lead that dies
+// for a persistent reason spent its three attempts in about 90 s, before anyone could read the
+// death screen. `revivalWaitMs` is the ms still to wait, measured from the row's `revived_at`.
+const RW_NOW = 1_352_844_800_000;
+const RW_MIN = 60_000;
+
+test('revivalWaitMs: the first revival is immediate, the second waits 15 minutes and the third an hour, from revived_at', async () => {
+  const { revivalWaitMs, REVIVAL_BACKOFF_MS } = await import('../bin/lib/wd/revive.mjs?backoff-' + Date.now());
+  // The schedule, one entry per attempt already spent, and nobody's to edit at run time.
+  assert.deepEqual(REVIVAL_BACKOFF_MS, [0, 15 * RW_MIN, 60 * RW_MIN]);
+  assert.equal(Object.isFrozen(REVIVAL_BACKOFF_MS), true);
+  // The first revival waits for nothing, a stamp included.
+  assert.equal(revivalWaitMs({ attempts: 0 }, RW_NOW), 0);
+  assert.equal(revivalWaitMs({}, RW_NOW), 0);
+  assert.equal(revivalWaitMs({ attempts: 0, revived_at: RW_NOW - 1 }, RW_NOW), 0);
+  // The second: 15 minutes after the first, to the millisecond.
+  assert.equal(revivalWaitMs({ attempts: 1, revived_at: RW_NOW - RW_MIN }, RW_NOW), 14 * RW_MIN);
+  assert.equal(revivalWaitMs({ attempts: 1, revived_at: RW_NOW - 15 * RW_MIN + 1 }, RW_NOW), 1);
+  assert.equal(revivalWaitMs({ attempts: 1, revived_at: RW_NOW - 15 * RW_MIN }, RW_NOW), 0);
+  assert.equal(revivalWaitMs({ attempts: 1, revived_at: RW_NOW - 9 * 60 * RW_MIN }, RW_NOW), 0);
+  // The third: an hour after the second, so 15 minutes is not enough.
+  assert.equal(revivalWaitMs({ attempts: 2, revived_at: RW_NOW - 15 * RW_MIN }, RW_NOW), 45 * RW_MIN);
+  assert.equal(revivalWaitMs({ attempts: 2, revived_at: RW_NOW - 60 * RW_MIN + 1 }, RW_NOW), 1);
+  assert.equal(revivalWaitMs({ attempts: 2, revived_at: RW_NOW - 60 * RW_MIN }, RW_NOW), 0);
+  // Capped at the hour. Past the schedule the step stays an hour and never grows; GAVE_UP itself
+  // is the tick's to decide, before this is asked, and it is not delayed.
+  assert.equal(revivalWaitMs({ attempts: 3, revived_at: RW_NOW - RW_MIN }, RW_NOW), 59 * RW_MIN);
+  assert.equal(revivalWaitMs({ attempts: 7, revived_at: RW_NOW - RW_MIN }, RW_NOW), 59 * RW_MIN);
+  // A hand-edited numeric string is honoured, as `attempts` is everywhere in this module.
+  assert.equal(revivalWaitMs({ attempts: '1', revived_at: String(RW_NOW - RW_MIN) }, RW_NOW), 14 * RW_MIN);
+});
+
+test('revivalWaitMs: an absent revived_at is no wait, and one that is not a time is refused by name', async () => {
+  const { revivalWaitMs } = await import('../bin/lib/wd/revive.mjs?backoff-shape-' + Date.now());
+  // A row revived before the stamp existed carries attempts and no `revived_at`. It is not held:
+  // the revival it gets stamps the row, so the leniency costs at most one early revival.
+  assert.equal(revivalWaitMs({ attempts: 2 }, RW_NOW), 0);
+  assert.equal(revivalWaitMs({ attempts: 2, revived_at: null }, RW_NOW), 0);
+  // Present and unreadable is a hand edit or a torn write. Read as "no stamp" it would revive at
+  // once; read as 0 (the epoch) it would too. Neither is the row's history, so it is named.
+  for (const bad of ['soon', '', -1, Number.NaN, Number.POSITIVE_INFINITY, {}, [], true]) {
+    assert.throws(() => revivalWaitMs({ attempts: 1, revived_at: bad }, RW_NOW), /revivalWaitMs: task\.revived_at must be a non-negative finite number/, String(bad));
+  }
+  // Refused even when no wait is owed, so a bad stamp is reported on the first tick it is read.
+  assert.throws(() => revivalWaitMs({ attempts: 0, revived_at: 'soon' }, RW_NOW), /task\.revived_at/);
+  assert.throws(() => revivalWaitMs({ attempts: 'many', revived_at: RW_NOW }, RW_NOW), /revivalWaitMs: task\.attempts must be a non-negative finite number/);
+  assert.throws(() => revivalWaitMs({ attempts: -1 }, RW_NOW), /task\.attempts/);
+  assert.throws(() => revivalWaitMs({ attempts: 1, revived_at: RW_NOW - RW_MIN }, undefined), /revivalWaitMs: now must be a non-negative finite number/);
+});
+
+test('revivalWaitMs: a stamp in the future holds nothing, so no wait outlasts one step from the tick that reads it', async () => {
+  const { revivalWaitMs } = await import('../bin/lib/wd/revive.mjs?backoff-future-' + Date.now());
+  // The clock stepped back after the last revival, or a hand edit put the stamp ahead. Measured
+  // against it, the wait would be the step plus however far ahead the stamp is: no bound at all, and
+  // spent in silence with the slot held. So it holds nothing: the revival goes now, and stamps the
+  // row again from the corrected clock.
+  assert.equal(revivalWaitMs({ attempts: 1, revived_at: RW_NOW + 1 }, RW_NOW), 0);
+  assert.equal(revivalWaitMs({ attempts: 2, revived_at: RW_NOW + 10 * RW_MIN }, RW_NOW), 0);
+  assert.equal(revivalWaitMs({ attempts: 2, revived_at: RW_NOW + 365 * 24 * 60 * RW_MIN }, RW_NOW), 0);
+  // A stamp at exactly now is the present, not the future: the whole step is owed.
+  assert.equal(revivalWaitMs({ attempts: 1, revived_at: RW_NOW }, RW_NOW), 15 * RW_MIN);
+  assert.equal(revivalWaitMs({ attempts: 2, revived_at: RW_NOW }, RW_NOW), 60 * RW_MIN);
+});
+
 // ─────────────────────────── budget ───────────────────────────
 
 test('checkBudget binds the five real budget classes from DEFAULTS', async () => {
@@ -438,6 +502,205 @@ test('warnPath names <SOMA_HOME>/leads/<id>/BUDGET_WARNED, beside the trip flag,
   }
 });
 
+// ─────────────────────────── clearing a trip ───────────────────────────
+//
+// `rm leads/<id>/BUDGET_TRIPPED` alone does not clear a trip: the lead is still over its cap, so
+// the next tick trips it again, with a second BUDGET 100 and a second toast. A clear therefore
+// grants one more allowance of the lead's class. `budget_grants` on the row counts them, and every
+// cap becomes (1 + grants) times the class's.
+
+/** A throwaway SOMA_HOME for one test, restored afterwards. */
+const tripHome = (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'soma-wd-trip-'));
+  const saved = process.env.SOMA_HOME;
+  t.after(() => {
+    rmSync(home, { recursive: true, force: true });
+    if (saved === undefined) delete process.env.SOMA_HOME;
+    else process.env.SOMA_HOME = saved;
+  });
+  process.env.SOMA_HOME = home;
+  return home;
+};
+
+/**
+ * An in-memory checkpoint with `fleet.updateFleet`'s contract: `mutate` works on a copy, and only
+ * a `mutate` that returns publishes it. `writes()` counts the publications.
+ */
+const fleetStore = (tasks) => {
+  let fleet = { tasks: structuredClone(tasks) };
+  let writes = 0;
+  return {
+    updateFleet: (mutate) => {
+      const live = structuredClone(fleet);
+      const out = mutate(live);
+      fleet = live;
+      writes += 1;
+      return out;
+    },
+    row: (id) => fleet.tasks.find((r) => r.id === id),
+    writes: () => writes,
+  };
+};
+
+/** One of a lead's flag files, written the way the watchdog writes it. */
+const flag = (fp) => {
+  mkdirSync(dirname(fp), { recursive: true });
+  writeFileSync(fp, '1\n');
+};
+
+test('grantsOf reads budget_grants strictly: absent or garbage is 0, never a throw', async () => {
+  const { grantsOf } = await import('../bin/lib/wd/budget.mjs?grants-' + Date.now());
+  assert.equal(grantsOf({}), 0);
+  assert.equal(grantsOf({ budget_grants: 0 }), 0);
+  assert.equal(grantsOf({ budget_grants: 1 }), 1);
+  assert.equal(grantsOf({ budget_grants: 7 }), 7);
+  // Garbage is 0, the strict direction: the meter asks this on every tick, and a throw there is a
+  // WATCHDOG_ERROR and no verdict, which is a lead with no breaker at all.
+  for (const bad of [null, '2', -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53, {}, [], true]) {
+    assert.equal(grantsOf({ budget_grants: bad }), 0, String(bad));
+  }
+  assert.equal(grantsOf(null), 0);
+  assert.equal(grantsOf(undefined), 0);
+  // An own field only: a grant inherited from a prototype is one nobody gave.
+  assert.equal(grantsOf(Object.create({ budget_grants: 3 })), 0);
+});
+
+test('grantedClass scales every cap the class itself carries by 1 + grants, and nothing else', async () => {
+  const { grantedClass, checkBudget } = await import('../bin/lib/wd/budget.mjs?granted-' + Date.now());
+  const cls = { tokens_cap: 1000, turn_cap: 600, wall_ms: 3_600_000, note: 'kept' };
+  assert.equal(grantedClass(cls, 0), cls, 'no grant: the class itself, untouched');
+  assert.deepEqual(grantedClass(cls, 1), { tokens_cap: 2000, turn_cap: 1200, wall_ms: 7_200_000, note: 'kept' });
+  assert.deepEqual(grantedClass(cls, 2), { tokens_cap: 3000, turn_cap: 1800, wall_ms: 10_800_000, note: 'kept' });
+  assert.deepEqual(cls, { tokens_cap: 1000, turn_cap: 600, wall_ms: 3_600_000, note: 'kept' }, 'the class it was handed is never written');
+  // A 0 cap means "not enforced" and stays 0; an absent cap is not invented.
+  assert.deepEqual(grantedClass({ tokens_cap: 500, turn_cap: 0 }, 1), { tokens_cap: 1000, turn_cap: 0 });
+  // A hand-edited numeric string is a cap checkBudget honours, so it is scaled too. Left as it was,
+  // the lead would be judged at its old allowance and tripped again on the next tick.
+  assert.deepEqual(grantedClass({ tokens_cap: '1000' }, 2), { tokens_cap: 3000 });
+  // What a grant does to a verdict: with one grant, 1.5x the class's tokens is 75% of the
+  // allowance, 1.7x is past 80%, and 2x trips.
+  const granted = grantedClass({ tokens_cap: 1000, turn_cap: 0, wall_ms: 0 }, 1);
+  assert.equal(checkBudget({ est_tokens: 1500, turns: 0 }, granted), null);
+  assert.equal(checkBudget({ est_tokens: 1700, turns: 0 }, granted), 'warn');
+  assert.equal(checkBudget({ est_tokens: 2000, turns: 0 }, granted), 'trip');
+});
+
+test('grantedClass hands a class it cannot price through untouched, so checkBudget still refuses it by name', async () => {
+  const { grantedClass, checkBudget } = await import('../bin/lib/wd/budget.mjs?granted-bad-' + Date.now());
+  const usage = { est_tokens: 0, turns: 0 };
+  assert.equal(grantedClass(null, 1), null);
+  assert.throws(() => checkBudget(usage, grantedClass(null, 1)), /budget class must be an object/);
+  // A cap that is not a number is kept as it was, and refused naming the value the class carries.
+  assert.deepEqual(grantedClass({ tokens_cap: 'lots', turn_cap: 10 }, 1), { tokens_cap: 'lots', turn_cap: 20 });
+  assert.throws(() => checkBudget(usage, grantedClass({ tokens_cap: 'lots' }, 1)), /cls\.tokens_cap must be a non-negative finite number, got "lots"/);
+  // A cap on a prototype is not the class's own, so it is not scaled into one.
+  assert.throws(() => checkBudget(usage, grantedClass(Object.create({ tokens_cap: 5 }), 1)), /no enforceable cap/);
+  for (const bad of [-1, 1.5, '1', null, undefined, Number.NaN]) {
+    assert.throws(() => grantedClass({ tokens_cap: 1 }, bad), /grantedClass: grants must be a non-negative safe integer/, String(bad));
+  }
+});
+
+test('clearTrip grants one more allowance: the trip flag goes and budget_grants climbs, in one transaction', async (t) => {
+  tripHome(t);
+  const { clearTrip, tripPath } = await import('../bin/lib/wd/budget.mjs?clear-' + Date.now());
+  const s = fleetStore([{ id: 'cr-1', status: 'spawned' }, { id: 'cr-2', status: 'blocked', budget_grants: 1 }, { id: 'cr-3', status: 'spawned', budget_grants: null }]);
+  flag(tripPath('cr-1'));
+  assert.deepEqual(clearTrip('cr-1', { updateFleet: s.updateFleet }), { lead: 'cr-1', grants: 1 });
+  assert.equal(existsSync(tripPath('cr-1')), false, 'the gate stops denying the moment the flag is gone');
+  assert.equal(s.row('cr-1').budget_grants, 1);
+  assert.equal(s.writes(), 1);
+  // A blocked lead is metered too, and a second clear adds a second allowance.
+  flag(tripPath('cr-2'));
+  assert.deepEqual(clearTrip('cr-2', { updateFleet: s.updateFleet }), { lead: 'cr-2', grants: 2 });
+  assert.equal(s.row('cr-2').budget_grants, 2);
+  // A null count is no count, as a null `attempts` is.
+  flag(tripPath('cr-3'));
+  assert.deepEqual(clearTrip('cr-3', { updateFleet: s.updateFleet }), { lead: 'cr-3', grants: 1 });
+});
+
+test('clearTrip removes an 80% note left from the old allowance, and keeps the delivered record', async (t) => {
+  tripHome(t);
+  const { clearTrip, tripPath, warnPath } = await import('../bin/lib/wd/budget.mjs?clear-warn-' + Date.now());
+  const s = fleetStore([{ id: 'cr-1', status: 'spawned' }]);
+  flag(tripPath('cr-1'));
+  flag(warnPath('cr-1'));                       // it tripped before its next allowed call, so never delivered
+  flag(`${warnPath('cr-1')}.delivered`);        // an earlier note, delivered
+  clearTrip('cr-1', { updateFleet: s.updateFleet });
+  assert.equal(existsSync(warnPath('cr-1')), false, 'a note about the old allowance would reach the lead on its first call under the new one');
+  assert.equal(existsSync(`${warnPath('cr-1')}.delivered`), true);
+  // No note to remove is the ordinary case, not an error.
+  flag(tripPath('cr-1'));
+  assert.deepEqual(clearTrip('cr-1', { updateFleet: s.updateFleet }), { lead: 'cr-1', grants: 2 });
+});
+
+test('clearTrip refuses a lead it cannot clear, saying why, and changes nothing', async (t) => {
+  tripHome(t);
+  const { clearTrip, tripPath } = await import('../bin/lib/wd/budget.mjs?clear-refuse-' + Date.now());
+  const unmetered = ['queued', 'done', 'failed', 'skipped'].map((status, i) => ({ id: `cr-${i + 2}`, status }));
+  const garbage = ['lots', '2', -1, 1.5, {}].map((budget_grants, i) => ({ id: `gr-${i}`, status: 'spawned', budget_grants }));
+  const rows = [{ id: 'cr-1', status: 'spawned' }, ...unmetered, ...garbage];
+  const s = fleetStore(rows);
+  for (const r of [...unmetered, ...garbage]) flag(tripPath(r.id));
+  const clear = (id) => () => clearTrip(id, { updateFleet: s.updateFleet });
+  assert.throws(clear('cr-1'), /cr-1 is not tripped/);
+  assert.throws(clear('nobody'), /no task "nobody"/);
+  for (const r of unmetered) {
+    // Nothing meters these rows, so there is no allowance to grant and nothing to re-judge it.
+    assert.throws(clear(r.id), /metered/, r.status);
+    assert.equal(existsSync(tripPath(r.id)), true, `${r.status}: the flag is left as it was`);
+  }
+  for (const r of garbage) {
+    assert.throws(clear(r.id), /budget_grants/, String(r.budget_grants));
+    assert.equal(existsSync(tripPath(r.id)), true);
+  }
+  assert.equal(s.writes(), 0, 'a refusal publishes nothing');
+  assert.deepEqual(s.row('gr-0'), garbage[0]);
+  // An id that is not a lead id never reaches the store or the disk.
+  for (const bad of ['../x', 'CR-1', '', null]) {
+    assert.throws(() => clearTrip(bad, { updateFleet: s.updateFleet }), /legal task id/, String(bad));
+  }
+  assert.throws(() => clearTrip('cr-2', {}), /clearTrip: updateFleet/);
+  assert.equal(s.writes(), 0);
+});
+
+test('the metered set has one spelling: the meter and clearTrip share budget.mjs\'s, and bus-tools\' copy equals it', async () => {
+  // The watchdog imports `METERED` from budget.mjs, so the rows it meters and the rows `clearTrip`
+  // grants an allowance to cannot drift. `bus-tools` imports nothing, so it keeps a copy for
+  // `soma_status`'s spend column, and this is what holds the copy to the original.
+  const { METERED } = await import('../bin/lib/wd/budget.mjs?metered-' + Date.now());
+  const { METERED_STATES } = await import('../bin/lib/bus-tools.mjs?metered-' + Date.now());
+  assert.ok(METERED instanceof Set && METERED_STATES instanceof Set);
+  assert.deepEqual([...METERED_STATES].sort(), [...METERED].sort());
+  assert.deepEqual([...METERED].sort(), ['blocked', 'spawned'], 'a blocked lead keeps its session and its team keeps spending');
+  const src = readFileSync(new URL('../bin/soma-watchdog.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(src, /const METERED\s*=/, 'the watchdog meters with the imported set, not a copy of its own');
+});
+
+test('a clear whose flag cannot be removed publishes nothing, and neither does a lock that cannot be taken', async (t) => {
+  tripHome(t);
+  const { clearTrip, tripPath, warnPath } = await import('../bin/lib/wd/budget.mjs?clear-fail-' + Date.now());
+  const s = fleetStore([{ id: 'cr-1', status: 'spawned' }]);
+  flag(tripPath('cr-1'));
+  const eacces = (fp) => { throw Object.assign(new Error(`EACCES: permission denied, unlink '${fp}'`), { code: 'EACCES' }); };
+  const failing = (which) => (fp) => (fp === which ? eacces(fp) : unlinkSync(fp));
+  // The trip flag will not go: the clear fails, and no grant is published without it.
+  assert.throws(() => clearTrip('cr-1', { updateFleet: s.updateFleet, unlink: failing(tripPath('cr-1')) }), /EACCES/);
+  assert.equal(s.writes(), 0);
+  assert.equal(s.row('cr-1').budget_grants, undefined);
+  // The old 80% note will not go. It is removed BEFORE the trip, so the lead stays tripped. Freed
+  // with no grant beside it, the next tick would trip it again on its old allowance.
+  flag(warnPath('cr-1'));
+  assert.throws(() => clearTrip('cr-1', { updateFleet: s.updateFleet, unlink: failing(warnPath('cr-1')) }), /EACCES/);
+  assert.equal(existsSync(tripPath('cr-1')), true, 'still tripped');
+  assert.equal(s.writes(), 0);
+  // The unlinks happen INSIDE the transaction: a store whose lock cannot be taken never runs the
+  // mutation, so nothing is removed.
+  const locked = () => { throw new Error('fleet.lock: still held by pid 7 — gave up after 5000ms'); };
+  assert.throws(() => clearTrip('cr-1', { updateFleet: locked }), /fleet\.lock/);
+  assert.equal(existsSync(tripPath('cr-1')), true);
+  assert.equal(existsSync(warnPath('cr-1')), true);
+});
+
 // ─────────────────────────── backpressure ───────────────────────────
 
 test('detectStorm needs two DISTINCT leads, not two signals from one', async () => {
@@ -512,6 +775,170 @@ test('detectStorm fails toward not-freezing on unusable input', async () => {
   // `signals` is an ARRAY; any other container is not evidence. Without this the array
   // check is indistinguishable from the catch above, which iterates a Set quite happily.
   assert.deepEqual(detectStorm(new Set([{ lead: 'a', paneHit: true }, { lead: 'b', paneHit: true }])), { frozen: false, evidence: [] });
+});
+
+// The second list (issue #10). The pane rule above is the design's, and in production it never
+// fires: `paneSignals` is a documented stub. A usage-limit hit does leave a line on the pane
+// (`You've hit your <limit name>`, above an idle composer), but the account-rotation design calls
+// that line corroboration and the transcript row the reliable signal, and no scraper pattern has
+// been built or measured against it. What IS measured, and machine-written, is Claude Code's
+// synthetic `rate_limit` row at the end of the limited lead's own transcript, which the limits
+// phase already reads through `classifyLimit`. So the tick hands `detectStorm` a second list, one
+// `{lead}` per lead whose own tail ends on a LIVE hit (`test/watchdog.tick.test.mjs` pins which
+// hits are live), and it is a separate rule with its own quorum: STORM_MIN_LEADS distinct leads.
+// The two rules never corroborate each other.
+
+/** Two pane-only hits in two distinct leads: a freeze by the pane rule alone. */
+const PANE_PAIR = () => [{ lead: 'x', paneHit: true }, { lead: 'y', paneHit: true }];
+/** No storm and no evidence: the one answer every refusal below must give. */
+const CALM = { frozen: false, evidence: [] };
+
+test('detectStorm freezes on STORM_MIN_LEADS distinct leads whose own transcripts end on a live limit hit, with no pane evidence at all', async () => {
+  const { STORM_MIN_LEADS, detectStorm } = await import('../bin/lib/wd/backpressure.mjs?limited-' + Date.now());
+  // A fixed constant, exported so there is one spelling of the number: an operator decision, not a
+  // config key.
+  assert.equal(STORM_MIN_LEADS, 2);
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }, { lead: 'b' }]), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] });
+  // One lead on its limit is that seat's limit, and rotation is its remedy. A freeze stalls every
+  // lead and every queued task behind them, so one witness is never a storm.
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }]), CALM);
+  // Two rows naming one lead are one lead: "distinct" is the dedup.
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }, { lead: 'a' }]), CALM);
+  // Deduped by a Set, never an object keyed by lead id: `constructor` is a legal task id, and an
+  // object registry would call it already-seen and drop a real storm's second witness.
+  assert.deepEqual(detectStorm([], [{ lead: '__proto__' }, { lead: '__proto__' }]), CALM);
+  assert.deepEqual(detectStorm([], [{ lead: 'constructor' }, { lead: 'toString' }]), { frozen: true, evidence: [{ lead: 'constructor' }, { lead: 'toString' }] });
+  assert.deepEqual(detectStorm([], PROTO_KEYS.map((lead) => ({ lead }))), { frozen: true, evidence: PROTO_KEYS.map((lead) => ({ lead })) });
+  // One evidence row per lead, in first-seen order: what BACKPRESSURE carries to the digest.
+  assert.deepEqual(detectStorm([], [{ lead: 'b' }, { lead: 'a' }, { lead: 'b' }]), { frozen: true, evidence: [{ lead: 'b' }, { lead: 'a' }] });
+});
+
+test('detectStorm: a pane hit and a limit hit never corroborate each other, on one lead or on two', async () => {
+  const { detectStorm } = await import('../bin/lib/wd/backpressure.mjs?cross-' + Date.now());
+  // Two rules, two quorums, and no exchange rate between them. A pane match is a string a lead's own
+  // work can produce (the backlog holds tickets about HTTP 429); a limit hit is one seat's state. A
+  // lead with both is still ONE lead, and a limit hit is not the transcript stanza that corroborates
+  // a pane match: that stanza is the scraper's to report, on the pane's own row.
+  for (const [signals, limited, why] of [
+    [[{ lead: 'a', paneHit: true }], [{ lead: 'a' }], 'a pane hit and a limit hit on the same lead'],
+    [[{ lead: 'a', paneHit: true }], [{ lead: 'b' }], 'a pane hit on a and a limit hit on b: one witness to each rule, two to neither'],
+    [[{ lead: 'a', transcriptHit: true }], [{ lead: 'a' }], 'a limit hit does not stand in for the pane match a transcript stanza needs'],
+    [[{ lead: 'a', transcriptHit: true }], [{ lead: 'b' }], 'nor does a limit hit on another lead'],
+    [[{ lead: 'a', paneHit: true }, { lead: 'a', paneHit: true }], [{ lead: 'a' }, { lead: 'a' }], 'four rows, one lead'],
+  ]) {
+    assert.deepEqual(detectStorm(signals, limited), CALM, why);
+  }
+  // The control, and it is what makes the refusals above a property of the RULES rather than of the
+  // witnesses: the same two leads in ONE list freeze, whichever list it is.
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }, { lead: 'b' }]), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] });
+  assert.deepEqual(detectStorm([{ lead: 'a', paneHit: true }, { lead: 'b', paneHit: true }], []), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] });
+  assert.deepEqual(detectStorm([{ lead: 'a', paneHit: true, transcriptHit: true }], []), { frozen: true, evidence: [{ lead: 'a' }] });
+});
+
+test('detectStorm: a limited row that names no lead is no evidence, never pairs with a real lead, and is never reported', async () => {
+  const { detectStorm } = await import('../bin/lib/wd/backpressure.mjs?limited-unattributable-' + Date.now());
+  // The pane rule's attribution guard, for the second list. The real lead is `b` so that no shape
+  // below can collide with it: a reader that coerced `lead` would read `['a']` as 'a' and 42 as '42',
+  // a second lead either way, and freeze the fleet on one witness.
+  for (const bad of [{}, { lead: undefined }, { lead: '' }, { lead: null }, { lead: 42 }, { lead: {} }, { lead: ['a'] }, null, undefined, 7, 'a']) {
+    const label = JSON.stringify(bad) ?? 'undefined';
+    assert.deepEqual(detectStorm([], [bad, { lead: 'b' }]), CALM, `${label}, then a real lead`);
+    assert.deepEqual(detectStorm([], [{ lead: 'b' }, bad]), CALM, `a real lead, then ${label}`);
+    // Two of one unattributable shape are not two leads. A clone, not the same row twice: `{lead: {}}`
+    // and its copy are two distinct keys to a Set, so here the guard is the only thing standing.
+    assert.deepEqual(detectStorm([], [bad, structuredClone(bad)]), CALM, `${label} twice`);
+    // And never in the evidence of a freeze the pane rule made: `evidence` names leads.
+    assert.deepEqual(detectStorm([{ lead: 'x', paneHit: true, transcriptHit: true }], [bad]), { frozen: true, evidence: [{ lead: 'x' }] }, `${label} beside a pane freeze`);
+  }
+  // The control: a REAL second lead in the same position is a storm.
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }, { lead: 'b' }]), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] });
+});
+
+test('detectStorm: a limited list that is not an array is no evidence, and leaves the pane rule exactly as it was', async () => {
+  const { detectStorm } = await import('../bin/lib/wd/backpressure.mjs?limited-container-' + Date.now());
+  // `limited` is an ARRAY, as `signals` is. The Set and the array-like are the two containers that
+  // tell an array check from "read whatever arrived": each holds two real leads, a storm if read.
+  const arrayLike = { length: 2, 0: { lead: 'a' }, 1: { lead: 'b' } };
+  for (const [label, bad] of [
+    ['no list (undefined)', undefined], ['null', null], ['a string', 'ab'], ['a number', 42], ['a bare row', { lead: 'a' }],
+    ['a Set of two rows', new Set([{ lead: 'a' }, { lead: 'b' }])], ['an array-like of two rows', arrayLike],
+  ]) {
+    assert.deepEqual(detectStorm([], bad), CALM, label);
+    assert.deepEqual(detectStorm([{ lead: 'x', paneHit: true }], bad), CALM, `${label}: one pane hit is still no storm`);
+    assert.deepEqual(detectStorm(PANE_PAIR(), bad), { frozen: true, evidence: [{ lead: 'x' }, { lead: 'y' }] }, `${label}: two pane hits still are`);
+    assert.deepEqual(detectStorm([{ lead: 'x', paneHit: true, transcriptHit: true }], bad), { frozen: true, evidence: [{ lead: 'x' }] }, `${label}: and so is a corroborated one`);
+  }
+  // The control: the same two rows in an array are a storm.
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }, { lead: 'b' }]), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] });
+});
+
+test('detectStorm: a hostile limited list never throws, never erases the pane rule\'s evidence, and keeps what it gave before it broke', async () => {
+  const { detectStorm } = await import('../bin/lib/wd/backpressure.mjs?limited-hostile-' + Date.now());
+  // Each list is read in its OWN try. A throw out of here ends the tick before admission, on every
+  // tick the bad list recurs: a freeze in all but name. And one try around both lists would let a bad
+  // second list erase the first one's evidence.
+  const boom = () => { throw new Error('boom'); };
+  const throwingIterator = [];
+  throwingIterator[Symbol.iterator] = boom;                                   // what it holds is beside the point: nothing can be read
+  const unreadable = new Proxy([{ lead: 'a' }, { lead: 'b' }], { get: boom }); // Array.isArray says array; every read of it throws
+  const proxyRow = new Proxy({}, { get: boom });
+  const throwingLead = { get lead() { throw new Error('boom'); } };
+  for (const [label, hostile] of [
+    ['an iterator that throws', throwingIterator],
+    ['an array no read of which succeeds', unreadable],
+    ['a Proxy row', [proxyRow]],
+    ['a row whose lead getter throws', [throwingLead]],
+  ]) {
+    assert.deepEqual(detectStorm([], hostile), CALM, label);
+    assert.deepEqual(detectStorm(PANE_PAIR(), hostile), { frozen: true, evidence: [{ lead: 'x' }, { lead: 'y' }] }, `${label}: the pane rule's freeze stands`);
+    assert.deepEqual(detectStorm([{ lead: 'x', paneHit: true, transcriptHit: true }], hostile), { frozen: true, evidence: [{ lead: 'x' }] }, `${label}: and so does a corroborated one`);
+  }
+  // Evidence gathered BEFORE an unreadable row is real and still counts; what comes after it is lost,
+  // which fails toward not freezing: the pane list's rule, and this module's direction.
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }, { lead: 'b' }, proxyRow]), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] });
+  assert.deepEqual(detectStorm([], [{ lead: 'a' }, { lead: 'b' }, throwingLead]), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] });
+  assert.deepEqual(detectStorm([], [proxyRow, { lead: 'a' }, { lead: 'b' }]), CALM);
+});
+
+test('detectStorm: a hostile or non-array signals list never erases the limits phase\'s evidence', async () => {
+  const { detectStorm } = await import('../bin/lib/wd/backpressure.mjs?signals-hostile-' + Date.now());
+  const boom = () => { throw new Error('boom'); };
+  const throwingIterator = [];
+  throwingIterator[Symbol.iterator] = boom;
+  const STORM = { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }] };
+  for (const [label, signals] of [
+    ['no list (undefined)', undefined], ['null', null], ['a string', 'xy'], ['a number', 42], ['a bare row', { lead: 'x', paneHit: true }],
+    ['a Set of two pane hits', new Set(PANE_PAIR())],
+    ['an iterator that throws', throwingIterator],
+    ['an array no read of which succeeds', new Proxy(PANE_PAIR(), { get: boom })],
+    ['a Proxy row', [new Proxy({}, { get: boom })]],
+    ['a row whose paneHit getter throws', [{ lead: 'x', get paneHit() { throw new Error('boom'); } }]],
+  ]) {
+    assert.deepEqual(detectStorm(signals, [{ lead: 'a' }, { lead: 'b' }]), STORM, label);
+  }
+  // A pane hit read before the bad row stands, and is named after the limited leads.
+  const tail = [{ lead: 'x', paneHit: true }, { get paneHit() { throw new Error('boom'); } }];
+  assert.deepEqual(detectStorm(tail, [{ lead: 'a' }, { lead: 'b' }]), { frozen: true, evidence: [{ lead: 'a' }, { lead: 'b' }, { lead: 'x' }] });
+});
+
+test('detectStorm: a freeze names every attributable lead from both lists once, limited leads first, then pane leads, each in first-seen order', async () => {
+  const { detectStorm } = await import('../bin/lib/wd/backpressure.mjs?union-' + Date.now());
+  const leads = (...ids) => ids.map((lead) => ({ lead }));
+  // Frozen by the limit rule while one pane hit is present: the pane hit is named too, after.
+  assert.deepEqual(detectStorm([{ lead: 'c', paneHit: true }], leads('b', 'a')), { frozen: true, evidence: leads('b', 'a', 'c') });
+  // Frozen by the pane rule while one limited lead is present: the limited lead is named too, first.
+  assert.deepEqual(detectStorm([{ lead: 'y', paneHit: true }, { lead: 'x', paneHit: true }], leads('a')), { frozen: true, evidence: leads('a', 'y', 'x') });
+  assert.deepEqual(detectStorm([{ lead: 'x', paneHit: true, transcriptHit: true }], leads('a')), { frozen: true, evidence: leads('a', 'x') });
+  // A corroborated pane row is a pane lead, never a limited one: its transcript stanza corroborates
+  // the pane rule and is not the limits phase's row, so `x` keeps its first-seen place after `y`.
+  assert.deepEqual(detectStorm([{ lead: 'y', paneHit: true }, { lead: 'x', paneHit: true, transcriptHit: true }]), { frozen: true, evidence: leads('y', 'x') });
+  // Both rules at once.
+  assert.deepEqual(detectStorm([{ lead: 'd', paneHit: true }, { lead: 'c', paneHit: true }], leads('b', 'a')), { frozen: true, evidence: leads('b', 'a', 'd', 'c') });
+  // A lead in both lists is named once, where the limited list first named it.
+  assert.deepEqual(detectStorm([{ lead: 'b', paneHit: true }, { lead: 'a', paneHit: true }], leads('a')), { frozen: true, evidence: leads('a', 'b') });
+  assert.deepEqual(detectStorm([{ lead: 'a', paneHit: true }], leads('b', 'a')), { frozen: true, evidence: leads('b', 'a') });
+  // A signals row that is not a pane hit names nobody: a transcript stanza alone, an explicit `paneHit: false`.
+  assert.deepEqual(detectStorm([{ lead: 't', transcriptHit: true }, { lead: 'u', paneHit: false }], leads('a', 'b')), { frozen: true, evidence: leads('a', 'b') });
 });
 
 // ─────────────────────────── admission ───────────────────────────

@@ -614,6 +614,20 @@ const PROMPT_RULES = {
           ["that 80% is the lead's to absorb", /wind\s+down/i],
           ['the trip', /100%/],
           ['and the two ways out of it', /(smaller\s+scope|let\s+it\s+end)/i],
+          // The clear has a mechanism now, and the row names it with what it costs: one more
+          // allowance of the class per clear, a TRIP_CLEARED per clear, and a fresh 80% note.
+          ['the tool that clears it', /soma_clear_trip/],
+          ['what a clear grants', /one\s+more\s+allowance/i],
+          ['that each clear is logged', /TRIP_CLEARED/],
+          ['that the lead is told again at 80% of the new allowance', /told\s+again\s+at\s+80%/i],
+          // A second BUDGET 80 for one lead has two causes, and the payload says which.
+          ['that a fresh session or a new allowance brings another BUDGET 80', /fresh\s+session\s+or\s+granted\s+a\s+new\s+allowance/i],
+          ['and the two payload fields that tell them apart', /`session_uuid`\s+and\s+`grants`/],
+          // The one limit, stated plainly: a wall-clock trip can outlast its clear.
+          ['the wall-clock limit', /wall-clock\s+trip[\s\S]{0,120}?wall_ms/i],
+        ], no: [
+          // Removing the flag by hand is undone by the next tick, with a second BUDGET 100 and toast.
+          ['removing the flag by hand', /\brm\b|BUDGET_TRIPPED/],
         ] },
         // Account rotation (design §3.8): BACKPRESSURE is now URGENT and carries two reasons with two
         // different remedies, neither of them the orchestrator's — the storm lifts itself, the org
@@ -647,11 +661,14 @@ const PROMPT_RULES = {
         // The pins are per-row and clause-shaped for the reason the final review recorded: a
         // section-wide pin on `/watchdog/` is satisfied by any of the eight other rows, and a
         // single alternation across a row's two clauses leaves either one deletable.
-        { at: /`LEAD_DEAD`/, why: 'a death and its relaunch, and how fast the attempts burn', pins: [
+        { at: /`LEAD_DEAD`/, why: 'a death and its relaunch, and how far apart the attempts are', pins: [
           ['that the watchdog already relaunched it', /relaunched/i],
           ['the attempt budget', /[Tt]hree\s+attempts/],
           ['what the last one becomes', /GAVE_UP/],
-          ['and that the three are not spaced out', /no\s+cooldown/i],
+          ['the backoff', /15\s+minutes[\s\S]{0,60}?an\s+hour/i],
+          ['that nothing is logged while a lead waits', /nothing\s+is\s+logged/i],
+        ], no: [
+          ['the retired claim that nothing spaces the attempts', /no\s+cooldown/i],
         ] },
         { at: /`BLOCKED`/, why: 'a freed slot, and how the lead gets back in', pins: [
           ['what elapsed', /blocked_slot_minutes/],
@@ -715,6 +732,7 @@ const PROMPT_RULES = {
         { at: /`LEAD_DEAD_SHELL`/, why: 'a pane that is a shell, and the two moves by status', pins: [
           ['what the pane is', /bare\s+shell/i],
           ['that the spawned case is the watchdog\'s', /revived\s+by\s+the\s+watchdog/i],
+          ['that a recent relaunch waits out its backoff', /backoff/i],
           ['that the other rows are the orchestrator\'s', /soma_kill/],
           ['then re-queue', /re-queue/i],
           ['the ban', /[Nn]ever\s+`?soma_send`?/],
@@ -862,6 +880,7 @@ const PROMPT_RULES = {
           ['redirecting a lead', /soma_send/],
           ['killing one that is doing the wrong thing', /soma_kill/],
           ['reviving one', /soma_resume/],
+          ['granting a tripped one one more allowance', /soma_clear_trip/],
           ['reading evidence rather than a summary', /soma_transcript/],
           ['and the digest', /soma_digest/],
         ] },

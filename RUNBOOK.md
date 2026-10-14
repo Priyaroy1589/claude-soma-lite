@@ -114,7 +114,7 @@ The tree `ensureTree()` guarantees:
 ```
 $SOMA_HOME/
   soma.json              your config (optional; DEFAULTS apply without it)
-  state/                 fleet.json, fleet.lock, orch.lease, QUEUE_PAUSED, seats.json, backpressure.json (written on an org spend cap)
+  state/                 fleet.json, fleet.lock, orch.lease, QUEUE_PAUSED, seats.json, backpressure.json (written on an org spend cap or a rate-limit storm)
   events/                <stream>.ndjson — one per lead, plus orch.ndjson
   heartbeats/            <lead> — touched by the lead's PostToolUse hook
   leads/<id>/            meta.json, brief.md, mcp.json, settings.json, settings.launch.json,
@@ -187,14 +187,33 @@ task naming an unconfigured repo cannot spawn:
 
 `tokens_cap` meters **the lead and its whole team** (teammate turns go to their own transcripts).
 `turn_cap` is calibrated per lead and is a backstop, not a budget. Warn at 80 %, hard trip at 100 %.
-A warning logs `BUDGET` on the orchestrator's stream and writes `leads/<id>/BUDGET_WARNED`; the
-PreToolUse gate attaches a one-time `soma:` note to the lead's next allowed tool call and renames the
-flag to `BUDGET_WARNED.delivered`, and teammates never get it. A trip writes
+A warning logs `BUDGET` on the orchestrator's stream and writes `leads/<id>/BUDGET_WARNED`, once per
+lead session and allowance; the PreToolUse gate attaches a one-time `soma:` note to the lead's next
+allowed tool call and renames the flag to `BUDGET_WARNED.delivered`, and teammates never get it. Per
+session, not per lead: the spend is the worktree's and carries across a revival, so a lead revived
+onto a fresh session (a new session uuid, none of the old context) is warned again on the tick it
+relaunches, while a resumed lead keeps its session and its note. Per allowance, because a cleared
+trip is a new one (below). Every `BUDGET` names both: `session_uuid` and `grants`. A trip writes
 `leads/<id>/BUDGET_TRIPPED`, which the PreToolUse gate reads to deny every tool except the soma bus —
-so a tripped lead can still file `COMPLETED` or `ERROR`, and nothing else.
+so a tripped lead can still file `COMPLETED`, `ERROR` or a `NEEDS_INPUT` saying how much more it
+needs and why, and nothing else.
+
+**Clearing a trip: `soma clear-trip <lead>`**, or the orchestrator's `soma_clear_trip(lead)`. Both
+go through one function (`wd/budget.clearTrip`), which removes the flag and raises the row's
+`budget_grants` in one fleet transaction: each clear grants one more allowance of the lead's class,
+and the meter judges every cap at (1 + grants) times the class's from its next tick. Each clear is
+logged as `TRIP_CLEARED`, and the lead is told again at 80% of the new allowance. Both refuse a lead
+that is not tripped, and a row the breaker does not meter (anything but `spawned` and `blocked`).
+**`rm leads/<id>/BUDGET_TRIPPED` alone is not a clear**: the lead is still over its cap, so the next
+tick trips it again, with a second `BUDGET` at 100 % and a second toast. One limit, stated plainly:
+a wall-clock trip cleared long after it fired can still be past (1 + grants) × `wall_ms`, so the
+next tick trips it again, and another clear adds another allowance.
 A lead is priced at the class pinned at enqueue when soma.json defines it, else at the class its
 newest `HARNESS` report reserves, else at `standard`; README's budget section has the exact rule
-and when `HARNESS_DEFAULTED` fires.
+and when `HARNESS_DEFAULTED` fires. `soma_status` shows that class as `budget_class`, the clears as
+`budget_grants`, and as `budget_pct` the share of the allowance, (1 + `budget_grants`) × its
+`tokens_cap`, the lead and its team have spent (`budget_est_tokens`), for a spawned or blocked lead,
+the only rows the breaker meters.
 
 ### Config keys that are declared and read by nothing
 
@@ -658,6 +677,16 @@ The watchdog tick (default 30 s) does seven things:
 1. **Liveness, reconcile, revival.** Reads panes, not session names — `remain-on-exit` keeps a dead
    lead's session alive on purpose, because that pane *is* the death scene. A dead lead gets its
    final screen captured, a `LEAD_DEAD` event, then resume-or-fresh-respawn, up to 3 attempts.
+   The attempts are spaced out, so that you can read a death screen before the next attempt
+   replaces it: the first revival is immediate, the second comes no sooner than 15 minutes after
+   the first, and the third no sooner than an hour after the second, timed from the previous
+   relaunch (the row's `revived_at`, written in the same transaction as `attempts`). While a lead
+   waits, its row stays `spawned` and keeps its slot, nothing is logged, and `soma peek <lead>`
+   shows the death screen; `LEAD_DEAD` and `REVIVED` come at the relaunch, as before. `GAVE_UP`
+   after the third attempt is not delayed. A row last revived before `revived_at` existed is not
+   held, and the revival it gets stamps it. A `revived_at` in the future (the clock stepped back)
+   holds nothing: the lead is revived at once and stamped again from the corrected clock, so no
+   dead lead waits longer than its step (15 minutes or an hour) from the tick that finds it dead.
    A `spawned` row whose pane the census read as a bare shell is dead here too (its `LEAD_DEAD`
    carries `pane_state: dead_shell`); a shell on any other row is surfaced and left standing —
    killing a finished lead's pane is the unbuilt `linger_minutes` reaper's job.
@@ -674,30 +703,48 @@ The watchdog tick (default 30 s) does seven things:
    minute for everything else). That is not the longest launch possible, because every git call in a
    launch gets its own two minutes. Past it the row is treated as dead, as every starting row was
    before the mark: usually a spawner that died, revived like any dead lead. A launch that is only
-   slower than the bound is revived under its spawner: a `LEAD_DEAD` and a charged revival attempt
-   every tick until its session appears (`GAVE_UP` after three), and if its session appears between
-   a tick's read and the revival's kill, that new session is killed and replaced. Two sessions never
-   run at once: the spawner holds the repo lock across the launch and checks for the session again
-   under it. Recording the session clears the mark, and so does a failed spawn's rollback.
+   slower than the bound is revived under its spawner, with its attempts spaced out like any dead
+   lead's (above): the first revival is immediate, and each later one waits out its step. A
+   `LEAD_DEAD` and a charged attempt come with each revival, none on a tick spent waiting, and
+   `GAVE_UP` comes after the third. If its session appears between a tick's read and the revival's
+   kill, that new session is killed and replaced. Two sessions never run at once: the spawner holds
+   the repo lock across the launch and checks for the session again under it. Recording the session
+   clears the mark, and so does a failed spawn's rollback.
    Meanwhile `soma status` shows the lead as LIVE `starting`, PANE `-`, and `soma_status` as
    `liveness: starting`.
 2. **Budget breakers and model deviation**, over every `spawned` *and* `blocked` row.
 3. **`NEEDS_INPUT` → `blocked`**, after `blocked_slot_minutes` of grace, which frees the slot.
-4. **Backpressure.** A rate-limit storm corroborated across two *distinct* leads freezes admission.
+4. **Backpressure.** A rate-limit storm freezes admission: two or more *distinct* leads whose own
+   transcripts end on a live usage-limit hit in the same tick. The evidence is the limits phase's
+   reading, the synthetic `rate_limit` row Claude Code itself writes when a seat refuses a request,
+   so no lead can produce it by reading or quoting a 429 log. The pane does show a limit line
+   (`You've hit your <limit name>`, with its reset time for a window) above an idle composer, but
+   the account-rotation design names the row the reliable signal and that line corroboration, and
+   no scraper pattern has been built or measured against it. The threshold is fixed at two, not a
+   `soma.json` key: one lead's hit is its own seat's window, which rotation handles, and it takes
+   two at once to make it the fleet's. Rotation keeps running under a freeze, and so does revival;
+   only admission is held. A hit stops counting when its lead is relaunched (rotated, revived, reverted or
+   spawned anew), when the lead resumes (a healthy row follows it), when its row stops being
+   `spawned`, or when its own `resetsAt` passes, so a storm freeze never outlasts the resets of the
+   hits that hold it.
    The freeze is a FILE: the tick writes `state/backpressure.json` (`{active, reason, since, until}`,
    tmp+rename under the fleet lock) and admission obeys the file, not only the in-memory verdict —
    so a freeze written by the limits phase (the org spend cap, `reason: org_level_disabled_until`)
    holds the queue with no storm in sight. `BACKPRESSURE` reaches the orchestrator as an event on
    its next `soma_inbox` drain plus, for the spend-cap emission, one desktop toast; the watchdog
-   never types into the orchestrator's pane. The storm emission is re-emitted every frozen tick (a
-   storm's end has no event; the events carry the record's `since`, so they agree about when it
-   began) and is silent on the desktop. Each writer owns its own `reason`: a storm clears its own
-   record when the watchdog stops corroborating it and never clears or relabels a spend-cap record;
-   a spend-cap record holds until `soma thaw` clears it (§9) — nothing inside the fleet lifts it. The
-   evidence scraper is still a declared stub — `paneSignals` returns `[]` — so on this build a storm
-   freeze needs that scraper before it can occur; the spend-cap writer does not. A corrupt
-   `state/backpressure.json` reads as "not frozen", is reported once as `WATCHDOG_ERROR` with
-   `where: backpressure_file`, and is never overwritten by the tick: fix or delete the file by hand.
+   never types into the orchestrator's pane. The storm emission (`reason: storm`, with `evidence`
+   naming the leads) is re-emitted every frozen tick (a storm's end has no event; the events carry
+   the storm record's `since`, so they agree about when it began; under a spend-cap record or an
+   unreadable file a storm writes none and each dates its own tick) and is silent on the desktop. Each
+   writer owns its own `reason`: a storm clears its own record once fewer than two leads still hold
+   a live hit, and never clears or relabels a spend-cap record; the spend cap keeps its own writer,
+   and its record holds until `soma thaw` clears it (§9) — nothing inside the fleet lifts it. The
+   org spend cap outranks a storm: a spend-cap hit replaces a live storm record and is announced at
+   once, never the reverse. The
+   pane half of the evidence is still a declared stub (`paneSignals` returns `[]`), so on this build
+   only transcript evidence freezes. A corrupt `state/backpressure.json` reads as "not frozen", is
+   reported once as `WATCHDOG_ERROR` with `where: backpressure_file`, and is never overwritten by
+   the tick: fix or delete the file by hand.
 5. **Admission.** At most one launch per tick, capped by `max_leads`, gated by `stagger_s`, vetoed
    by the pause flag and by a freeze.
 6. **Settlement** → `FLEET_DRAINED` / `FLEET_SETTLED` plus one desktop toast, announced once per
@@ -729,6 +776,7 @@ Confirmed against the `switch` in `bin/soma.mjs`. Nothing below is aspirational.
 | `soma kill <lead> ["reason"]` | kill the session, mark the row `failed` |
 | `soma resume <lead> [--force]` | restart a dead lead from its recorded claude session, on the seat `pick()` chooses — written to the row's `seat`; with no pool configured, this process's own `CLAUDE_CONFIG_DIR` and `seat: null`. The seat is picked **before** the kill, and every seat closed or unverified is a refusal (exit 3), not a launch on this shell's own account. A `soma.json` that `loadConfig()` refuses (§4) is refused before the kill too, with the loader's reason (exit 2) |
 | `soma retry <lead>` | re-queue a `failed` or `skipped` row |
+| `soma clear-trip <lead>` | clear a budget trip by granting one more allowance of the lead's class (§4, *Budget classes*), and log `TRIP_CLEARED`; **refuses a lead that is not tripped or not metered, exit 3** |
 | `soma digest [--lines N]` | recent events, oldest first, **consuming nothing** |
 | `soma enqueue --file <f>` | add tasks from a JSON array, refusing what `soma_enqueue` refuses (§6.2) |
 | `soma thaw` | clear an org spend-cap freeze (`state/backpressure.json`) and print the record cleared; **refuses a live storm and an unreadable record, exit 3** — see §9 |
@@ -743,12 +791,15 @@ consulted)` and proceeds. There is no `inbox` subcommand.
 > that is not `failed`/`skipped`, kills the lingering session, sets the row `queued` and logs
 > `RETRIED`. What it does *not* do is force worktree recreation — the `-r2` path is the worktree
 > layer's own behaviour on a dirty reuse. Same for **reconcile-driven revival**, which the ROADMAP
-> lists as v1.x and which the shipped tick fully wires (`resumeLead`/`spawnLead`, 3 attempts).
+> once listed as v1.x and which the shipped tick fully wires (`resumeLead`/`spawnLead`, 3 attempts
+> spaced out as §6.3 says).
 >
 > And **`thaw` is built**: the shipped arm lifts an org spend-cap freeze (it clears
 > `state/backpressure.json`) and refuses a live storm — §9. `docs/ROADMAP.md` now records only the half
-> that is still deferred: the per-fleet ignore list for a *false* storm freeze, which is still v1.x and
-> cannot exist before the evidence scraper does.
+> that is still deferred: the per-fleet ignore list for a *false* storm freeze, which is still v1.x. A
+> list of text to ignore needs matched text, so it waits on the pane scraper, which is still a stub;
+> the transcript row a storm freezes on today is written by Claude Code itself, not by a lead, and
+> stops counting at its own reset.
 
 ### Provisioning a seat
 
@@ -970,7 +1021,7 @@ stops on the next tick; running leads continue. The flag lives at `state/QUEUE_P
 | `soma hold <lead>` | Nothing in `bin/` reads `leads/<id>/HOLD`. Writing it would ship a pause that is written, displayed and **never obeyed**. | `soma_queue pause` to freeze the whole fleet; `soma kill <lead>` for one. |
 | `soma release <lead>` | The other half of `hold`. **Not** `soma_release` — that MCP tool hands back the orchestrator lease. | see above |
 | `soma gc` | No worktree/branch/log/digest sweep exists. | `git worktree remove` by hand. soma never touches `~/.claude/projects`, which `--resume` needs. |
-| `soma thaw` | Refuses a **storm** record (`reason: storm`): a live storm is the watchdog's — it re-writes its record on every tick it corroborates the storm and clears it itself when the panes stop matching, so a clear here would be undone within a tick and would hide the storm from `soma status` meanwhile. Refuses an **unreadable** record: it never overwrites bytes it cannot read. | An org spend-cap freeze (`reason: org_level_disabled_until`) is what `soma thaw` is for: it clears `state/backpressure.json`, prints the record it cleared, and admission resumes on the next tick. Order of operations, because the tick reads transcript tails and not calendars: first move or kill every lead whose transcript still ends on the cap row — `soma send <lead> "continue"` once you believe the cap has lifted (a healthy reply proves it; a second cap row proves it has not) or `soma kill <lead>` — then `soma thaw`. A record that comes back within a tick means a spawned lead's tail still reads the cap. `soma status` / `soma_status` show `backpressure` three-state (none / FROZEN with reason and since / unreadable); the lift has no event of its own — the record is what says it lifted. |
+| `soma thaw` | Refuses a **storm** record (`reason: storm`): a live storm is the watchdog's — it re-writes its record on every tick the storm holds and clears it itself once fewer than two leads still hold a live usage-limit hit, so a clear here would be undone within a tick and would hide the storm from `soma status` meanwhile. Refuses an **unreadable** record: it never overwrites bytes it cannot read. | An org spend-cap freeze (`reason: org_level_disabled_until`) is what `soma thaw` is for: it clears `state/backpressure.json`, prints the record it cleared, and admission resumes on the next tick unless a rate-limit storm still holds. Order of operations, because the tick reads transcript tails and not calendars: first move or kill every lead whose transcript still ends on the cap row — `soma send <lead> "continue"` once you believe the cap has lifted (a healthy reply proves it; a second cap row proves it has not) or `soma kill <lead>` — then `soma thaw`. A spend-cap record that comes back within a tick means a spawned lead's tail still reads the cap. `soma status` / `soma_status` show `backpressure` three-state (none / FROZEN with reason and since / unreadable); the lift has no event of its own — the record is what says it lifted. |
 | `soma up --canary` | The flag is answered; the driver is a v1.x gap, so the canary can only report "unproven" (`canary: ERROR`) and `up` refuses with exit 3. | §5.4 and §10 |
 | `soma_inbox` from the CLI | No `inbox` subcommand in v1. | `soma digest`, or `tail -n 40 "$SOMA_HOME/events/"*.ndjson` |
 
@@ -987,7 +1038,7 @@ task row; the RC URL is the one field it lacks), and **watchdog episode semantic
 notification coalescing** (notifications are per-event and chatty at ten leads). The **Claude Code
 version gate** is no longer on this list: it is wired and enforced, see §4.
 
-### Five more gaps, declared here because this is where you would meet them
+### Three more gaps, declared here because this is where you would meet them
 
 Found by the final whole-branch review and **declared rather than fixed** on this branch. Each is
 recorded in `docs/ROADMAP.md` as v1.x.
@@ -995,10 +1046,11 @@ recorded in `docs/ROADMAP.md` as v1.x.
 | gap | what you actually see | what to do |
 |---|---|---|
 | **No `PostCompact` installer.** `bin/hooks/lead-postcompact.mjs` exists; nothing registers it (the generator writes `PostToolUse`, `Stop` and `PreToolUse` only). | After an auto-compact — routine, measured on this build around a ~994k prompt — a lead loses its HARNESS contract and its standing orders with nothing to restore them. It keeps working and stops being the thing you briefed. | `soma_send` the lead a pointer to `soma_task()`, which is the tool the missing injected line would have named. Watch for a lead whose reports change shape mid-run. |
-| **A tripped budget cannot be cleared.** Nothing unlinks `leads/<id>/BUDGET_TRIPPED` — no CLI verb, no MCP tool — and the deny message tells the lead *"Ask the orchestrator to clear the trip"*, which the orchestrator has no way to do. | A tripped lead is alive, holding its slot, and able to call nothing but the bus. It will ask, and nothing can answer. | Delete the file by hand (`rm "$SOMA_HOME/leads/<id>/BUDGET_TRIPPED"`) or `soma kill` the lead. There is no third option. |
 | **`serialize_with` does not exist.** The orchestrator prompt used to instruct it; `soma_enqueue`'s schema sets `additionalProperties:false` and omits it, and admission is pure FIFO. The instruction is removed as of this branch. | Two tickets touching one module get two leads and two draft PRs that fight. | Enqueue same-module tickets one at a time — the second after the first reports `COMPLETED`. The orchestrator prompt now says so. |
-| **No revival cooldown.** The 1-hour backoff the design pairs with the 3-attempt limit is not implemented. | A lead that dies for a persistent reason (bad credential, wedged repo) burns **all three revival attempts in about 90 seconds** of consecutive ticks and lands on `GAVE_UP` before you can look at it. | Read the `LEAD_DEAD` payload's captured death screen rather than the `GAVE_UP`. `soma peek` still has the pane. |
 | **A Claude Code build that prompts under bypass** (the stalled-lead incident). Claude Code 2.1.259 raised a bypass-immune permission prompt on `cd <dir> && grep <relative file>` whenever a `Read()` deny existed — leads carry 13 — and `tested_claude` admits patch releases by design. 2.1.263 fixed it; the fleet cannot tell which build a lead runs from inside a hook. | A lead or teammate sits on `Do you want to proceed?` with nobody at the pane: measured 79 stalls summing 214 hours, the worst 40 hours, all on 2.1.259. `soma doctor`'s `claude cd-compound read runs` check is **FAIL** on such a build. | Cycle the leads onto a fixed build (`soma kill` + `soma_resume` relaunches `claude` from PATH). If the fleet must keep running on the asking build, arm the gate's emergency lever **per lead**: `touch "$SOMA_HOME/leads/<id>/CD_COMPOUND_ASKS"` — the PreToolUse gate then denies the asking shape with a reason that says what to type instead (one retry turn per matching call, ~14% of Bash calls on a 2.1.259-class build) — and `rm` the flag once the lead is on a fixed build. Unarmed it costs nothing and does nothing; never leave it armed on a build that does not ask. |
+
+The **revival cooldown** is no longer on this list: it ships, and §6.3 gives the schedule. Nor is
+**clearing a tripped budget**: `soma clear-trip` ships (§4, *Budget classes*).
 
 ---
 
@@ -1227,19 +1279,21 @@ reach, a fleet small enough to read. That is what the residual set below is the 
 **Do not yet leave ten agents running unsupervised in your repos.** Three things make the composite
 weaker than the list:
 
-**(a) The residuals compose, and a list read line by line hides that.** Two examples, both live:
+**(a) The residuals compose, and a list read line by line hides that.** Two examples, the first
+still live:
 
 - The single-holder lease is bounded in the design by two compensating controls after a
   `force: true` steal. One of those controls is the `UserPromptSubmit` inject hook — **which
   nothing installs** (§5.1), and which is its own separately declared residual. Two items that are
   each fine alone are jointly load-bearing, and the second one is missing.
 - Backpressure was two independent gaps and only the first was ever declared: the *evidence
-  scraper* is a known stub (§8), and separately `state/backpressure.json` — the file `soma status`
-  renders from — **had no writer at all**. The second is closed (§6 item 4: the tick writes it under
-  the fleet lock, admission reads it, `soma thaw` lifts a spend-cap record); the first stands. The
-  comment declaring the first had said in as many words that everything downstream of it was
-  complete, so the declaration of one gap actively asserted the other was fine — kept here as the
-  pattern, not the instance.
+  scraper* was a known stub, and separately `state/backpressure.json` — the file `soma status`
+  renders from — **had no writer at all**. Both are closed (§6 item 4): the tick writes the file
+  under the fleet lock, admission reads it, `soma thaw` lifts a spend-cap record, and a storm now
+  freezes on the limits phase's own transcript reading, so only the pane half of the scraper is
+  still a stub. The comment declaring the first had said in as many words that everything
+  downstream of it was complete, so the declaration of one gap actively asserted the other was
+  fine — kept here as the pattern, not the instance.
 
 A residual list that is honest line by line and silent about interaction is the same defect as a
 rule stated as a conjunction and guarded by a disjunction: each half checks out, and the thing they
@@ -1578,7 +1632,7 @@ lease at that server's pane id at once.
 - **The nine invariants, in full** — `bin/lib/canary.mjs`
 - **The 48 checks** — `bin/lib/doctor.mjs` (`CHECKS`)
 - **Account rotation, design** — `docs/superpowers/specs/2026-09-15-account-rotation-design.md`
-- **The seat pool** — `bin/lib/seats.mjs`, state in `state/seats.json`; **the limit classifier** — `bin/lib/wd/limit-state.mjs`; **the six rotation events** — `bin/lib/wd/rotation-events.mjs`; **the freeze record** — `bin/lib/wd/backpressure.mjs`, `state/backpressure.json`, lifted by `soma thaw`
+- **The seat pool** — `bin/lib/seats.mjs`, state in `state/seats.json`; **the limit classifier** — `bin/lib/wd/limit-state.mjs`; **the six rotation events** — `bin/lib/wd/rotation-events.mjs`; **the freeze record and storm detection** — `bin/lib/wd/backpressure.mjs`, `state/backpressure.json`, a spend-cap record lifted by `soma thaw` and a storm's by the watchdog
 - **The tenth invariant** — §10 of this document, deliberately not `bin/lib/canary.mjs`
 - **The deny rules** — `bin/lib/settings-gen.mjs` (`STANDING_DENIES`)
 - **The gate's five bans and their evidence** — `bin/hooks/lead-gate.mjs`
