@@ -29,6 +29,10 @@ const { ensureTree } = await import('../bin/lib/paths.mjs');
 const { enqueue } = await import('../bin/lib/fleet.mjs');
 const { appendEvent, readEvents: realReadEvents, unread, writeCursor } = await import('../bin/lib/events.mjs');
 const { acquireLease } = await import('../bin/lib/lease.mjs');
+// The watchdog's own BACKPRESSURE builder and storm reason, so the freeze tests carry the payload
+// exactly as the tick emits it.
+const { backpressure } = await import('../bin/lib/wd/rotation-events.mjs');
+const { STORM_REASON } = await import('../bin/lib/wd/backpressure.mjs');
 
 const CLI = fileURLToPath(new URL('../bin/soma.mjs', import.meta.url));
 
@@ -65,6 +69,28 @@ const emit = (stream, type, { lead = stream === 'orch' ? null : stream, payload 
 
 /** A hand-written fleet checkpoint: the rows `enqueue` refuses to write still reach a reader this way. */
 const writeFleetRows = (home, tasks) => writeFileSync(join(home, 'state', 'fleet.json'), JSON.stringify({ tasks }));
+
+/**
+ * Append one event by hand at the `ts` it is given, its id following from it the way `events.mjs`
+ * stamps one: the freeze tests below run a clock of their own, two hours of ticks in a second.
+ */
+const put = (home, stream, ts, type, payload = {}, lead = stream === 'orch' ? null : stream) => {
+  const id = `${String(ts).padStart(13, '0')}-0000`;
+  writeFileSync(join(home, 'events', `${stream}.ndjson`), `${JSON.stringify({ id, ts, type, payload, lead })}\n`, { flag: 'a' });
+  return id;
+};
+
+/**
+ * The two BACKPRESSURE payloads the watchdog emits (`bin/soma-watchdog.mjs`). A storm is said on
+ * every frozen tick with its record's `since`, or under another freeze's record with the tick's own
+ * time, and carries the leads whose limit hits make it up. The spend cap is said once per freeze.
+ */
+const STORM = (since) => ({ ...backpressure({ reason: STORM_REASON, since, until: null }).payload, evidence: [{ lead: 'cr-1' }, { lead: 'cr-2' }] });
+const SPEND_CAP = (since) => backpressure({ reason: 'org_level_disabled_until', since, until: null }).payload;
+const BP = '[soma] fleet BACKPRESSURE. Call soma_inbox.';
+/** A clock for the freeze tests, in ms; any 13-digit time will do. */
+const T0 = 1_700_000_000_000;
+const TICK = 30_000;
 
 /** Every file under `dir` with its bytes, inode and mtime, and every directory's entries: what "wrote nothing" claims. */
 const snapshot = (dir) => {
@@ -353,9 +379,12 @@ test('the cap: 25 unread ring events are 20 wake lines and one "…and 5 more" l
   seed('cr-1', 'cr-2');
   const { watcher } = await mod();
   const sent = [];
+  // Every ring type but BACKPRESSURE, which rings once per freeze (its own tests, below): two of
+  // them in this fleet would be one freeze, and one wake line.
+  const EACH = RING.filter((type) => type !== 'BACKPRESSURE');
   for (let i = 0; i < 25; i++) {
     const lead = i % 2 ? 'cr-2' : 'cr-1';
-    const type = RING[i % RING.length];
+    const type = EACH[i % EACH.length];
     emit(lead, type);
     sent.push(W(lead, type));
   }
@@ -380,6 +409,191 @@ test('the cap\'s edges: exactly 20 is 20 lines and no more-line, and 21 is 20 li
   writeCursor('orch', last.id);
   for (let i = 0; i < 21; i++) emit('cr-1', 'NEEDS_INPUT');
   assert.deepEqual(watcher({}).events(), [...Array(20).fill(W('cr-1', 'NEEDS_INPUT')), moreLine(1)]);
+});
+
+// ------------------------------------------------------------------------- BACKPRESSURE, once a freeze
+//
+// The watchdog says a storm's BACKPRESSURE on EVERY frozen tick, deliberately: a storm's end has no
+// event, so the repetition records how long it held. A watcher that rang each one would wake the
+// orchestrator every 30 s for the whole storm, hours of it under a five-hour window and days under
+// a weekly one. So in ring mode a BACKPRESSURE with a reason (a non-empty string) rings unless the
+// last one with a reason this watcher saw, rung or not, has the same reason and either the same
+// `since` or a ts less than BACKPRESSURE_QUIET_MS (10 minutes) before this one's. One it does not
+// ring is still taken as said: it is never announced later, it becomes the last one seen, and it
+// takes no place under the 20-line cap. One with no reason always rings and leaves the last one seen
+// as it was. The last one seen is one slot. `--all` is the raw stream and prints every one.
+
+test('BACKPRESSURE rings once per freeze: a storm said every 30 s for two hours is one wake line, through a drain and a silence', async (t) => {
+  const home = stateRoot(t);
+  seed('cr-1', 'cr-2');
+  const { watcher } = await mod();
+  const w = watcher({});
+  const said = [];
+  let first = null;
+  for (let i = 0; i <= 240; i++) {
+    const id = put(home, 'orch', T0 + i * TICK, 'BACKPRESSURE', STORM(T0));
+    first ??= id;
+    said.push(...w.events());
+    // soma_inbox drains the first wake while the storm goes on.
+    if (i === 1) writeCursor('orch', first);
+  }
+  assert.deepEqual(said, [BP], 'one storm, said every tick for two hours, is one wake');
+  // The watchdog was down for three hours and came back to the same storm record: the same since.
+  put(home, 'orch', T0 + 240 * TICK + 180 * MIN, 'BACKPRESSURE', STORM(T0));
+  assert.deepEqual(w.events(), [], 'the same since is the same freeze, however long the silence');
+});
+
+test('BACKPRESSURE once per freeze: a restart mid-storm says it once', async (t) => {
+  const home = stateRoot(t);
+  seed('cr-1', 'cr-2');
+  const { watcher } = await mod();
+  // A hundred re-emits, none drained: a watcher started now says the storm once.
+  for (let i = 0; i < 100; i++) put(home, 'orch', T0 + i * TICK, 'BACKPRESSURE', STORM(T0));
+  const w = watcher({});
+  assert.deepEqual(w.events(), [BP]);
+  put(home, 'orch', T0 + 100 * TICK, 'BACKPRESSURE', STORM(T0));
+  assert.deepEqual(w.events(), []);
+  // What a watcher has seen lives in its memory only, so the next restart says it once again.
+  assert.deepEqual(watcher({}).events(), [BP]);
+});
+
+test('BACKPRESSURE once per freeze: a spend cap, which the watchdog says once, rings once', async (t) => {
+  const home = stateRoot(t);
+  seed('cr-1');
+  const { watcher } = await mod();
+  put(home, 'orch', T0, 'BACKPRESSURE', SPEND_CAP(T0));
+  const w = watcher({});
+  assert.deepEqual(w.events(), [BP]);
+  assert.deepEqual(w.events(), []);
+});
+
+test('BACKPRESSURE once per freeze: a storm under a spend cap\'s record, each re-emit dated by its tick, is one more wake, not one a tick', async (t) => {
+  const home = stateRoot(t);
+  seed('cr-1', 'cr-2');
+  const { watcher } = await mod();
+  const w = watcher({});
+  const said = [];
+  put(home, 'orch', T0, 'BACKPRESSURE', SPEND_CAP(T0));
+  said.push(...w.events());
+  // Under another freeze's record the storm has no record of its own to carry a since from, so each
+  // re-emit stamps its tick: a new since every 30 s, an hour of them.
+  for (let i = 1; i <= 120; i++) {
+    const ts = T0 + i * TICK;
+    put(home, 'orch', ts, 'BACKPRESSURE', STORM(ts));
+    said.push(...w.events());
+  }
+  assert.deepEqual(said, [BP, BP], 'the spend cap, then the storm: two freezes, two wakes');
+});
+
+test('BACKPRESSURE once per freeze: a new storm after eleven quiet minutes rings again', async (t) => {
+  const home = stateRoot(t);
+  seed('cr-1', 'cr-2');
+  const { watcher } = await mod();
+  const w = watcher({});
+  const said = [];
+  let ts = T0;
+  for (let i = 0; i <= 20; i++) {
+    ts = T0 + i * TICK;
+    put(home, 'orch', ts, 'BACKPRESSURE', STORM(T0));
+    said.push(...w.events());
+  }
+  // Eleven minutes with no BACKPRESSURE, then a storm with a since of its own.
+  const t2 = ts + 11 * MIN;
+  for (let i = 0; i <= 20; i++) {
+    put(home, 'orch', t2 + i * TICK, 'BACKPRESSURE', STORM(t2));
+    said.push(...w.events());
+  }
+  assert.deepEqual(said, [BP, BP], 'two storms, eleven minutes apart, are two wakes');
+});
+
+test('BACKPRESSURE once per freeze: the ten minutes run from the last one seen, said or not, and end at exactly BACKPRESSURE_QUIET_MS', async (t) => {
+  const home = stateRoot(t);
+  seed('cr-1', 'cr-2');
+  const { watcher, BACKPRESSURE_QUIET_MS } = await mod();
+  const QUIET = 600_000;
+  // A new since every time, so only the gap decides. 9 + 9 minutes is two gaps under ten, not one
+  // of eighteen: the one not said is still the last one seen. Ten minutes exactly is no longer
+  // under ten; a millisecond less still is.
+  const at = [T0, T0 + 9 * MIN, T0 + 18 * MIN, T0 + 18 * MIN + QUIET, T0 + 18 * MIN + 2 * QUIET - 1];
+  const w = watcher({});
+  const said = at.map((ts) => {
+    put(home, 'orch', ts, 'BACKPRESSURE', STORM(ts));
+    return w.events();
+  });
+  assert.deepEqual(said, [[BP], [], [], [BP], []]);
+  assert.equal(BACKPRESSURE_QUIET_MS, QUIET, 'and the constant says so');
+});
+
+test('BACKPRESSURE once per freeze: a re-emit it does not ring is said for good, and another freeze after it does not bring it back', async (t) => {
+  const home = stateRoot(t);
+  seed('cr-1', 'cr-2');
+  const { watcher } = await mod();
+  const w = watcher({});
+  const said = [0, 1, 2].map((i) => {
+    put(home, 'orch', T0 + i * TICK, 'BACKPRESSURE', STORM(T0));
+    return w.events();
+  });
+  // The spend cap outranks a storm and is a freeze of its own: it rings.
+  put(home, 'orch', T0 + 3 * TICK, 'BACKPRESSURE', SPEND_CAP(T0 + 3 * TICK));
+  said.push(w.events());
+  // The storm's two re-emits are behind it, unread and of another reason. They were said.
+  said.push(w.events());
+  // The last one seen is one slot, and it holds the spend cap now: the storm's next re-emit is its
+  // reason's first since then, and rings. Storm, spend cap, storm: three wakes.
+  for (const i of [4, 5]) {
+    put(home, 'orch', T0 + i * TICK, 'BACKPRESSURE', STORM(T0));
+    said.push(w.events());
+  }
+  assert.deepEqual(said, [[BP], [], [], [BP], [], [BP], []]);
+});
+
+test('BACKPRESSURE once per freeze: one with no reason always rings, and leaves the last one seen as it was', async (t) => {
+  const home = stateRoot(t);
+  seed('cr-1', 'cr-2');
+  const { watcher } = await mod();
+  const w = watcher({});
+  const said = [];
+  const step = (i, payload) => {
+    put(home, 'orch', T0 + i * TICK, 'BACKPRESSURE', payload);
+    said.push(w.events());
+  };
+  step(0, STORM(T0));
+  // No reason, a reason that is not a string, an empty one: each rings, two in a row included.
+  step(1, {});
+  step(2, { reason: 42, since: T0 });
+  step(3, { reason: '', since: T0 });
+  step(4, {});
+  // And none of them is the last one seen: the storm's re-emit is still the same freeze.
+  step(5, STORM(T0));
+  assert.deepEqual(said, [[BP], [BP], [BP], [BP], [BP], []]);
+});
+
+test('BACKPRESSURE once per freeze: --all is the raw stream and prints every re-emit', async (t) => {
+  const home = stateRoot(t);
+  seed('cr-1', 'cr-2');
+  const { watcher } = await mod();
+  const w = watcher({ all: true });
+  const said = [];
+  for (let i = 0; i < 10; i++) {
+    put(home, 'orch', T0 + i * TICK, 'BACKPRESSURE', STORM(T0));
+    said.push(...w.events());
+  }
+  assert.deepEqual(said, Array(10).fill(BP));
+});
+
+test('BACKPRESSURE once per freeze: re-emits it does not ring take no place under the cap', async (t) => {
+  const home = stateRoot(t);
+  seed('cr-1', 'cr-2');
+  const { watcher } = await mod();
+  for (let i = 0; i < 25; i++) put(home, 'orch', T0 + i * TICK, 'BACKPRESSURE', STORM(T0));
+  put(home, 'cr-1', T0 + 15_000, 'NEEDS_INPUT');
+  put(home, 'cr-1', T0 + 45_000, 'NEEDS_INPUT');
+  put(home, 'cr-2', T0 + 10 * MIN + 15_000, 'NEEDS_INPUT');
+  const w = watcher({});
+  // 28 unread ring events, 24 of them re-emits of one storm: four wake lines, oldest first, and no
+  // "…and N more" line.
+  assert.deepEqual(w.events(), [BP, W('cr-1', 'NEEDS_INPUT'), W('cr-1', 'NEEDS_INPUT'), W('cr-2', 'NEEDS_INPUT')]);
+  assert.deepEqual(w.events(), []);
 });
 
 test('a fleet row whose id is not a lead id is never read as a stream', async (t) => {
