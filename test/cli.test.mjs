@@ -1124,6 +1124,123 @@ test('enqueue with no --file says which flag is missing instead of parsing undef
   assert.match(h.stderr(), /--file/);
 });
 
+/** The issue's soma.json: one repo, `r`, and the default budget classes. */
+const ONE_REPO = JSON.stringify({ repos: { r: { path: '/repos/r', base_branch: 'main' } } });
+
+/** Four rows `soma_enqueue` refuses, one per reason, each on a row the fleet's own id rule admits. */
+const REFUSED_ROWS = [
+  { id: 'orch', repo: 'r', brief: 'b' },
+  { id: 'typo-repo', repo: 'rr', brief: 'b' },
+  { id: 'typo-class', repo: 'r', brief: 'b', budget_class: 'standrad' },
+  { id: 'long-brief', repo: 'r', brief: 'x'.repeat(40_000) },
+];
+
+/** `soma enqueue` over the real soma.json reader and the real `fleet.enqueue`, under `$SOMA_HOME`. */
+const realEnqueue = (rows) => {
+  const h = mk({ readFile: () => JSON.stringify(rows) });
+  delete h.deps.loadConfig;
+  delete h.deps.enqueue;
+  return h;
+};
+
+/** The `skipped N:` block, read back as the `{id, reason}` rows it prints. */
+const skippedOf = (stdout) => stdout.split('\n')
+  .map((line) => /^ {2}(.+) — (.+)$/.exec(line))
+  .filter((m) => m !== null)
+  .map(([, id, reason]) => ({ id: id === '(no id)' ? null : id, reason }));
+
+test('enqueue --file refuses what soma_enqueue refuses: the reserved id, an unknown repo or budget class, an over-long brief', async (t) => {
+  const home = root(t);
+  writeFileSync(join(home, 'soma.json'), ONE_REPO);
+  // Each of the four used to reach the checkpoint through this door alone: `orch` would file its
+  // reports into the orchestrator's own stream, the repo typo fails at admission three times, the
+  // class typo is never applied, and the 40,000-character brief reaches the lead in full.
+  const mixed = realEnqueue([...REFUSED_ROWS, { id: 'good-row', repo: 'r', brief: 'b' }]);
+  assert.equal(await dispatch(['enqueue', '--file', 'tasks.json'], mixed.deps), 0, 'one row was queued, so the enqueue succeeded');
+  const fp = join(home, 'state', 'fleet.json');
+  assert.deepEqual(JSON.parse(readFileSync(fp, 'utf8')).tasks.map((x) => x.id), ['good-row'], 'only the good row reaches the checkpoint');
+  const out = mixed.stdout();
+  assert.match(out, /^queued 1: good-row$/m);
+  assert.match(out, /^skipped 4:$/m);
+  assert.deepEqual(skippedOf(out), [
+    { id: 'orch', reason: 'reserved-id' },
+    { id: 'typo-repo', reason: 'unknown-repo' },
+    { id: 'typo-class', reason: 'unknown-budget-class' },
+    { id: 'long-brief', reason: 'brief-too-long' },
+  ]);
+  // The bus's hint beside those two refusals, one line each: what the file could have said instead.
+  assert.match(out, /^known repos: r$/m);
+  const classes = /^known budget classes: (.+)$/m.exec(out)?.[1]?.split(', ') ?? [];
+  assert.ok(classes.includes('standard') && !classes.includes('standrad'), `known budget classes: ${classes.join(', ')}`);
+
+  // The four alone: rows were offered and none was taken, so exit 3, and the checkpoint is the
+  // bytes it was.
+  const before = readFileSync(fp, 'utf8');
+  const alone = realEnqueue(REFUSED_ROWS);
+  assert.equal(await dispatch(['enqueue', '--file', 'tasks.json'], alone.deps), 3);
+  assert.equal(readFileSync(fp, 'utf8'), before, 'the fleet is unchanged');
+  assert.match(alone.stderr(), /nothing was queued/);
+  assert.equal(skippedOf(alone.stdout()).length, 4);
+});
+
+test('enqueue with an unreadable soma.json still refuses the reserved id and an over-long brief, and checks no repo or class', async (t) => {
+  const home = root(t);
+  writeFileSync(join(home, 'soma.json'), '{"repos": ');
+  // As `soma_enqueue` does when its config read fails: with no repo map and no budgets there is
+  // nothing to check a repo or a class against, so those rows queue. The two checks that need no
+  // config still hold, and the one warning says what went unchecked.
+  const h = realEnqueue(REFUSED_ROWS);
+  assert.equal(await dispatch(['enqueue', '--file', 'tasks.json'], h.deps), 0);
+  assert.deepEqual(JSON.parse(readFileSync(join(home, 'state', 'fleet.json'), 'utf8')).tasks.map((x) => x.id), ['typo-repo', 'typo-class']);
+  assert.deepEqual(skippedOf(h.stdout()), [{ id: 'orch', reason: 'reserved-id' }, { id: 'long-brief', reason: 'brief-too-long' }]);
+  assert.doesNotMatch(h.stdout(), /^known /m, 'no hint: nothing was refused for a name soma.json could have listed');
+  assert.equal(h.err.length, 1, `one warning, got: ${JSON.stringify(h.err)}`);
+  assert.match(h.err[0], /\bbudget_class\b/, 'and it says the budget classes went unchecked too');
+});
+
+test('soma_enqueue and enqueue --file queue the same rows from the same file, and skip the rest for the same reasons', async (t) => {
+  // Two fresh state roots, one per door, with the same soma.json, the real reader and the real
+  // `fleet.enqueue` behind both: the bus's reply and the CLI's printout must name the same rows.
+  const busHome = root(t);
+  const cliHome = mkdtempSync(join(tmpdir(), 'soma-cli-'));
+  t.after(() => rmSync(cliHome, { recursive: true, force: true }));
+  writeFileSync(join(busHome, 'soma.json'), ONE_REPO);
+  writeFileSync(join(cliHome, 'soma.json'), ONE_REPO);
+  const rows = [
+    { id: 'good-row', repo: 'r', brief: 'b' },
+    ...REFUSED_ROWS,
+    42,                                                    // not a task object at all
+    { id: 'BAD', repo: 'r', brief: 'b' },                  // the fleet's own id rule
+    { id: 'good-row', repo: 'r', brief: 'b' },             // and its duplicate check
+    { id: 'pinned', repo: 'r', brief: 'b', budget_class: 'research' },
+  ];
+
+  const { orchTools } = await import('../bin/lib/bus-tools.mjs');
+  const { enqueue } = await import('../bin/lib/fleet.mjs');
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  const bus = orchTools({
+    env: { SOMA_ROLE: 'orchestrator', SOMA_SESSION_ID: 'S1' },
+    deps: { readLease: () => ({ session_id: 'S1', heartbeat_at: Date.now() }), loadConfig, enqueue },
+  });
+  const reply = await bus.get('soma_enqueue')({ tasks: rows });
+  assert.ok(Array.isArray(reply.queued), `the bus refused the call: ${JSON.stringify(reply).slice(0, 200)}`);
+
+  process.env.SOMA_HOME = cliHome;
+  const cli = realEnqueue(rows);
+  assert.equal(await dispatch(['enqueue', '--file', 'tasks.json'], cli.deps), 0);
+  const out = cli.stdout();
+
+  assert.deepEqual(reply.queued, ['good-row', 'pinned'], 'the premise: the bus queues the two good rows');
+  assert.equal(/^queued \d+: (.+)$/m.exec(out)?.[1], reply.queued.join(', '), 'the same rows are queued');
+  const bySet = (list) => list.map((x) => JSON.stringify([x.id, x.reason])).sort();
+  assert.deepEqual(bySet(skippedOf(out)), bySet(reply.skipped), 'the same rows are skipped, for the same reasons');
+  assert.equal(skippedOf(out).length, 7);
+  assert.equal(/^known repos: (.+)$/m.exec(out)?.[1], reply.known_repos?.join(', '), 'and the same repo hint');
+  assert.equal(/^known budget classes: (.+)$/m.exec(out)?.[1], reply.known_budget_classes?.join(', '), 'and the same class hint');
+  const idsIn = (home) => JSON.parse(readFileSync(join(home, 'state', 'fleet.json'), 'utf8')).tasks.map((x) => x.id);
+  assert.deepEqual(idsIn(cliHome), idsIn(busHome), 'the two checkpoints hold the same rows');
+});
+
 // --------------------------------------------------------------------------- usage
 
 test('unknown subcommand exits non-zero with usage', async (t) => {

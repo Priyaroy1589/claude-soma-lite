@@ -58,6 +58,7 @@ import { isAbsolute, join } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { intake } from './lib/bus-tools.mjs';
 import { runCanary } from './lib/canary.mjs';
 import { loadConfig } from './lib/config.mjs';
 import { runDoctor } from './lib/doctor.mjs';
@@ -1077,33 +1078,44 @@ export async function dispatch(argv, deps = {}) {
           + ` ${tasks === null ? 'null' : typeof tasks}.`);
         return USAGE_CODE;
       }
-      // The repo map goes with the tasks, because `fleet.enqueue` never reads soma.json and a
-      // task with no `verify_hint` of its own takes its repo's. A soma.json that will not load
-      // costs only that fallback, said out loud; it does not hold up the queue, and a task's
-      // own hint never depended on it.
-      let repos = null;
+      // soma.json is read once, for two uses. Its repo names and budget classes are what the
+      // intake check below judges rows against, and the repo map goes with the tasks, because
+      // `fleet.enqueue` never reads soma.json and a task with no `verify_hint` of its own takes
+      // its repo's. A soma.json that will not load costs that fallback and those two checks, said
+      // out loud; it does not hold up the queue, and a task's own hint never depended on it.
+      let cfg = null;
       try {
-        repos = d.loadConfig()?.repos;
+        cfg = d.loadConfig();
       } catch (e) {
-        d.warn(`soma enqueue: soma.json could not be read (${oneLine(reason(e))}), so no repo verify_hint was applied; tasks keep only their own.`);
+        d.warn(`soma enqueue: soma.json could not be read (${oneLine(reason(e))}), so no repo verify_hint was applied (tasks keep only their own) and no repo or budget_class was checked.`);
       }
-      let r;
-      try {
-        r = d.enqueue(tasks, { repos });
-      } catch (e) {
-        d.warn(`soma enqueue: ${reason(e)}`);
-        return ENV;
+      // The check `soma_enqueue` applies, from the same function, so the two doors into the queue
+      // cannot disagree about a row: the reserved id `orch`, the brief cap, and a repo or a
+      // budget_class soma.json does not define. A refused row never reaches `fleet.enqueue`, and
+      // when every row was refused it is not called at all, so the checkpoint is not rewritten.
+      const checked = intake(tasks, cfg);
+      let r = null;
+      if (checked.accepted.length) {
+        try {
+          r = d.enqueue(checked.accepted, { repos: cfg?.repos });
+        } catch (e) {
+          d.warn(`soma enqueue: ${reason(e)}`);
+          return ENV;
+        }
       }
       const queued = Array.isArray(r?.queued) ? r.queued : [];
-      const skipped = Array.isArray(r?.skipped) ? r.skipped : [];
+      const skipped = [...(Array.isArray(r?.skipped) ? r.skipped : []), ...checked.rejected];
       d.print(`queued ${queued.length}${queued.length ? `: ${queued.join(', ')}` : ''}`);
-      // The drops are reported, always. `fleet.enqueue` skips an invalid or duplicate id
-      // rather than throwing so one bad row does not cost the other twenty-nine — and
-      // "enqueued 30" when four were dropped is how a fleet quietly runs short.
+      // The drops are reported, always: the intake check's, and `fleet.enqueue`'s invalid or
+      // duplicate ids, each skipped rather than thrown on so one bad row does not cost the other
+      // twenty-nine. "enqueued 30" when four were dropped is how a fleet quietly runs short.
       if (skipped.length) {
         d.print(`skipped ${skipped.length}:`);
         for (const s of skipped) d.print(`  ${s?.id ?? '(no id)'} — ${s?.reason ?? 'unknown'}`);
       }
+      // The bus's hint, one line each, printed only beside a refusal it explains.
+      if (checked.known_repos) d.print(`known repos: ${checked.known_repos.join(', ')}`);
+      if (checked.known_budget_classes) d.print(`known budget classes: ${checked.known_budget_classes.join(', ')}`);
       // Rows were offered and none was taken: the fleet is unchanged, so the exit code says so.
       // `queued 0` beside a zero exit is how a plan of thirty duplicate ids reads as a success.
       if (queued.length === 0 && tasks.length > 0) {

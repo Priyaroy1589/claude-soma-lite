@@ -5,6 +5,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { startSkip, tmuxSandbox } from './tmux-sandbox.mjs';
 
 /** The module under test, freshly instantiated (it holds no state, but keeps the fresh-import idiom). */
 const load = (tag) => import('../bin/lib/tmux.mjs?' + tag);
@@ -667,26 +668,34 @@ test('defaultRun reports a failing tmux instead of throwing, and keeps its noise
 });
 
 test('against a real tmux: the transcript path, the wake, and a wedged server', { skip: !tmuxInstalled && 'tmux not installed' }, async (t_) => {
-  const saved = process.env.SOMA_TMUX_SOCKET;
-  process.env.SOMA_TMUX_SOCKET = TEST_SOCKET;    // a throwaway server: never the operator's live fleet
-  t_.after(() => { if (saved === undefined) delete process.env.SOMA_TMUX_SOCKET; else process.env.SOMA_TMUX_SOCKET = saved; });
-  const t = await load('integration');
-  assert.equal(t.tmuxArgs([])[1], TEST_SOCKET, 'the integration test must not run on the production socket');
-  const name = `soma-selftest-${process.pid}`;
+  // A throwaway server, never the operator's live fleet, in a short private TMUX_TMPDIR of its own
+  // (tmux-sandbox.mjs) rather than the caller's: its socket binds under any TMPDIR (issue #46), and
+  // no socket name can reach a live server. Both are set BEFORE the import, since tmux.mjs reads
+  // SOMA_TMUX_SOCKET at load, and both reach the tmux child through the inherited environment.
+  const box = tmuxSandbox(TEST_SOCKET, { prefix: 'si-' });
+  if (!box.dir) return t_.skip(box.skip);
   // Everything a stub cannot prove: that tmux accepts these vectors, that the
   // transcript lands at the exact path, and that a wedged tmux gives up.
   const dir = mkdtempSync(join(tmpdir(), 'soma smoke '));
   // `#` and `%` are tmux format sequences, the space and quote are shell metachars.
   const logPath = join(dir, "lead #1 100% it's.log");
-  // Filled in once the server is up; neither the last session dying nor
-  // kill-server unlinks the socket file, so the throwaway one goes with us
-  // rather than littering /tmp with one dead socket per test run.
-  let socketPath = '';
+  const saved = { SOMA_TMUX_SOCKET: process.env.SOMA_TMUX_SOCKET, TMUX_TMPDIR: process.env.TMUX_TMPDIR };
+  process.env.SOMA_TMUX_SOCKET = TEST_SOCKET;
+  process.env.TMUX_TMPDIR = box.dir;
+  // One hook, so the order holds: the server, then the box, then the environment. The kill names the
+  // box itself, so it reaches this server whatever the module or the environment ended up as, and it
+  // comes first because tmux reads a TMUX_TMPDIR that does not exist as unset: sent once the box had
+  // gone, it would go to /tmp, where the live servers are. The box takes the socket file with it,
+  // which neither the last session dying nor kill-server unlinks.
   t_.after(() => {
-    t.killSession(name);
-    if (socketPath.includes(TEST_SOCKET)) rmSync(socketPath, { force: true });
+    spawnSync('tmux', ['-L', TEST_SOCKET, 'kill-server'], { env: { ...process.env, TMUX_TMPDIR: box.dir } });
+    rmSync(box.dir, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   });
+  const t = await load('integration');
+  assert.equal(t.tmuxArgs([])[1], TEST_SOCKET, 'the integration test must not run on the production socket');
+  const name = `soma-selftest-${process.pid}`;
 
   try {
     // `-f /dev/null` on the call that STARTS the server, the only one that reads a config: the
@@ -696,8 +705,9 @@ test('against a real tmux: the transcript path, the wake, and a wedged server', 
       (args) => t.defaultRun(['-f', '/dev/null', ...args]));
   } catch (e) {
     // A pty-exhausted host ("fork failed: Device not configured") is an OS
-    // limit, not a regression — do not fail the fleet's build over it.
-    return t_.skip(`tmux could not start a session here: ${e.message}`);
+    // limit, not a regression — do not fail the fleet's build over it. A socket
+    // path too long to bind is neither, and the skip says so.
+    return t_.skip(startSkip(e.message, box.socket));
   }
 
   const until = async (what, fn, ms = 4000) => {
@@ -708,8 +718,9 @@ test('against a real tmux: the transcript path, the wake, and a wedged server', 
     assert.fail(`timed out waiting for ${what}`);
   };
 
-  socketPath = t.defaultRun(['display-message', '-p', '#{socket_path}']).stdout.trim();
+  const socketPath = t.defaultRun(['display-message', '-p', '#{socket_path}']).stdout.trim();
   assert.ok(socketPath.endsWith(TEST_SOCKET), `expected a throwaway socket, got ${socketPath}`);
+  assert.ok(socketPath.startsWith(realpathSync(box.dir)), `expected a socket inside the sandbox, got ${socketPath}`);
   assert.equal(t.hasSession(name), true);
   assert.ok(t.listSessions().includes(name));
   // The transcript exists at exactly the path asked for — not at a hostname-
@@ -738,21 +749,24 @@ test('against a real tmux: the transcript path, the wake, and a wedged server', 
 
 test('against a real tmux: serverAbsent reads a never-started and a killed server as absent, a running one as present', { skip: !tmuxInstalled && 'tmux not installed' }, async (t_) => {
   // A sandbox of its own, not only a socket name: TMUX_TMPDIR moves the directory tmux keeps every
-  // socket in, so not even a mistyped name could reach a live fleet's server. Both are set BEFORE the
+  // socket in, so not even a mistyped name could reach a live fleet's server. tmux-sandbox.mjs keeps
+  // it short enough for the socket to bind under any TMPDIR (issue #46). Both are set BEFORE the
   // import — tmux.mjs reads SOMA_TMUX_SOCKET at load — and both reach the tmux child through the
   // inherited environment.
-  const dir = mkdtempSync(join(tmpdir(), 'st-'));
   const sock = `soma-absent-${process.pid}`;
+  const box = tmuxSandbox(sock, { prefix: 'st-' });
+  if (!box.dir) return t_.skip(box.skip);
   const saved = { SOMA_TMUX_SOCKET: process.env.SOMA_TMUX_SOCKET, TMUX_TMPDIR: process.env.TMUX_TMPDIR };
   process.env.SOMA_TMUX_SOCKET = sock;
-  process.env.TMUX_TMPDIR = dir;
+  process.env.TMUX_TMPDIR = box.dir;
   // The cleanup names the sandbox itself rather than going through the module, so it cannot reach
-  // any other server whatever state the module ended up in.
-  const sandbox = (args) => spawnSync('tmux', ['-L', sock, ...args], { encoding: 'utf8', env: { ...process.env, TMUX_TMPDIR: dir } });
+  // any other server whatever state the module ended up in. The server goes before the box, and the
+  // box before the environment, for the reason the test above gives.
+  const sandbox = (args) => spawnSync('tmux', ['-L', sock, ...args], { encoding: 'utf8', env: { ...process.env, TMUX_TMPDIR: box.dir } });
   t_.after(() => {
     sandbox(['kill-server']);
+    rmSync(box.dir, { recursive: true, force: true });
     for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
-    rmSync(dir, { recursive: true, force: true });
   });
   const t = await load('server-absent-real');
   assert.equal(t.tmuxArgs([])[1], sock, 'this test must not run on the production socket');
@@ -766,14 +780,20 @@ test('against a real tmux: serverAbsent reads a never-started and a killed serve
   // `-f /dev/null` on the call that starts the server, for the reason the test above gives.
   const up = t.defaultRun(['-f', '/dev/null', 'new-session', '-d', '-s', `soma-absent-probe-${process.pid}`, 'cat']);
   // A pty-exhausted host is an OS limit, not a regression (the same allowance as the test above).
-  if (up.code !== 0) return t_.skip(`tmux could not start a session here: ${up.stderr.trim()}`);
+  if (up.code !== 0) return t_.skip(startSkip(up.stderr, box.socket));
   assert.equal(t.serverAbsent(), false, 'a running server is not absent');
   const socketPath = t.defaultRun(['display-message', '-p', '#{socket_path}']).stdout.trim();
-  assert.ok(socketPath.startsWith(realpathSync(dir)), `expected a socket inside the sandbox, got ${socketPath}`);
+  assert.ok(socketPath.startsWith(realpathSync(box.dir)), `expected a socket inside the sandbox, got ${socketPath}`);
 
   // kill-server: the server is gone, its socket file stays behind (measured on 3.6a), and a connect
-  // to it is refused — tmux's OTHER sentence, "no server running on …".
+  // to it is refused — tmux's OTHER sentence, "no server running on …". Gone once it has finished
+  // exiting, that is: kill-server returns first, and a server on its way out drops a client
+  // unanswered, "server exited unexpectedly", which serverAbsent deliberately does not read as
+  // absent (issue #43). So the wait is bounded, and a server that never goes still fails.
   assert.equal(t.defaultRun(['kill-server']).code, 0);
+  for (const deadline = Date.now() + 5000; !t.serverAbsent() && Date.now() < deadline;) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
   assert.equal(t.serverAbsent(), true, `after kill-server — tmux said: ${said()}`);
   if (existsSync(socketPath)) assert.match(said(), /^no server running on /, 'a stale socket file must be the path this exercised');
 });

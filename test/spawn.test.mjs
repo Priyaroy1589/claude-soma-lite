@@ -1334,11 +1334,143 @@ test('the module still exports the six names the rest of the system pins', () =>
   assert.equal(typeof s.resumeLead, 'function');
 });
 
-test('spawnLead returns the four fields bus-tools and the watchdog both read', () => {
+test('spawnLead returns the five fields bus-tools and the watchdog both read', () => {
   const { deps } = harness();
   const r = s.spawnLead({ id: 'cr-1', repo: 'r', brief: 'do x' }, deps);
-  assert.deepEqual(Object.keys(r).sort(), ['cwd', 'lead', 'session_uuid', 'tmux_target']);
+  assert.deepEqual(Object.keys(r).sort(), ['base_sha', 'cwd', 'lead', 'session_uuid', 'tmux_target']);
   assert.equal(r.lead, 'cr-1');
+});
+
+// --- the base commit: leads/<id>/meta.json and the row's base_sha ----------------------------
+//
+// `ensureWorktree` reports `base_sha`, the tip of `origin/<base>` as just fetched. On a fresh cut
+// that IS the commit the checkout was made from; on a reused checkout it is only the remote's tip
+// now, and the commit the checkout was cut from is whatever the first cut recorded. Each test
+// below uses its own lead id, because `leads/<id>/` is shared state under this file's one root.
+
+/** `leads/<id>/meta.json` as the spawner wrote it, or null when there is none. */
+const metaOf = (id) => {
+  try {
+    return JSON.parse(readFileSync(join(leadDir(id), 'meta.json'), 'utf8'));
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw e;
+  }
+};
+
+/** An `ensureWorktree` answering for `id`: a checkout on `soma/<id>`, freshly cut or reused, with `tip` as the remote's tip. */
+const worktreeAt = (id, tip, reused) => () => ({ dir: `/w/${id}`, branch: `soma/${id}`, base_sha: tip, reused, excluded: true });
+
+test('a fresh cut records its base: spawnLead returns it, and leads/<id>/meta.json holds it with the launch\'s fixed facts', () => {
+  const before = Date.now();
+  const { deps } = harness({ ensureWorktree: worktreeAt('base-fresh', 'abc123', false), uuid: () => 'u-fresh' });
+  const r = s.spawnLead({ id: 'base-fresh', repo: 'r', brief: 'do x' }, deps);
+  assert.equal(r.base_sha, 'abc123');
+  const meta = metaOf('base-fresh');
+  assert.notEqual(meta, null, 'leads/base-fresh/meta.json was not written');
+  const { spawned_at: spawnedAt, ...facts } = meta;
+  assert.deepEqual(facts, {
+    id: 'base-fresh', repo: 'r', base_branch: 'develop', base_sha: 'abc123', branch: 'soma/base-fresh',
+    worktree: '/w/base-fresh', reused: false, session_uuid: 'u-fresh', tmux_target: 'lead-base-fresh',
+  }, 'only what the spawn fixed: no seat or config dir (a rotation changes those), and no RC URL');
+  const t = Date.parse(spawnedAt);
+  assert.ok(typeof spawnedAt === 'string' && t >= before && t <= Date.now(), `spawned_at is the spawn's own ISO time, got ${spawnedAt}`);
+});
+
+test('a reused worktree takes its base from the meta.json the spawner wrote, over the row, and never from the remote tip', () => {
+  // A record for the same branch that disagrees with the row. The record wins: the spawner wrote
+  // it before the launch, while the row only got its copy after, through a write that can fail on
+  // its own (a fresh -r2 cut whose row write failed leaves the row naming the old branch's base).
+  mkdirSync(leadDir('base-row'), { recursive: true });
+  writeFileSync(join(leadDir('base-row'), 'meta.json'), JSON.stringify({ id: 'base-row', branch: 'soma/base-row', base_sha: 'from-meta' }));
+  const { deps } = harness({ ensureWorktree: worktreeAt('base-row', 'newer-tip', true) });
+  const r = s.spawnLead({ id: 'base-row', repo: 'r', brief: 'do x', base_sha: 'orig' }, deps);
+  assert.equal(r.base_sha, 'from-meta');
+  assert.equal(metaOf('base-row')?.base_sha, 'from-meta');
+  assert.equal(metaOf('base-row')?.reused, true);
+});
+
+test('with no meta.json to read, a reused worktree falls back to the base its row recorded', () => {
+  // A lead spawned before meta.json existed, or a lead dir someone wiped: the row is all there is.
+  const id = 'base-norecord';
+  const fp = join(leadDir(id), 'meta.json');
+  const reuse = () => harness({ ensureWorktree: worktreeAt(id, 'newer-tip', true) }).deps;
+  rmSync(fp, { force: true });
+  assert.equal(s.spawnLead({ id, repo: 'r', brief: 'do x', base_sha: 'orig' }, reuse()).base_sha, 'orig');
+  // A file that does not parse, or parses to no record at all, is as good as none.
+  for (const garbage of ['{"branch": ', '[]']) {
+    writeFileSync(fp, garbage);
+    assert.equal(s.spawnLead({ id, repo: 'r', brief: 'do x', base_sha: 'orig' }, reuse()).base_sha, 'orig', `meta.json holding ${garbage}`);
+  }
+  assert.equal(metaOf(id)?.base_sha, 'orig', 'and the new record carries it on');
+});
+
+test('a readable meta.json for another branch, or with no base of its own, leaves the base unknown even when the row has one', () => {
+  // After a retry suffix the checkout here is on soma/<id>-r2, cut later. A record of soma/<id> is
+  // the one a failed meta write on that cut left behind, and the row's base may be from the same
+  // stale cut: neither says what -r2 was cut from.
+  const id = 'base-stale';
+  const fp = join(leadDir(id), 'meta.json');
+  const reuse = () => harness({ ensureWorktree: worktreeAt(id, 'newer-tip', true) }).deps;
+  mkdirSync(leadDir(id), { recursive: true });
+  writeFileSync(fp, JSON.stringify({ id, branch: `soma/${id}-old`, base_sha: 'old-branch' }));
+  assert.equal(s.spawnLead({ id, repo: 'r', brief: 'do x', base_sha: 'orig' }, reuse()).base_sha, null);
+  writeFileSync(fp, JSON.stringify({ id, branch: `soma/${id}`, base_sha: null }));
+  assert.equal(s.spawnLead({ id, repo: 'r', brief: 'do x', base_sha: 'orig' }, reuse()).base_sha, null);
+  assert.equal(metaOf(id)?.base_sha, null);
+});
+
+test('a reused worktree with no recorded base carries the one meta.json holds for the same branch, and a resume leaves that record alone', () => {
+  const id = 'base-carry';
+  const fp = join(leadDir(id), 'meta.json');
+  const reuse = () => harness({ ensureWorktree: worktreeAt(id, 'newer-tip', true) }).deps;
+  mkdirSync(leadDir(id), { recursive: true });
+  writeFileSync(fp, JSON.stringify({ id, branch: `soma/${id}`, base_sha: 'first-cut' }));
+  const r = s.spawnLead({ id, repo: 'r', brief: 'do x' }, reuse());
+  assert.equal(r.base_sha, 'first-cut');
+  assert.equal(metaOf(id)?.base_sha, 'first-cut');
+
+  // A resume is a relaunch of the same session in the same checkout, not a new record of it.
+  const bytes = readFileSync(fp, 'utf8');
+  const resumed = s.resumeLead({ id, repo: 'r', brief: 'do x', lead_session_uuid: 'u-old' }, harness().deps);
+  assert.equal(readFileSync(fp, 'utf8'), bytes, 'resumeLead rewrote meta.json');
+  assert.equal(Object.hasOwn(resumed, 'base_sha'), false, 'resumeLead reports no base: it cut nothing');
+
+  // A record for another branch says nothing about this checkout, and with no record at all the
+  // base is unknown: null, never the tip, which is a commit this checkout was not cut from.
+  writeFileSync(fp, JSON.stringify({ id, branch: `soma/${id}-r2`, base_sha: 'other-branch' }));
+  assert.equal(s.spawnLead({ id, repo: 'r', brief: 'do x' }, reuse()).base_sha, null);
+  rmSync(fp);
+  assert.equal(s.spawnLead({ id, repo: 'r', brief: 'do x' }, reuse()).base_sha, null);
+  assert.equal(metaOf(id)?.base_sha, null);
+});
+
+test('a launch that fails after a fresh cut still leaves its base in meta.json, and the retry that reuses the checkout carries it', () => {
+  const id = 'base-retry';
+  const failing = harness({
+    ensureWorktree: worktreeAt(id, 'cut-sha', false),
+    newSession: () => { throw new Error('tmux new-session failed (1)'); },
+  });
+  assert.throws(() => s.spawnLead({ id, repo: 'r', brief: 'do x' }, failing.deps), /tmux new-session failed/);
+  assert.equal(metaOf(id)?.base_sha, 'cut-sha', 'written before the launch, so a launch that throws cannot lose it');
+  // The caller rolled the row back to queued with no base on it. The next attempt finds the clean
+  // checkout and reuses it, by which time the remote has moved on.
+  const r = s.spawnLead({ id, repo: 'r', brief: 'do x', base_sha: null }, harness({ ensureWorktree: worktreeAt(id, 'later-tip', true) }).deps);
+  assert.equal(r.base_sha, 'cut-sha');
+  assert.equal(metaOf(id)?.base_sha, 'cut-sha');
+  assert.equal(metaOf(id)?.reused, true);
+});
+
+test('a meta.json that cannot be written fails the spawn before anything launches', () => {
+  const id = 'base-unwritable';
+  // A DIRECTORY where meta.json goes: the rename onto it fails, and nothing else in leads/<id>/
+  // is in the way, so this refuses on the record and on nothing else.
+  const fp = join(leadDir(id), 'meta.json');
+  mkdirSync(join(fp, 'in-the-way'), { recursive: true });
+  const { deps, calls } = harness({ ensureWorktree: worktreeAt(id, 'abc123', false) });
+  assert.throws(() => s.spawnLead({ id, repo: 'r', brief: 'do x' }, deps));
+  assert.deepEqual(calls.newSession, [], 'a lead launched with no record of its base is the gap this closes');
+  rmSync(fp, { recursive: true, force: true });
 });
 
 // --- seats: a per-launch config dir ------------------------------------------------
