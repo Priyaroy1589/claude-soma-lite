@@ -1563,6 +1563,40 @@ test('up beside a watchdog already running reads soma.json too, and refuses one 
   assert.equal(ok.calls.confirm.length, 0);
 });
 
+test('up asks about the max_leads admission will run, when soma.json spells it as a string (#21)', async (t) => {
+  const home = root(t);
+  // The REAL loader, for the same reason as above: the bug was two readers disagreeing about one
+  // file. The projection read `"10"` as 0 and asked to open the queue to 0 leads; admission ran ten.
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ max_leads: '10' }));
+  const h = mk({ loadConfig });   // declined: the prompt is the subject, nothing need start
+  await dispatch(['up'], h.deps);
+  assert.equal(h.calls.confirm.length, 1);
+  assert.match(h.calls.confirm[0], /Open the queue to 10 concurrent leads\?/);
+  assert.match(h.stdout(), /Fleet worst case: 10 leads × 38,000,000 est_tokens \(iterate/);
+});
+
+test('up refuses a max_leads no reader accepts, before it asks or starts anything (#21)', async (t) => {
+  const home = root(t);
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  // Two refusals, both exit ENV before the prompt: the real loader refuses the file, and — for a
+  // config that reached the arm unjudged (the stub below) — the projection refuses it too.
+  const cases = [
+    [{ max_leads: 'ten' }, /max_leads/],
+    [{ max_leads: 2.5 }, /max_leads/],
+  ].map(([overlay, key]) => [JSON.stringify(overlay), () => { writeFileSync(join(home, 'soma.json'), JSON.stringify(overlay)); return loadConfig; }, key]);
+  cases.push(['an unjudged cfg', () => () => ({ max_leads: 'ten', budgets: {} }), /projectFleetSpend: max_leads/]);
+  for (const [label, arrange, key] of cases) {
+    const h = mk({ loadConfig: arrange() }, { answer: true });
+    assert.equal(await dispatch(['up'], h.deps), 2, `${label}: the ENV exit code`);
+    assert.match(h.stderr(), /^soma up: /m);
+    assert.match(h.stderr(), key, `${label}: the refusal must name the key`);
+    assert.doesNotMatch(h.stdout(), /worst case/i, 'a projection was printed from a refused value');
+    assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend on a refused value');
+    assert.equal(h.calls.newSession.length, 0, 'a watchdog was started on a refused value');
+  }
+});
+
 test('up --canary does not open the queue on a verdict that is not a pass', async (t) => {
   root(t);
   const bad = mk({ canary: async () => false }, { answer: true });
@@ -2684,6 +2718,30 @@ test('resume refuses a soma.json loadConfig refuses BEFORE the kill, with the re
 
   // The control: the same row on a config that loads is killed first and resumed.
   writeFileSync(join(home, 'soma.json'), JSON.stringify({ seats: [] }));
+  const ok = mk({ readFleet: fleet, loadConfig });
+  assert.equal(await dispatch(['resume', 'cr-1'], ok.deps), 0, ok.stderr());
+  assert.equal(ok.calls.killSession.length, 1);
+  assert.equal(ok.calls.resumeLead.length, 1);
+});
+
+test('resume refuses a max_leads loadConfig refuses BEFORE the seat pick and the kill, with exit 2 (#21)', async (t) => {
+  const home = root(t);
+  // The same refusal as the seats one above, reached through the same `validated`: a seated
+  // config, so a pick that ran before the refusal would be recorded.
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ max_leads: 'ten', seats: [{ config_dir: '/s/a', label: 'seat-a' }] }));
+  const fleet = () => ({ tasks: [{ id: 'cr-1', status: 'failed', lead_session_uuid: 'u1' }] });
+  const h = mk({ readFleet: fleet, loadConfig });
+  assert.equal(await dispatch(['resume', 'cr-1'], h.deps), 2, 'the same exit `soma up` gives a config it cannot load');
+  assert.equal(h.calls.pickSeat.length, 0, 'no seat was picked');
+  assert.equal(h.calls.killSession.length, 0, 'the dead pane is still standing');
+  assert.equal(h.calls.resumeLead.length, 0);
+  assert.equal(h.calls.setTaskStatus.length, 0);
+  assert.equal(h.calls.updateFleet.length, 0);
+  assert.match(h.stderr(), /^soma resume: .*\bmax_leads must be a non-negative integer\b.*got "ten"/m, 'the loader\'s reason, which names the key');
+
+  // The control: a numeric string is a number, not a refusal, and the resume goes ahead.
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ max_leads: '10' }));
   const ok = mk({ readFleet: fleet, loadConfig });
   assert.equal(await dispatch(['resume', 'cr-1'], ok.deps), 0, ok.stderr());
   assert.equal(ok.calls.killSession.length, 1);

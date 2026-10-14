@@ -1619,6 +1619,16 @@ export function orchTools(ctx) {
   // soma_enqueue / soma_queue — the backlog
   // -------------------------------------------------------------------------
 
+  const configForEnqueue = async () => {
+    if (!has('loadConfig')) return { cfg: null, unreadable: false };
+    try {
+      const cfg = await deps.loadConfig();
+      return { cfg: isRecord(cfg) ? cfg : null, unreadable: false };
+    } catch {
+      return { cfg: null, unreadable: true };
+    }
+  };
+
   def('soma_enqueue', async ({ tasks } = {}) => {
     if (!Array.isArray(tasks)) {
       return refuse('tasks must be an array of task objects, e.g. [{"id":"task-42","title":"…","repo":"…","brief":"…"}]');
@@ -1630,7 +1640,7 @@ export function orchTools(ctx) {
     // One read of soma.json for every use: the repo names and budget classes gate intake below,
     // and the repo map itself goes to `enqueue`, which never reads the config and needs it for a
     // repo's `verify_hint`.
-    const cfg = await configOf();
+    const { cfg, unreadable } = await configForEnqueue();
     const checked = intake(tasks, cfg);
 
     let result = { queued: [], skipped: [] };
@@ -1646,7 +1656,13 @@ export function orchTools(ctx) {
     const fromFleet = Array.isArray(result.skipped)
       ? result.skipped.map((row) => ({ id: cut(row?.id, MAX_ECHO), reason: cut(row?.reason, MAX_ECHO) }))
       : [];
-    const out = { queued: Array.isArray(result.queued) ? result.queued : [], skipped: [...fromFleet, ...checked.rejected] };
+    const out = {
+      queued: Array.isArray(result.queued) ? result.queued : [],
+      skipped: [...fromFleet, ...checked.rejected],
+      ...(unreadable
+        ? { warning: 'soma.json could not be read, so repository and budget-class checks were skipped and no repo verify_hint was applied' }
+        : {}),
+    };
     if (checked.known_repos) out.known_repos = checked.known_repos;
     if (checked.known_budget_classes) out.known_budget_classes = checked.known_budget_classes;
     return out;

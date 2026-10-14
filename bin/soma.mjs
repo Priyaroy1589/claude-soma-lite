@@ -1224,8 +1224,16 @@ export async function dispatch(argv, deps = {}) {
       // The operator's own decision, taken with this figure in front of them: they kept
       // `max_leads: 10` accepting ~200M est_tokens per fleet run. It is shown once, here,
       // before the queue opens — not as a warning that scrolls past — and the arithmetic lives
-      // in `tokens.projectFleetSpend` so this arm only has to print it.
-      const spend = d.projectFleetSpend(cfg);
+      // in `tokens.projectFleetSpend` so this arm only has to print it. It throws on a
+      // `max_leads` no enforcer would accept, and that refuses here: a
+      // confirmation asked over a figure that is not the fleet's is the prompt that lies.
+      let spend;
+      try {
+        spend = d.projectFleetSpend(cfg);
+      } catch (e) {
+        d.warn(`soma up: ${reason(e)}`);
+        return ENV;
+      }
       d.print(spend.message);
       const answer = N('confirm')(`Open the queue to ${spend.max_leads} concurrent leads? Type "yes" to confirm: `);
       if (answer === null) {

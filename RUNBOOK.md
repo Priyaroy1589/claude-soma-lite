@@ -141,12 +141,13 @@ forever.
 ## 4. `soma.json`
 
 Optional. `loadConfig()` is `DEFAULTS` with your file layered over it, key by key, and unknown keys
-are preserved. A file that does not parse is refused, never read as the defaults, and so is a
-`seats` that is not an array. `soma up` then exits 2 with a message naming the key, whether or not a
-watchdog is already running; a watchdog already running logs `WATCHDOG_ERROR` on every tick and acts
-on nothing until the file is fixed, exactly as it does for an unparseable file, and `up`'s refusal
-beside it says so. Minimum useful file — **`repos` is the one you must fill in**, because a task
-naming an unconfigured repo cannot spawn:
+are preserved. A file that does not parse is refused, never read as the defaults, and so are a
+`seats` that is not an array and a `max_leads` that is not a non-negative integer (a numeric string
+such as `"10"` is read as its number). `soma up` then exits 2 with a message naming the key, whether
+or not a watchdog is already running; a watchdog already running logs `WATCHDOG_ERROR` on every tick
+and acts on nothing until the file is fixed, exactly as it does for an unparseable file, and `up`'s
+refusal beside it says so. Minimum useful file — **`repos` is the one you must fill in**, because a
+task naming an unconfigured repo cannot spawn:
 
 ```json
 {
@@ -162,7 +163,7 @@ naming an unconfigured repo cannot spawn:
 
 | key | default | effect |
 |---|---|---|
-| `max_leads` | `10` | Concurrency cap. **This is the multiplier on your worst-case spend** (§5). Lowering it is the one lever that lowers exposure. |
+| `max_leads` | `10` | Concurrency cap. **This is the multiplier on your worst-case spend** (§5). Lowering it is the one lever that lowers exposure. Must be a non-negative integer; a numeric string such as `"10"` is read as its number. |
 | `stagger_s` | `90` | Minimum seconds between admissions, so ten leads do not hit the API in the same second. At most one launch per tick regardless. |
 | `tick_ms` | `30000` | Watchdog cadence. Floored at 1000. |
 | `blocked_slot_minutes` | `120` | How long a lead that asked a question keeps its admission slot before the row flips to `blocked` and the slot frees. |

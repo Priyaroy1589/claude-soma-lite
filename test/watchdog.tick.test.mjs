@@ -4148,6 +4148,43 @@ test('admission with a seats that is not an array claims nothing: the pool is as
   assert.match(err.payload.error, /cfg\.seats must be an array/);
 });
 
+test('a max_leads loadConfig refuses ends the tick at its first line: nothing is admitted or spawned (#21)', async (t) => {
+  const { tick } = await load('adm-maxleads-' + Date.now());
+  // The REAL loader over a real soma.json: the refusal under test is loadConfig's (`validated`),
+  // the same one a non-array `seats` gets. The tick calls it before any phase's try, so the throw
+  // ends the tick — and `runLoop` (below) files it as a WATCHDOG_ERROR.
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  const fp = join(process.env.SOMA_HOME, 'soma.json');
+  mkdirSync(process.env.SOMA_HOME, { recursive: true });
+  writeFileSync(fp, JSON.stringify({ max_leads: 'ten' }));
+  t.after(() => rmSync(fp, { force: true }));
+  const c = ctx({
+    deps: { loadConfig },
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u' }), row({ id: 'b', status: 'queued' })] },
+    alive: new Set(['lead-a']),
+    readDirUsage: () => dirUsage({ est_tokens: 1_200_000, sessions: [usage({ uuid: 'u', turns: 3 })] }),
+  });
+  await assert.rejects(() => tick(c.deps), /soma\.json: max_leads must be a non-negative integer.*got "ten"/);
+  assert.deepEqual(c.calls.spawnLead, [], 'nothing was admitted on a cap no one can read');
+  assert.deepEqual(c.calls.setTaskStatus, [], 'no row was claimed');
+  assert.equal(c.task('b').status, 'queued');
+  // The stated cost of a load-time refusal, pinned so a change to it is a decision rather than an
+  // accident: the over-cap lead is NOT tripped while the file is invalid (as with `seats`).
+  assert.deepEqual(c.calls.tripBudget, [], 'the breakers are skipped until soma.json is fixed');
+  assert.deepEqual(c.calls.appendEvent, [], 'the tick itself files nothing; runLoop does');
+});
+
+test('runLoop files a tick that threw as a WATCHDOG_ERROR at where: tick, and keeps looping (#21)', () => {
+  // `runLoop` is not driven here: it reschedules itself through `setTimeout` for ever. So its catch
+  // is pinned by source, comments stripped, as the dep-set tests above pin what they cannot run.
+  const code = WD_SRC.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const body = code.slice(code.indexOf('export function runLoop('));
+  const loop = body.slice(0, body.indexOf('\n}\n'));
+  assert.match(loop, /try \{\s*await tick\(deps\);\s*\} catch \(e\) \{/, 'the tick is awaited inside a try');
+  assert.match(loop, /type: 'WATCHDOG_ERROR', payload: \{ where: 'tick', error: reason\(e\) \}/, 'and its throw is filed, by reason');
+  assert.match(loop, /setTimeout\(loop, nextDelay\(deps\)\)/, 'and the loop goes on');
+});
+
 test('cfg.seats [] — the value production actually passes — is no seats at all: no pool read, no reopen, no lock, today\'s launch', async () => {
   const { tick } = await load('lim-empty-' + Date.now());
   // A soma.json with no `seats` key — every config written before seats existed — makes
