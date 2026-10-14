@@ -1280,3 +1280,86 @@ test('acceptance: a real `soma watch --interval 1` says a NEEDS_INPUT within sec
     assert.equal(env.TMUX_TMPDIR, tt);
     assert.deepEqual(sockets(tt), [], 'a tmux server was started inside the sandbox');
   });
+
+/**
+ * A real `soma watch --interval 1`, set up the way the acceptance above is (an environment built
+ * from nothing, a throwaway socket in a throwaway TMUX_TMPDIR), on a fleet of one lead with one
+ * unread HARNESS. `until(fn, ms)` waits for `fn` or the process's exit; `exit(ms)` waits for the
+ * exit, with a SIGKILL past `ms`.
+ */
+let e2eRuns = 0;
+const watchProcess = (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'sw-e2e-'));
+  // SHORT: a Unix socket path must fit in ~104 bytes, and tmux reports the realpath.
+  const tt = mkdtempSync(existsSync('/tmp') ? '/tmp/sw-' : join(tmpdir(), 'sw-'));
+  const sock = `soma-t35-e2e-${process.pid}-${++e2eRuns}`;
+  let child = null;
+  t.after(() => {
+    if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    spawnSync('tmux', ['-L', sock, 'kill-server'], { env: { PATH: process.env.PATH ?? '', TMUX_TMPDIR: tt }, stdio: 'ignore' });
+    rmSync(base, { recursive: true, force: true });
+    rmSync(tt, { recursive: true, force: true });
+  });
+  const home = join(base, 'home');
+  const inRoot = (fn) => {
+    const prev = process.env.SOMA_HOME;
+    process.env.SOMA_HOME = home;
+    try { return fn(); } finally { if (prev === undefined) delete process.env.SOMA_HOME; else process.env.SOMA_HOME = prev; }
+  };
+  inRoot(() => {
+    ensureTree();
+    seed('cr-1');
+    emit('cr-1', 'HARNESS');
+  });
+  const env = { PATH: process.env.PATH ?? '', HOME: base, SOMA_HOME: home, TMUX_TMPDIR: tt, SOMA_TMUX_SOCKET: sock };
+  child = spawn(process.execPath, [CLI, 'watch', '--interval', '1'], { cwd: base, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '';
+  let err = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.stderr.on('data', (d) => { err += d; });
+  let closed = null;
+  const exited = new Promise((resolve) => child.on('close', (code, signal) => { closed = { code, signal }; resolve(closed); }));
+  const until = async (fn, ms) => {
+    for (const end = Date.now() + ms; Date.now() < end && closed === null;) {
+      if (fn()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return fn();
+  };
+  const exit = async (ms) => {
+    const timer = setTimeout(() => child.kill('SIGKILL'), ms);
+    const r = await exited;
+    clearTimeout(timer);
+    return r;
+  };
+  return {
+    child, inRoot, until, exit,
+    lines: () => out.split('\n').filter((l) => l !== ''),
+    stderr: () => err,
+    closed: () => closed,
+    said: () => `\nstdout:\n${out}\nstderr:\n${err}\nexit: ${JSON.stringify(closed)}`,
+  };
+};
+
+test('acceptance: SIGINT, an operator\'s Ctrl-C, ends `soma watch` with exit 0', { timeout: 60_000 }, async (t) => {
+  const p = watchProcess(t);
+  assert.ok(await p.until(() => p.lines().includes(W('cr-1', 'HARNESS')), 20_000), `no first poll within 20 s${p.said()}`);
+  p.child.kill('SIGINT');
+  const { code, signal } = await p.exit(10_000);
+  assert.equal(code, 0, `SIGINT must end the loop and exit 0 (got code ${code}, signal ${signal})${p.said()}`);
+});
+
+test('acceptance: a reader that went away is no crash: a wake line written into the closed pipe, and `soma watch` still exits 0', { timeout: 60_000 }, async (t) => {
+  const p = watchProcess(t);
+  assert.ok(await p.until(() => p.lines().includes(W('cr-1', 'HARNESS')), 20_000), `no first poll within 20 s${p.said()}`);
+  // The reader goes, and the next poll has a line to write into the pipe it left.
+  p.child.stdout.destroy();
+  p.inRoot(() => emit('cr-1', 'NEEDS_INPUT'));
+  // Ending by itself on the write error is fine, and so is polling on until the next signal. An
+  // unhandled EPIPE is not.
+  await p.until(() => false, 5_000);
+  if (p.closed() === null) p.child.kill('SIGTERM');
+  const { code, signal } = await p.exit(10_000);
+  assert.equal(code, 0, `a closed reader must not crash it (got code ${code}, signal ${signal})${p.said()}`);
+  assert.doesNotMatch(p.stderr(), /EPIPE|Unhandled 'error'|node:internal|^\s+at /m, `a crash trace on stderr${p.said()}`);
+});
