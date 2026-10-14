@@ -40,7 +40,7 @@
  *
  * **What lifts a transcript storm.** Nothing here remembers anything: each tick decides from
  * that tick's lists, and the limits phase stops listing a lead's hit when the lead is
- * relaunched (rotated, revived or spawned anew — the stale-row guard: the hit belongs to the
+ * relaunched (rotated, revived, reverted or spawned anew — the stale-row guard: the hit belongs to the
  * process the launch replaced), when the lead resumes (a healthy row after the hit reads
  * `none`), when its row stops being `spawned`, or when the hit's own `resetsAt` passes. That
  * last rule caps any false freeze: none outlasts the resets of the hits that hold it.

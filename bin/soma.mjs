@@ -2109,7 +2109,7 @@ export async function dispatch(argv, deps = {}) {
         return REFUSED;
       }
       d.print(`thawed: cleared ${JSON.stringify({ reason: rec.reason ?? null, since: rec.since ?? null, until: rec.until ?? null })}`
-        + ` (frozen since ${whenMs(rec.since)}). Admission resumes on the watchdog's next tick. If the record comes back`
+        + ` (frozen since ${whenMs(rec.since)}). Admission resumes on the watchdog's next tick unless a rate-limit storm still holds (\`soma status\` names the reason). If a spend-cap record comes back`
         + ' within a tick, a spawned lead\'s transcript still ends on the spend-cap row: the tick reads tails, not calendars,'
         + ' so move or kill those leads first (RUNBOOK §9).');
       return OK;

@@ -666,6 +666,9 @@ test('detectStorm: a freeze names every attributable lead from both lists once, 
   // Frozen by the pane rule while one limited lead is present: the limited lead is named too, first.
   assert.deepEqual(detectStorm([{ lead: 'y', paneHit: true }, { lead: 'x', paneHit: true }], leads('a')), { frozen: true, evidence: leads('a', 'y', 'x') });
   assert.deepEqual(detectStorm([{ lead: 'x', paneHit: true, transcriptHit: true }], leads('a')), { frozen: true, evidence: leads('a', 'x') });
+  // A corroborated pane row is a pane lead, never a limited one: its transcript stanza corroborates
+  // the pane rule and is not the limits phase's row, so `x` keeps its first-seen place after `y`.
+  assert.deepEqual(detectStorm([{ lead: 'y', paneHit: true }, { lead: 'x', paneHit: true, transcriptHit: true }]), { frozen: true, evidence: leads('y', 'x') });
   // Both rules at once.
   assert.deepEqual(detectStorm([{ lead: 'd', paneHit: true }, { lead: 'c', paneHit: true }], leads('b', 'a')), { frozen: true, evidence: leads('b', 'a', 'd', 'c') });
   // A lead in both lists is named once, where the limited list first named it.

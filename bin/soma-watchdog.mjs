@@ -755,10 +755,11 @@ export async function tick(deps) {
   // was written nowhere and displayed from a file nobody wrote.
   //
   // Two writers share the file: this branch (`STORM_REASON`) and the limits phase's spend cap
-  // (`reason: 'org_level_disabled_until'`). One rule keeps them apart: a branch writes only its
-  // own reason and clears only its own reason. So a storm ending cannot thaw a spend-cap freeze,
-  // and a storm cannot relabel one — the foreign record and its `since` stand. The spend-cap
-  // record is lifted by a human, through `soma thaw`; nothing in this tick clears it.
+  // (`reason: 'org_level_disabled_until'`). A branch writes only its own reason and clears only
+  // its own reason, and the spend cap outranks a storm. So a storm ending cannot thaw a spend-cap
+  // freeze, and a storm cannot relabel one (the foreign record and its `since` stand), while a
+  // spend-cap hit writes over a storm's record (`freeze`). The spend-cap record is lifted by a
+  // human, through `soma thaw`; nothing in this tick clears it.
   //
   // Deliberately re-emitted on every frozen tick and deliberately silent on the desktop. A storm's
   // END has no event, so the repetition is what records the freeze's duration for the digest; and
@@ -1796,15 +1797,19 @@ function rotate(task, { deps, cfg, history, now, verdict, pane }) {
  * (`clearBackpressure`), which is a human's act — and BACKPRESSURE is URGENT in the bus, so a
  * repeat every 30 s for the days a monthly cap lasts would be a wake every 30 s for days. It
  * reaches the orchestrator by this toast and by its next `soma_inbox` drain; the watchdog types
- * into no pane. Already-active is read off the FILE, so a freeze written by an earlier tick, or
- * by hand, is not re-announced — and an active record of ANY reason stands: a storm's record is
- * the storm branch's to clear when the storm ends, and the cap row is re-read next tick. `until`
+ * into no pane. Already-active is read off the FILE, so a spend-cap freeze written by an earlier
+ * tick, or by hand, stands and is not re-announced: once per freeze. So does any active record
+ * but a storm's. A STORM record does not stand, because the spend cap outranks a storm: the org
+ * cap is the alarm only a human can act on, and a storm can hold for hours. The cap replaces the
+ * storm's record and is said and toasted at once, and the storm branch, finding a foreign record,
+ * neither writes over it nor clears it. `until`
  * is null: the org cap carries no reset time (9 of 9 real rows), and `until` is descriptive in
  * any case — nothing expires a freeze by its own clock. Through `writeBackpressure`, which refuses
  * a seconds stamp, and the `backpressure` builder, which pins the payload.
  */
 function freeze(deps, verdict, now) {
-  if (deps.readBackpressure()?.active === true) return;
+  const rec = deps.readBackpressure();
+  if (rec?.active === true && rec.reason !== STORM_REASON) return;
   const state = { active: true, reason: verdict.rateLimitType, since: now, until: null };
   deps.writeBackpressure(state);
   deps.appendEvent(ORCH, backpressure({ reason: state.reason, since: state.since, until: state.until }));

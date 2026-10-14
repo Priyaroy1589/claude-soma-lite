@@ -5213,3 +5213,55 @@ test('a pane-only hit and one limited lead are not a storm: the two rules never 
   await tick(paneRule.deps);
   assert.deepEqual(oneEvent(paneRule, 'BACKPRESSURE').payload.evidence, [{ lead: 'a' }, { lead: 'x' }]);
 });
+
+test('an org spend cap supersedes a live storm record: written, said and toasted at once, the storm defers to it, and the tick the storm lifts admits nothing', async () => {
+  const { tick } = await load('storm-spend-cap-' + Date.now());
+  // The spend cap outranks a storm, and the storm branch already defers to a foreign record (the
+  // backpressure section above). This is the same precedence, seen from the cap's side. `freeze()`
+  // used to stand down on ANY active record, so while `a` and `b` held a storm, `s` hitting the org cap
+  // wrote no record, said nothing and toasted nobody. On the tick the storm lifted (its leads' tails
+  // ending on the cap too, which is not storm evidence), the storm branch cleared its own record and
+  // admission launched `c` onto a capped org.
+  const SPEND_CAP_RECORD = { active: true, reason: 'org_level_disabled_until', since: NOW, until: null };
+  /** `twoLeads` plus a third spawned lead `s` (session `us`), alive, so nothing here is a revival. */
+  const withS = (TAILS, backpressure) => twoLeads(TAILS, {
+    fleet: { tasks: [...stormRows(), row({ id: 's', status: 'spawned', lead_session_uuid: 'us' })] },
+    alive: new Set(['lead-a', 'lead-b', 'lead-s']),
+    backpressure,
+  });
+  // (a) Our storm record, `a` and `b` on live hits, `s` on the org cap: the cap replaces the record.
+  const storm = { active: true, reason: 'storm', since: NOW - 5 * MIN, until: null };
+  const c = withS({ ua: [FIVE_HOUR_ROW], ub: [FIVE_HOUR_ROW], us: [SPEND_CAP_ROW] }, storm);
+  await tick(c.deps);
+  assert.deepEqual(c.calls.writeBackpressure, [SPEND_CAP_RECORD], 'the cap\'s record, and nothing written over it');
+  assert.deepEqual(c.backpressure(), SPEND_CAP_RECORD);
+  // Said at once, then the storm's re-emit, under a record that is no longer its own, so it dates the tick.
+  assert.deepEqual(eventsOf(c, 'BACKPRESSURE').map((e) => e.payload), [
+    { reason: 'org_level_disabled_until', since: NOW, until: null },
+    STORM_EVENT,
+  ]);
+  assert.equal(c.calls.notify.length, 1, 'toasted at once: the one freeze no machine action lifts');
+  assert.equal(c.calls.clearBackpressure, 0);
+  assert.deepEqual(c.calls.spawnLead, []);
+  assert.equal(c.task('c').status, 'queued');
+  // (b) The tick the storm lifts: `a` and `b` end on the cap as well. The cap's record stands (it is
+  // nobody's to clear inside the tick), admission stays shut, and the freeze is not said again.
+  const lifted = withS({ ua: [SPEND_CAP_ROW], ub: [SPEND_CAP_ROW], us: [SPEND_CAP_ROW] }, c.backpressure());
+  await tick(lifted.deps);
+  assert.equal(lifted.calls.clearBackpressure, 0, 'a storm ending clears no spend-cap record');
+  assert.deepEqual(lifted.calls.spawnLead, [], 'and admits nothing onto a capped org');
+  assert.deepEqual(lifted.calls.writeBackpressure, []);
+  assert.deepEqual(eventsOf(lifted, 'BACKPRESSURE'), [], 'once per freeze');
+  assert.deepEqual(lifted.calls.notify, []);
+  assert.deepEqual(lifted.backpressure(), SPEND_CAP_RECORD);
+  // (c) The control, one reason apart from (a): the same three leads under a SPEND-CAP record. The cap is
+  // not announced again, so what (a) pins is the storm record's case and nothing else.
+  const capped = { active: true, reason: 'org_level_disabled_until', since: NOW - 5 * MIN, until: null };
+  const control = withS({ ua: [FIVE_HOUR_ROW], ub: [FIVE_HOUR_ROW], us: [SPEND_CAP_ROW] }, capped);
+  await tick(control.deps);
+  assert.deepEqual(control.calls.writeBackpressure, []);
+  assert.deepEqual(eventsOf(control, 'BACKPRESSURE').map((e) => e.payload), [STORM_EVENT], 'the storm\'s re-emit alone: the cap is not said twice');
+  assert.deepEqual(control.calls.notify, []);
+  assert.deepEqual(control.backpressure(), capped);
+  assert.deepEqual(control.calls.spawnLead, []);
+});

@@ -661,7 +661,7 @@ The watchdog tick (default 30 s) does seven things:
    no scraper pattern has been built or measured against it. The threshold is fixed at two, not a
    `soma.json` key: one lead's hit is its own seat's window, which rotation handles, and it takes
    two at once to make it the fleet's. Rotation keeps running under a freeze, and so does revival;
-   only admission is held. A hit stops counting when its lead is relaunched (rotated, revived or
+   only admission is held. A hit stops counting when its lead is relaunched (rotated, revived, reverted or
    spawned anew), when the lead resumes (a healthy row follows it), when its row stops being
    `spawned`, or when its own `resetsAt` passes, so a storm freeze never outlasts the resets of the
    hits that hold it.
@@ -677,6 +677,8 @@ The watchdog tick (default 30 s) does seven things:
    writer owns its own `reason`: a storm clears its own record once fewer than two leads still hold
    a live hit, and never clears or relabels a spend-cap record; the spend cap keeps its own writer,
    and its record holds until `soma thaw` clears it (§9) — nothing inside the fleet lifts it. The
+   org spend cap outranks a storm: a spend-cap hit replaces a live storm record and is announced at
+   once, never the reverse. The
    pane half of the evidence is still a declared stub (`paneSignals` returns `[]`), so on this build
    only transcript evidence freezes. A corrupt `state/backpressure.json` reads as "not frozen", is
    reported once as `WATCHDOG_ERROR` with `where: backpressure_file`, and is never overwritten by
@@ -955,7 +957,7 @@ stops on the next tick; running leads continue. The flag lives at `state/QUEUE_P
 | `soma hold <lead>` | Nothing in `bin/` reads `leads/<id>/HOLD`. Writing it would ship a pause that is written, displayed and **never obeyed**. | `soma_queue pause` to freeze the whole fleet; `soma kill <lead>` for one. |
 | `soma release <lead>` | The other half of `hold`. **Not** `soma_release` — that MCP tool hands back the orchestrator lease. | see above |
 | `soma gc` | No worktree/branch/log/digest sweep exists. | `git worktree remove` by hand. soma never touches `~/.claude/projects`, which `--resume` needs. |
-| `soma thaw` | Refuses a **storm** record (`reason: storm`): a live storm is the watchdog's — it re-writes its record on every tick the storm holds and clears it itself once fewer than two leads still hold a live usage-limit hit, so a clear here would be undone within a tick and would hide the storm from `soma status` meanwhile. Refuses an **unreadable** record: it never overwrites bytes it cannot read. | An org spend-cap freeze (`reason: org_level_disabled_until`) is what `soma thaw` is for: it clears `state/backpressure.json`, prints the record it cleared, and admission resumes on the next tick. Order of operations, because the tick reads transcript tails and not calendars: first move or kill every lead whose transcript still ends on the cap row — `soma send <lead> "continue"` once you believe the cap has lifted (a healthy reply proves it; a second cap row proves it has not) or `soma kill <lead>` — then `soma thaw`. A record that comes back within a tick means a spawned lead's tail still reads the cap. `soma status` / `soma_status` show `backpressure` three-state (none / FROZEN with reason and since / unreadable); the lift has no event of its own — the record is what says it lifted. |
+| `soma thaw` | Refuses a **storm** record (`reason: storm`): a live storm is the watchdog's — it re-writes its record on every tick the storm holds and clears it itself once fewer than two leads still hold a live usage-limit hit, so a clear here would be undone within a tick and would hide the storm from `soma status` meanwhile. Refuses an **unreadable** record: it never overwrites bytes it cannot read. | An org spend-cap freeze (`reason: org_level_disabled_until`) is what `soma thaw` is for: it clears `state/backpressure.json`, prints the record it cleared, and admission resumes on the next tick unless a rate-limit storm still holds. Order of operations, because the tick reads transcript tails and not calendars: first move or kill every lead whose transcript still ends on the cap row — `soma send <lead> "continue"` once you believe the cap has lifted (a healthy reply proves it; a second cap row proves it has not) or `soma kill <lead>` — then `soma thaw`. A spend-cap record that comes back within a tick means a spawned lead's tail still reads the cap. `soma status` / `soma_status` show `backpressure` three-state (none / FROZEN with reason and since / unreadable); the lift has no event of its own — the record is what says it lifted. |
 | `soma up --canary` | The flag is answered; the driver is a v1.x gap, so the canary can only report "unproven" (`canary: ERROR`) and `up` refuses with exit 3. | §5.4 and §10 |
 | `soma_inbox` from the CLI | No `inbox` subcommand in v1. | `soma digest`, or `tail -n 40 "$SOMA_HOME/events/"*.ndjson` |
 
