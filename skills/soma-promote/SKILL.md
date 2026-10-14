@@ -116,13 +116,15 @@ re-check the lease; a bare human invocation says "acting as operator" instead of
 
 Two of those rows are not substitutes, so know what you are short of.
 
-**Draining events (§3):** the user-scope `UserPromptSubmit` inject hook feeds the unread event
-*headers* into the lease-holder's next turn and advances the `orch` cursor itself — when it fires
-for you, that injection, not the tool, is why you are not blind here. Do not assume it does: a
-holder with no recorded pane, outside tmux or in a tmux server that is not soma's (the
-`degraded_wake: true` case in §1), may not match the hook's holder test, and then nothing is
-injected at all. Either way the payloads are what you lose, and the tail in the row above is where
-they still are: it reads the files directly, so nothing is consumed and re-reading is free.
+**Draining events (§3):** the user-scope `UserPromptSubmit` inject hook, registered only if the
+operator ran `soma init --inject-hook`, feeds the unread event *headers* into the lease-holder's
+next turn and advances its own `orch-inject` cursor, never your `orch` one, so `soma_inbox` still
+returns every event it showed you. When it fires for you, that injection, not the tool, is why you
+are not blind here. Do not assume it does: a holder with no recorded pane, outside tmux or in a
+tmux server that is not soma's (the `degraded_wake: true` case in §1), may not match the hook's
+holder test, and then nothing is injected at all. Either way the payloads are what you lose, and
+the tail in the row above is where they still are: it reads the files directly, so nothing is
+consumed and re-reading is free.
 
 **Handing the lease back (§5):** there is no CLI handback in v1, and `soma release <lead>` is the
 other verb. So you cannot give the lease up by typing — it passes to the next session that adopts,

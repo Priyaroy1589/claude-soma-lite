@@ -588,7 +588,7 @@ soma retry my-task-1            # put a failed or skipped row back on the queue
 | verb | what it does |
 |---|---|
 | `soma` / `soma help` | Print usage. Bare `soma` exits 1; `help`, `--help` and `-h` exit 0. |
-| `soma init [--seat <dir>]` | Create the state tree, install the `/soma-promote` skill, register the bus at user scope with this fleet's `SOMA_HOME` and tmux socket pinned, and read both back. Reports whether the inject hook is registered (it never installs it). `--seat <dir>` does the skill and the registration in a rotation seat's config dir instead. Idempotent. |
+| `soma init [--seat <dir> \| --inject-hook]` | Create the state tree, install the `/soma-promote` skill, register the bus at user scope with this fleet's `SOMA_HOME` and tmux socket pinned, and read both back. Reports whether the inject hook is registered and which state root it pins. `--inject-hook` also registers it, in this config root's `settings.json` (opt-in; refused with `--seat`). `--seat <dir>` does the skill and the registration in a rotation seat's config dir instead. Idempotent. |
 | `soma doctor` | Run every environment check and print what it observed. Exit 0 on PASS or INCOMPLETE, 3 on FAIL. |
 | `soma up [--canary]` | Print the worst-case spend projection, ask for `yes` on a terminal, start the watchdog in tmux, and read it back. No `--yes`; anything other than `y` or `yes`, including Ctrl-D, declines with exit 1. If a watchdog is already live, start nothing. `--canary` cannot pass on this build. |
 | `soma down` | Stop the watchdog. **Running leads are not stopped**: they continue unsupervised until `soma up`. |
@@ -740,21 +740,23 @@ about most of them.
 
 `bin/hooks/orch-inject.mjs` staples unread event headers onto the next prompt you type, so that
 prompt carries a lead's `NEEDS_INPUT` even if you missed the wake-up; it cannot interrupt you.
-**Nothing installs it**; `soma init` only
-reports whether it is there. Add it yourself to `$CLAUDE_CONFIG_DIR/settings.json` (or
-`~/.claude/settings.json`), pinning the state root, because the hook reads `SOMA_HOME` and your
-session does not export it:
+It is opt-in, because it runs on every prompt in every session using that config root (each one
+that does not hold the lease exits silently). Register it from the shell that pins your fleet:
 
-```json
-{ "hooks": { "UserPromptSubmit": [ { "matcher": "", "hooks": [
-  { "type": "command",
-    "command": "SOMA_HOME=/absolute/state/root node /path/to/claude-soma-lite/bin/hooks/orch-inject.mjs" }
-] } ] } }
+```bash
+soma init --inject-hook
 ```
 
-A config-dir `settings.local.json` is **not** read at user scope (measured). The hook runs on every
-prompt in every session using that config root, and exits silently for anyone who does not hold
-the lease.
+That appends one `UserPromptSubmit` entry to `$CLAUDE_CONFIG_DIR/settings.json` (or
+`~/.claude/settings.json`), keeping every other key and hook in the file. The entry pins this
+fleet's `SOMA_HOME`, because the hook reads it and your session does not export it, and the
+absolute `node` that ran `soma init`. If a hook running `orch-inject.mjs` is already there, nothing
+is rewritten, and soma says which state root it pins: a different root is exit 2, no root at all a
+warning. A `settings.json` soma cannot parse is refused and left untouched. Plain `soma init` only
+reports whether the hook is registered.
+
+A config-dir `settings.local.json` is **not** read at user scope (measured), so a hook wired there
+by hand never runs.
 
 ### Establishing the invariants by hand
 
@@ -786,9 +788,10 @@ details.
 - `hold`, `release` and `gc` refuse with a reason. `soma up --canary` cannot pass: its live driver is
   not built, so the canary reports `ERROR` (nothing proven) and `up` refuses with exit 3: *the canary
   did not report a pass*.
-- **Two hooks ship but nothing installs them**: the orchestrator inject hook (add it by hand, above)
-  and the lead's `PostCompact` re-orientation hook. After a compaction, a lead can lose its harness
-  contract. `soma_send` it a pointer to `soma_task()`.
+- **The inject hook is opt-in.** Plain `soma init` does not register it; `soma init --inject-hook`
+  does (above). The lead's re-orientation note after a compaction is registered for every lead, on
+  `SessionStart` with matcher `compact`, but a lead spawned or resumed before this change keeps its
+  old settings until its next spawn or resume.
 - **There is no digest composer.** `soma_digest` refuses, `digests/` stays empty, and `soma digest`
   prints the raw event log.
 - **No revival cooldown.** A lead that dies for a persistent reason uses all three revival attempts
@@ -816,7 +819,7 @@ details.
 | a lead is alive but silent forever | its budget breaker tripped, and **no verb clears it** | `rm "$SOMA_HOME/leads/<id>/BUDGET_TRIPPED"`, or `soma kill <lead>` |
 | a lead sits on `Do you want to proceed?` after a `cd … && grep …` | the Claude Code build prompts under bypass (2.1.259 did); doctor's `claude cd-compound read runs` is `FAIL` | move the lead to a fixed build. If it must stay, `touch "$SOMA_HOME/leads/<id>/CD_COMPOUND_ASKS"` arms the gate to deny that shape with a fix-it reason; `rm` it afterwards |
 | a lead hit `GAVE_UP` in about 90 s | **no revival cooldown**: consecutive ticks burn all 3 attempts | read the death screen in the `LEAD_DEAD` event, not the `GAVE_UP` row; `soma peek` still has the pane |
-| a lead forgot its instructions | the `PostCompact` hook exists, but **nothing registers it** | `soma send <lead> "Call soma_task() and re-read your brief."` |
+| a lead forgot its instructions after a compaction | it was spawned or resumed before the re-orientation hook (`SessionStart`, matcher `compact`) was registered, so nothing told it to re-read them | `soma send <lead> "Call soma_task() and re-read your HARNESS contract before acting."` |
 | a lead is stuck on `Quick safety check` | the wrong `.claude.json` was read, so the worktree had no trust mark | always go through your wrapper, so `CLAUDE_CONFIG_DIR` reaches the watchdog |
 | `LEAD_BLOCKED_ON_PROMPT`, or `PANE prompt` in `soma status` | the lead hit a permission or trust dialog, or is asking you a question (`pane_kind: question`) | answer it at the pane: `soma attach <lead>`. **Never `soma send` it**: the Enter approves the pending command. Escape at the pane declines *and* stops the turn, so follow with an instruction |
 | `LEAD_DEAD_SHELL`, `PANE shell`, or `zsh: command not found: …` in a pane | the pane is a bare shell, not claude; tmux-resurrect restored it after a reboot (if `~/.tmux.conf` loads continuum, every tmux server sources it, `-L soma` included) | a `spawned` row is revived by the watchdog. For `done` or `blocked` rows, `soma kill <lead>`, then `soma retry` or re-enqueue if the work is unfinished |
@@ -872,7 +875,8 @@ queue. Run `soma up` (it asks about spend again), then `soma status`. Reconcile 
 
 **Where is everything?** Under `$SOMA_HOME` (default `~/.soma`): `soma.json`, `state/`, `events/`,
 `heartbeats/`, `leads/<id>/`, `logs/`, `worktrees/<repo>/<id>/` and an empty `digests/`. Outside it,
-soma writes the skill and the bus registration into your Claude Code config, a trust mark per
+soma writes the skill and the bus registration into your Claude Code config (and, only with
+`soma init --inject-hook`, one hook entry in its `settings.json`), a trust mark per
 worktree in `.claude.json`, and `soma/<id>` branches in your repositories. It reads Claude Code's
 transcripts and never writes or deletes them.
 
@@ -888,10 +892,9 @@ build. Re-prove the RUNBOOK §10 invariants after every upgrade.
 `docs/ROADMAP.md` records what is deliberately deferred and why. In short:
 
 - **Finishing the operator experience (v1.x):** the digest composer; `hold`/`release` and `gc`; a way
-  to clear a tripped budget; installers for the inject and `PostCompact` hooks; `soma up` running
-  doctor; a revival cooldown; the live canary driver; a writeback ledger; case- and
-  quote-insensitive credential matching in the gate; notification coalescing; `meta.json` and the
-  per-task `base_sha`.
+  to clear a tripped budget; `soma up` running doctor; a revival cooldown; the live canary driver; a
+  writeback ledger; case- and quote-insensitive credential matching in the gate; notification
+  coalescing; `meta.json` and the per-task `base_sha`.
 - **Account rotation, declared out of scope for now:** detecting the orchestrator's own usage
   limit; two fleets sharing a seat; seats from different organisations; and a doctor check that
   each seat has the bus registered. Proving `crossSeatResume` on a real rotation is a bring-up step

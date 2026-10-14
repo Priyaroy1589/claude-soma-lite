@@ -67,7 +67,7 @@ const mk = (over = {}, { answer = false } = {}) => {
   const err = [];
   const calls = {
     newSession: [], killSession: [], sendKeys: [], capturePane: [], resumeLead: [],
-    exec: [], capture: [], confirm: [], installSkill: [], setTaskStatus: [],
+    exec: [], capture: [], confirm: [], installSkill: [], installInjectHook: [], setTaskStatus: [],
     enqueue: [], appendEvent: [], heartbeat: [], clearBackpressure: [],
     // The seat a resume picked, the options the spawner got, and every fleet the store was asked
     // to mutate — so a test can read the row a `resume` wrote without a real checkpoint.
@@ -104,6 +104,8 @@ const mk = (over = {}, { answer = false } = {}) => {
     confirm: (q) => { calls.confirm.push(q); return answer; },
     linkProbe: () => ({ ok: true, code: null, dir: '/state' }),
     installSkill: (cfgRoot) => { calls.installSkill.push(cfgRoot); return { ok: true, dest: '/claude/skills/soma-promote' }; },
+    // Writes nothing and says so: a refusal, never a claim that a hook was registered.
+    installInjectHook: (opts) => { calls.installInjectHook.push(opts); return { ok: false, error: 'a stub: nothing was registered' }; },
     loadConfig: () => ({ max_leads: 10, budgets: { standard: { tokens_cap: 20000000 } } }),
     readFleet: () => ({ tasks: [] }),
     enqueue: (tasks) => { calls.enqueue.push(tasks); return { queued: tasks.map((x) => x.id), skipped: [] }; },
@@ -1480,8 +1482,10 @@ test('init pins SOMA_HOME into the registration, and the read-back has three out
  * reporting it missing. The comment that used to stand here reasoned about one way the message
  * could go stale (someone finding `orch-inject.mjs` on disk) and missed this one.
  *
- * "soma init does not write user settings.json" was never the false part and is still true. The
- * false part was asserting a registration state nothing had looked at.
+ * "soma init does not write user settings.json" was never the false part, and it is still true
+ * of a plain `soma init`: only the opt-in `soma init --inject-hook` writes that file (its tests
+ * are in inject-hook.test.mjs). The false part was asserting a registration state nothing had
+ * looked at.
  *
  * The third state is the one worth the separate assertion: an unreadable or absent settings.json
  * is NOT evidence of absence, and printing it as "NOT installed" is the same two-state-over-a-
@@ -1492,13 +1496,16 @@ test('the inject-hook line is observed, and has three states not two', async (t)
   const env = { ...process.env, CLAUDE_CONFIG_DIR: '/tmp/cfgroot' };
   const withSettings = (readFile) => mk({ env, readFile });
 
-  // 1. wired by hand -> says registered, and says soma init did not do it
+  // 1. wired -> says registered, and this run, which installed nothing, does not claim the install.
+  //    It used to say "somebody wired it by hand"; since `soma init --inject-hook` exists, an
+  //    entry may be that command's work, and an observing run cannot tell which, so the pin is
+  //    now the claim that is always false here: that this run registered it.
   const on = withSettings(() => JSON.stringify({ hooks: { UserPromptSubmit: [
     { matcher: '', hooks: [{ type: 'command', command: 'SOMA_HOME=/x node /a/bin/hooks/orch-inject.mjs' }] },
   ] } }));
   await dispatch(['init'], on.deps);
   assert.match(on.stdout(), /inject hook: registered/);
-  assert.match(on.stdout(), /wired it by hand/, 'so nobody credits soma init with an install it did not do');
+  assert.doesNotMatch(on.stdout(), /registered by soma init/, 'so nobody credits a plain soma init with an install it did not do');
   assert.doesNotMatch(on.stdout(), /inject hook: NOT installed/);
   assert.match(on.stdout(), /pins SOMA_HOME/, 'a hook on the wrong root reads the default state root');
 
@@ -2518,7 +2525,7 @@ const ARM_FOR = {
   liveSessions: ['status'], serverAbsent: ['status'], paneStates: ['status'], newSession: ['up'], killSession: ['down'], sendKeys: ['send', 'cr-1', 'x'],
   capturePane: ['peek', 'cr-1'], resumeLead: ['resume', 'cr-1'], exec: ['attach', 'cr-1'],
   capture: ['init'], doctor: ['doctor'], canary: ['up', '--canary'], confirm: ['up'],
-  linkProbe: ['up'], installSkill: ['init'],
+  linkProbe: ['up'], installSkill: ['init'], installInjectHook: ['init', '--inject-hook'],
 };
 
 test('every guarded dep is refused when absent, never silently defaulted', async (t) => {
@@ -2534,9 +2541,11 @@ test('every guarded dep is refused when absent, never silently defaulted', async
   for (const name of GUARDED_DEPS) {
     const h = mk({ readFleet: () => ({ tasks: [{ id: 'cr-1', status: 'failed', lead_session_uuid: 'u1' }] }) }, { answer: true });
     delete h.deps[name];
+    // `dependency "<name>"`, not the bare name: the refusal lists every guarded dep, so any
+    // guarded dep's refusal contains every name.
     await assert.rejects(
       () => dispatch(ARM_FOR[name], h.deps),
-      (e) => e instanceof TypeError && e.message.includes(name),
+      (e) => e instanceof TypeError && e.message.includes(`dependency "${name}" is missing`),
       `omitting ${name} must be refused by name`,
     );
   }
