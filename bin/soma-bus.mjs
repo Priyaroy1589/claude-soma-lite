@@ -8,12 +8,12 @@
  * grows a candidate into the orchestrator when it takes the lease. Four jobs, in
  * the order they matter:
  *
- *   1. `realDeps()` — the seam. `bus-tools` reaches for 34 named deps and touches
+ *   1. `realDeps()` — the seam. `bus-tools` reaches for 44 named deps and touches
  *      no module itself (it has zero imports, deliberately), so every one of them
  *      is named here or the handler that needs it degrades. Some degradations are
  *      honest refusals; two are silent, and both are guarded below.
  *   2. `buildTools(env, deps)` — the role gate: `SOMA_ROLE` selects lead (3 tools),
- *      orchestrator (12), or candidate (2, and the default).
+ *      orchestrator (13), or candidate (2, and the default).
  *   3. `describe(name)` — the MCP tool declaration. A client hands these to a
  *      model, and a model cannot call `soma_send({lead, message})` if the schema
  *      declares no properties, so they are real rather than placeholders.
@@ -38,15 +38,17 @@ import * as fleet from './lib/fleet.mjs';
 import * as lease from './lib/lease.mjs';
 import * as tmux from './lib/tmux.mjs';
 import { readBackpressure } from './lib/wd/backpressure.mjs';
+import { resolveBudgetClass } from './lib/wd/budget-class.mjs';
+import { clearTrip } from './lib/wd/budget.mjs';
 import { readPane } from './lib/wd/pane-state.mjs';
 import { loadConfig } from './lib/config.mjs';
-import { validateHarnessReport } from './lib/harness.mjs';
+import { namedBudgetClassFor, validateHarnessReport } from './lib/harness.mjs';
 import { notify } from './lib/notify.mjs';
-import { p } from './lib/paths.mjs';
+import { p, worktreeDir } from './lib/paths.mjs';
 import { queuePaused, setQueuePaused } from './lib/queue.mjs';
 import { seatsSummary } from './lib/seats-summary.mjs';
 import { pick as pickOpenSeat } from './lib/seats.mjs';
-import { readUsage } from './lib/tokens.mjs';
+import { readDirUsage, readUsage } from './lib/tokens.mjs';
 
 /**
  * One diagnostic line, on stderr, never on stdout.
@@ -385,6 +387,24 @@ export function realDeps() {
     readUsage,
     tailLog,
 
+    // --- the budget, as the breaker prices and meters it (issue #59) ----------
+    // `bus-tools` is import-free, so it consumes the class rather than the resolver: the one
+    // `wd/budget-class.mjs` the watchdog's meter calls, composed here with the real reads, the
+    // lead's own event stream and the registry's NAMED class. `soma_status` shows that class and
+    // never the row's `budget_class`, which only the inbox drain moves.
+    budgetClassOf: (task, cfg) => resolveBudgetClass(task, (id) => events.readEvents(id), cfg, namedBudgetClassFor),
+    // The meter's spend: `readDirUsage` of the lead's worktree, derived by `paths.worktreeDir` as
+    // the watchdog's `leadCwd` derives it, which makes it the transcript directory of the lead and
+    // its whole team. Fixed arity, because `readDirUsage` takes an options object a forwarded
+    // argument would set.
+    readDirUsage: (cwd) => readDirUsage(cwd),
+    worktreeDir,
+    // Clearing a trip (`soma_clear_trip`): the one guarded function the CLI's `soma clear-trip` calls
+    // too. `bus-tools` hands it this bus's own `updateFleet`, so the flag and the grant go in the
+    // same transaction the watchdog's trip write takes. Fixed arity, so a forwarded argument cannot
+    // replace the options object.
+    clearTrip: (id, opts) => clearTrip(id, opts),
+
     // --- admission switches ---------------------------------------------------
     //
     // BOTH HALVES COME FROM `lib/queue.mjs`, AND THE POINT OF THAT MODULE IS THAT
@@ -608,7 +628,7 @@ const SPECS = {
   },
   soma_status: {
     description:
-      'The fleet at a glance: one row per lead (status, liveness, harness, budget class, turns, est tokens, budget %, model, heartbeat age, team pane health, PR url, tmux target), '
+      'The fleet at a glance: one row per lead (status, liveness, harness, budget class, budget grants, turns, est tokens, budget % of the allowance the breaker judges, model, heartbeat age, team pane health, PR url, tmux target), '
       + 'plus the queued ids, a status count map, backpressure, whether admission is paused, watchdog health, and who holds the lease with whether that claim is stale. '
       + 'Pass `lead` for one row. Read-only, and available to an unpromoted session. A non-zero `rows_omitted` means the lead list was capped and is partial.',
     inputSchema: obj({ lead: LEAD_ID }),
@@ -695,6 +715,15 @@ const SPECS = {
       + 'With `seats` in soma.json the resume lands on an open seat (not necessarily the one it died on) and the row records it; refused when every seat is closed or unverified.',
     inputSchema: obj({ lead: LEAD_ID, force: bool('Skip the liveness probe. Does not kill.', false) }, ['lead']),
   },
+  soma_clear_trip: {
+    description:
+      'Clear a lead\'s budget trip by granting it one more allowance of its budget class: every cap becomes (1 + grants) times the class\'s, and the lead can act again from its next tool call. '
+      + 'Removing the flag alone does not hold (the lead is still over its cap, so the next tick trips it again), which is why the flag and the grant go in one fleet transaction. '
+      + 'Each clear is logged as TRIP_CLEARED, and the lead gets a fresh 80% note at 80% of the new allowance. '
+      + 'Refused for a lead that is not tripped, and for one the breaker does not meter (only spawned and blocked rows are). '
+      + 'A wall-clock trip cleared long after it fired can still be past (1 + grants) times wall_ms, and then the next tick trips it again.',
+    inputSchema: obj({ lead: LEAD_ID }, ['lead']),
+  },
   soma_transcript: {
     description:
       'The tail of a lead\'s terminal transcript, bounded in lines and characters — the end, because that is where a death scene is. '
@@ -727,7 +756,7 @@ export const describe = (name) => {
  * The promotion is the only interesting line. `soma init` mounts this bus at user
  * scope in the *candidate* role, which is what makes `/soma-promote` one tool call
  * with no restart and no mid-session MCP mounting — so when that call succeeds the
- * ten control tools have to appear in a session that is already running. Growing
+ * eleven control tools have to appear in a session that is already running. Growing
  * the Map `serve` is holding (it reads it live, never snapshots it) and then
  * announcing `notifications/tools/list_changed` is how.
  *
@@ -749,7 +778,7 @@ export const describe = (name) => {
  *
  * This upgrade is one-way: the Map grows on a successful adopt and nothing ever shrinks
  * it, so a session that is later demoted — force-stolen from, or released — keeps all
- * twelve tools for the life of its process. `startingRole` is consulted once, at startup.
+ * thirteen tools for the life of its process. `startingRole` is consulted once, at startup.
  *
  * For most of this build that was a live hole, and a review measured it: eleven of
  * the twelve handlers never compared the caller to `lease.session_id`, so after a

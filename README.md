@@ -73,7 +73,7 @@ code runs on Node.js 24 built-ins with no npm dependencies.
   review-fix, babysitter, research spike) and reports the choice, which the bus validates against
   the registry. The harness sets the lead's budget class, unless the operator pinned one at enqueue.
 - **An MCP bus with no dependencies.** A hand-written stdio MCP server gives leads three tools to
-  report through, and gives the orchestrator twelve tools to run the fleet. A lead's
+  report through, and gives the orchestrator thirteen tools to run the fleet. A lead's
   `NEEDS_INPUT`, `ERROR` or `COMPLETED` wakes the orchestrator: a keystroke into its pane when the
   orchestrator runs inside soma's own tmux server (`tmux -L soma new-session -s orchestrator`),
   plus a desktop notification.
@@ -137,7 +137,7 @@ flowchart TB
   mounts it. `soma init` registers it at user scope with no role, so every session that uses that
   Claude Code config starts as a read-only *candidate* holding `soma_adopt` and `soma_status`. A
   successful `soma_adopt` takes the orchestrator lease (`state/orch.lease`) and grows that
-  session's tool list in place to the orchestrator's twelve, with no restart. Each lead mounts its
+  session's tool list in place to the orchestrator's thirteen, with no restart. Each lead mounts its
   own bus in the lead role, with three tools.
 - **The watchdog** (`bin/soma-watchdog.mjs`) is started by `soma up` in a tmux session on soma's
   own tmux server (`tmux -L soma`). It admits, revives, meters and rotates leads on its own; the
@@ -451,12 +451,24 @@ The retired key `resume_token_guard` is stripped with a warning if your file sti
   keeps for the lead's worktree (the lead's and its teammates'). `turn_cap` counts the lead's own
   turns and is a runaway-loop backstop, not a budget.
 - At 80% the watchdog logs a `BUDGET` event on the orchestrator's stream and writes
-  `leads/<id>/BUDGET_WARNED`. The lead hears about it once: the gate attaches a short `soma:` note
-  to the lead's next tool call that it allows, then renames the flag to `BUDGET_WARNED.delivered`.
-  Teammates never get the note. At 100% the watchdog writes `leads/<id>/BUDGET_TRIPPED`, after
+  `leads/<id>/BUDGET_WARNED`. Each lead session hears about it once per allowance: the gate
+  attaches a short `soma:` note to the lead's next tool call that it allows, then renames the flag
+  to `BUDGET_WARNED.delivered`. A lead revived onto a fresh session keeps the spend but none of the
+  old context, so it is told again; a resumed lead keeps its session and is not. Teammates never
+  get the note. At 100% the watchdog writes `leads/<id>/BUDGET_TRIPPED`, after
   which the gate denies the lead and its teammates every tool except the soma bus: a tripped lead
   can still call its bus tools, and the denial tells it to file `COMPLETED` or `ERROR` with what
-  exists. **No verb clears a trip**: delete the file by hand, or kill the lead.
+  exists, or, if the work needs more, a `NEEDS_INPUT` saying how much and why.
+- `soma clear-trip <lead>`, or the orchestrator's `soma_clear_trip`, clears a trip by granting one
+  more allowance of the lead's class. It removes the flag and raises the row's `budget_grants` in
+  one fleet transaction, and from the next tick the breaker judges every cap at (1 + grants) times
+  the class's. Each clear is logged as `TRIP_CLEARED`, and the lead is told again at 80% of the new
+  allowance; every `BUDGET` names the session and the allowance it covers (`session_uuid`,
+  `grants`). Deleting `BUDGET_TRIPPED` by hand is not a clear: the lead is still over its cap, so
+  the next tick trips it again, with a second `BUDGET` and a second toast. A wall-clock trip
+  cleared long after it fired can still be past (1 + grants) × `wall_ms`, so the next tick trips it
+  again, and another clear adds another allowance. `clear-trip` refuses a lead that is not tripped,
+  and a row the breaker does not meter.
 - The breaker prices a lead at the first class that resolves. A `budget_class` given at enqueue
   comes first, when soma.json's `budgets` defines it. Next is the class of the harness the lead
   declares (H1 standard, H2 and H3 iterate, H4 review, H5 babysit, H6 research), read from the
@@ -467,6 +479,10 @@ The retired key `resume_token_guard` is stripped with a warning if your file sti
   declared and none of it can be priced (a harness the registry does not carry or soma.json cannot
   price, or an enqueue class soma.json does not define with no priceable harness behind it), or
   nothing was declared and even H1 cannot be priced, which means a broken install.
+  `soma_status` reports the same: `budget_class` is the class this rule picks, `budget_grants` the
+  clears granted, and `budget_pct` is `budget_est_tokens`, the lead's and its team's spend, as a
+  share of the allowance, (1 + `budget_grants`) × that class's `tokens_cap`; its `est_tokens` and
+  `turns` are the lead's own session.
 - `soma_enqueue` refuses a `budget_class` soma.json does not define (`unknown-budget-class`, and
   lists the classes it does define); `soma enqueue --file` stores what the file says. The breaker
   passes such a class over and logs `HARNESS_DEFAULTED` once for that lead: the lead is priced by
@@ -607,16 +623,17 @@ soma retry my-task-1            # put a failed or skipped row back on the queue
 | `soma kill <lead> ["<reason>"]` | Kill the lead's tmux session, read tmux back, then mark the row `failed`. Exit 3 means the lead may still be running and the row was left alone. |
 | `soma resume <lead> [--force]` | Restart a dead lead from its recorded Claude Code session, on the seat soma picks. Refuses while the session may still be live, unless `--force`, and refuses a `soma.json` soma cannot load before it kills anything (exit 2). |
 | `soma retry <lead>` | Put a `failed` or `skipped` row back on the queue. A `done` row is refused: enqueue a new id instead. |
+| `soma clear-trip <lead>` | Clear a lead's budget trip by granting one more allowance of its class, and log `TRIP_CLEARED`. Refuses a lead that is not tripped, and one the breaker does not meter (exit 3). |
 | `soma digest [--lines N]` | The fleet's recent events across every stream, oldest first (default 40, at most 2000). Moves no cursor. |
 | `soma thaw` | Lift an organisation spend-cap freeze by clearing `state/backpressure.json`. Refuses a live rate-limit storm and an unreadable record. |
 | `soma hold <lead>` | **Not implemented.** Refuses with a reason (exit 3). Use `soma_queue pause` for the fleet, or `soma kill` for one lead. |
 | `soma release <lead>` | **Not implemented**, the other half of `hold`. **It is not the `soma_release` MCP tool**, which hands back the orchestrator lease. |
 | `soma gc` | **Not implemented.** Nothing sweeps worktrees, branches, logs or digests. Remove a worktree with `git worktree remove`. |
 
-`send`, `kill`, `resume`, `retry` and `thaw` accept `--as <session_id>`: soma then checks that the
-session holds the orchestrator lease and stamps its heartbeat. Without it they act as the operator
-and say so. `enqueue` ignores `--as`. There is no `inbox` subcommand: use `soma digest`, or
-`soma_inbox` from a promoted session.
+`send`, `kill`, `resume`, `retry`, `clear-trip` and `thaw` accept `--as <session_id>`: soma then
+checks that the session holds the orchestrator lease and stamps its heartbeat. Without it they act
+as the operator and say so. `enqueue` ignores `--as`. There is no `inbox` subcommand: use
+`soma digest`, or `soma_inbox` from a promoted session.
 
 **Exit codes:** `0` ok · `1` usage error, or you declined · `2` this machine cannot run soma (a
 relative `SOMA_HOME`, no hard links, an unreadable config) · `3` soma refused (a fleet state, not an
@@ -691,9 +708,9 @@ Two tools to be careful with:
 | tool | what it does |
 |---|---|
 | `soma_adopt` | Take the orchestrator lease: the promotion. Refused while a live session holds it, with `holder` and `holder_live` (`true`: the liveness check ran; `null`: it could not, so the refusal proves little). `force: true` steals it and types a `DEMOTED` notice into the old holder's pane. Operator decision only. |
-| `soma_status` | The fleet at a glance, read-only: one row per lead (status, liveness, pane state, seat, harness, budget class, turns, est tokens, budget %, model, heartbeat age, team panes, PR link), plus queue, backpressure, seat pool, watchdog health and lease. `lead` narrows it to one row. |
+| `soma_status` | The fleet at a glance, read-only: one row per lead (status, liveness, pane state, seat, harness, budget class (the one the breaker prices it at), budget grants (how many cleared trips have added an allowance), turns and est tokens (the lead's own session), budget est tokens and budget % (the spend of the lead and its team, as the breaker meters it, over (1 + grants) times the class's token cap; null unless the lead is spawned or blocked, the only rows it meters), model, heartbeat age, team panes, PR link), plus queue, backpressure, seat pool, watchdog health and lease. `lead` narrows it to one row. |
 
-**Orchestrator role** (after a successful `soma_adopt`: the two above, plus ten):
+**Orchestrator role** (after a successful `soma_adopt`: the two above, plus eleven):
 
 | tool | what it does |
 |---|---|
@@ -705,13 +722,14 @@ Two tools to be careful with:
 | `soma_send` | Type a one-line answer or instruction into a lead's composer. Refused on a dialog, a shell, a dead pane or an unreadable one unless `force: true`. |
 | `soma_kill` | Kill a lead's session, mark its row `failed`, and log why. The worktree and transcript stay. |
 | `soma_resume` | Bring a dead lead back on its recorded session (`claude --resume`), on an open seat when seats are configured. Refused while its session still looks alive; `force` skips that probe and never kills. |
+| `soma_clear_trip` | Clear a tripped lead's budget by granting one more allowance of its class, the same clear as `soma clear-trip`, and log `TRIP_CLEARED`. The reply says `cleared`, the new `grants` and whether the event was `logged`. Refused for a lead that is not tripped, or not metered. |
 | `soma_transcript` | The tail of a lead's terminal log (default 120 lines, at most 500). |
 | `soma_digest` | Always refuses on this build, with *the digest composer is not available in this build*. Use `soma_inbox`, or `soma digest` from a shell. |
 
-Seven of these (`soma_enqueue`, `soma_queue`, `soma_spawn`, `soma_inbox`, `soma_send`, `soma_kill`
-and `soma_resume`) re-check the lease on every call and refuse a session that no longer holds it,
-naming the session that does. A demoted orchestrator keeps the tools in its list but cannot act on
-the fleet.
+Eight of these (`soma_enqueue`, `soma_queue`, `soma_spawn`, `soma_inbox`, `soma_send`, `soma_kill`,
+`soma_resume` and `soma_clear_trip`) re-check the lease on every call and refuse a session that no
+longer holds it, naming the session that does. A demoted orchestrator keeps the tools in its list
+but cannot act on the fleet.
 
 **Lead role** (each lead's own bus):
 
@@ -741,7 +759,7 @@ about most of them.
   `TURNS_UNMEASURED`, `MODEL_DEVIATION`, `BLOCKED`, `VERSION_GATE`, `FLEET_DRAINED`,
   `FLEET_SETTLED`, `BACKPRESSURE`, `SEAT_CLOSED`, `SEAT_REOPENED`, `ROTATED`, `ROTATION_FAILED`,
   `ROTATION_UNAVAILABLE`, `WATCHDOG_ERROR`.
-- **From the CLI and the bus:** `KILLED`, `KILL_REFUSED`, `RETRIED`.
+- **From the CLI and the bus:** `KILLED`, `KILL_REFUSED`, `RETRIED`, `TRIP_CLEARED`.
 
 #### The inject hook (optional, recommended)
 
@@ -798,10 +816,9 @@ details.
   contract. `soma_send` it a pointer to `soma_task()`.
 - **There is no digest composer.** `soma_digest` refuses, `digests/` stays empty, and `soma digest`
   prints the raw event log.
-- **No revival cooldown.** A lead that dies for a persistent reason uses all three revival attempts
-  in about 90 seconds and lands on `GAVE_UP`. Read the death screen in the `LEAD_DEAD` event.
-- **A tripped budget cannot be cleared by any verb or tool.** `rm "$SOMA_HOME/leads/<id>/BUDGET_TRIPPED"`
-  or kill the lead.
+- **A wall-clock trip can outlast its clear.** `soma clear-trip` grants one more allowance, but a
+  wall-clock trip cleared long after it fired can still be past (1 + grants) × `wall_ms`, so the
+  next tick trips it again; each further clear adds another allowance.
 - **A rate-limit storm is announced on every tick it holds.** When two or more leads hold a live
   usage-limit hit at once, the watchdog freezes admission and lifts the freeze itself, but repeats
   `BACKPRESSURE` on every tick meanwhile (every 30 s by default). On a fleet with no seats a storm
@@ -824,9 +841,9 @@ details.
 | symptom | cause | what to do |
 |---|---|---|
 | a lead's status line says `Not logged in` | an environment name that auth needs did not reach the lead | `USER` is on both allow-lists in this build; re-prove `oauthUnderEnvI` after Claude Code upgrades |
-| a lead is alive but silent forever | its budget breaker tripped, and **no verb clears it** | `rm "$SOMA_HOME/leads/<id>/BUDGET_TRIPPED"`, or `soma kill <lead>` |
+| a lead is alive but only reports, or asks for more budget in a `NEEDS_INPUT` | its budget breaker tripped: the gate denies it every tool but the soma bus | `soma clear-trip <lead>` grants one more allowance of its class (the orchestrator's `soma_clear_trip` does the same), or `soma kill <lead>`. Deleting `BUDGET_TRIPPED` by hand is re-tripped within a tick |
 | a lead sits on `Do you want to proceed?` after a `cd … && grep …` | the Claude Code build prompts under bypass (2.1.259 did); doctor's `claude cd-compound read runs` is `FAIL` | move the lead to a fixed build. If it must stay, `touch "$SOMA_HOME/leads/<id>/CD_COMPOUND_ASKS"` arms the gate to deny that shape with a fix-it reason; `rm` it afterwards |
-| a lead hit `GAVE_UP` in about 90 s | **no revival cooldown**: consecutive ticks burn all 3 attempts | read the death screen in the `LEAD_DEAD` event, not the `GAVE_UP` row; `soma peek` still has the pane |
+| a dead lead's pane stays up, with no `LEAD_DEAD`, for up to an hour | the revival backoff: the first relaunch is immediate, the second comes no sooner than 15 minutes after the first, and the third no sooner than an hour after the second. Nothing is logged while a lead waits | read the death screen with `soma peek <lead>`. The row stays `spawned` and keeps its slot; `LEAD_DEAD` and `REVIVED` arrive at the relaunch, and `GAVE_UP` after the third attempt is not delayed |
 | a lead forgot its instructions | the `PostCompact` hook exists, but **nothing registers it** | `soma send <lead> "Call soma_task() and re-read your brief."` |
 | a lead is stuck on `Quick safety check` | the wrong `.claude.json` was read, so the worktree had no trust mark | always go through your wrapper, so `CLAUDE_CONFIG_DIR` reaches the watchdog |
 | `LEAD_BLOCKED_ON_PROMPT`, or `PANE prompt` in `soma status` | the lead hit a permission or trust dialog, or is asking you a question (`pane_kind: question`) | answer it at the pane: `soma attach <lead>`. **Never `soma send` it**: the Enter approves the pending command. Escape at the pane declines *and* stops the turn, so follow with an instruction |
@@ -902,10 +919,10 @@ build. Re-prove the RUNBOOK §10 invariants after every upgrade.
 
 `docs/ROADMAP.md` records what is deliberately deferred and why. In short:
 
-- **Finishing the operator experience (v1.x):** the digest composer; `hold`/`release` and `gc`; a way
-  to clear a tripped budget; installers for the inject and `PostCompact` hooks; a revival cooldown;
-  the live canary driver; a writeback ledger; case- and quote-insensitive credential matching in the
-  gate; notification coalescing; `meta.json` and the per-task `base_sha`.
+- **Finishing the operator experience (v1.x):** the digest composer; `hold`/`release` and `gc`;
+  installers for the inject and `PostCompact` hooks; storm-aware revival; the live canary driver; a
+  writeback ledger; case- and quote-insensitive credential matching in the gate; notification
+  coalescing; `meta.json` and the per-task `base_sha`.
 - **Account rotation, declared out of scope for now:** detecting the orchestrator's own usage
   limit; two fleets sharing a seat; seats from different organisations; and a doctor check that
   each seat has the bus registered. Proving `crossSeatResume` on a real rotation is a bring-up step

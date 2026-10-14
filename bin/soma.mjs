@@ -72,6 +72,7 @@ import { resumeLead } from './lib/spawn.mjs';
 import * as tmux from './lib/tmux.mjs';
 import { projectFleetSpend, readUsage } from './lib/tokens.mjs';
 import { STORM_REASON, clearBackpressure, readBackpressure } from './lib/wd/backpressure.mjs';
+import { clearTrip } from './lib/wd/budget.mjs';
 import { CENSUS_LINES, readPane, takeCensus } from './lib/wd/pane-state.mjs';
 
 /** The watchdog's tmux session name. One spelling, shared by the start, the probe and the kill. */
@@ -272,6 +273,7 @@ export const USAGE = `usage: soma <command> [args]
   kill <lead> ["<reason>"]    kill a lead's session and mark its row failed
   resume <lead> [--force]     restart a dead lead from its recorded claude session
   retry <lead>                put a finished row back on the queue
+  clear-trip <lead>           clear a lead's budget trip by granting one more allowance of its budget class
   enqueue --file <tasks.json> add tasks from a JSON array
   digest [--lines N]          the fleet's recent events, oldest first, consuming nothing
   thaw                        lift an org spend-cap freeze: clear state/backpressure.json (refuses a live rate-limit storm)
@@ -618,6 +620,10 @@ export async function dispatch(argv, deps = {}) {
     // the same clearer `soma thaw` is for. Unguarded: both touch only state/ under $SOMA_HOME.
     backpressureState: readBackpressure,
     clearBackpressure,
+    // The one guarded function that clears a budget trip, shared with the bus's `soma_clear_trip`.
+    // Unguarded: it writes the checkpoint through the `updateFleet` it is handed and removes two
+    // flags under `leads/<id>/`, all under $SOMA_HOME.
+    clearTrip,
     projectFleetSpend,
     readFile: (f) => readFileSync(f, 'utf8'),
     // Unguarded on purpose, like `setTaskStatus` and `enqueue`: `pickSeat` reads soma.json and
@@ -2026,6 +2032,42 @@ export async function dispatch(argv, deps = {}) {
       const logged = logOrch({ type: 'RETRIED', payload: { lead: id, from: row.status }, lead: id });
       d.print(`retry ${id}: re-queued from ${row.status}, event ${logged ? 'logged' : 'NOT logged'}.`
         + ' The watchdog admits it on a later tick — admission is staggered and capped by max_leads.');
+      return OK;
+    }
+
+    case 'clear-trip': {
+      // Clear a lead's budget trip. Removing `leads/<id>/BUDGET_TRIPPED` alone is undone within a
+      // tick: the lead is still over its cap, so the meter trips it again, with a second BUDGET 100
+      // and a second toast. So this goes through `wd/budget.clearTrip`, the one guarded function the
+      // bus's `soma_clear_trip` calls too. In ONE fleet transaction it removes the flag, and an 80%
+      // note left from the old allowance, and raises the row's `budget_grants`, so the meter judges
+      // every cap at (1 + grants) times the class's from then on. Its refusals (an unknown lead, a
+      // row the meter does not judge, a lead that is not tripped, a count that is not one) are
+      // relayed as they are: they name no path. The event is logged AFTER the transaction, so a
+      // refused or failed clear leaves no TRIP_CLEARED in the history.
+      const id = positionals(rest)[0];
+      if (badId(id)) return USAGE_CODE;
+      const act = actor();
+      if (!act.ok) {
+        d.warn(act.message);
+        return REFUSED;
+      }
+      d.print(act.note);
+      if (act.as) d.heartbeat(act.as);
+      let out;
+      try {
+        out = d.clearTrip(id, { updateFleet: d.updateFleet });
+      } catch (e) {
+        // "No allowance was granted" holds on every path here: the grant is published only when the
+        // whole transaction is, and the meter re-trips a flag removed without one on its next tick.
+        d.warn(`soma clear-trip: no allowance was granted to ${id}: ${reason(e)}`);
+        return REFUSED;
+      }
+      // By whom, as `actor()` established it: the orchestrator only when `--as` proved the lease.
+      const logged = logOrch({ type: 'TRIP_CLEARED', payload: { grants: out.grants, by: act.as ? 'orchestrator' : 'operator' }, lead: id });
+      d.print(`clear-trip ${id}: trip cleared, budget_grants ${out.grants} (every cap is now ${out.grants + 1}x its class's),`
+        + ` event ${logged ? 'logged' : 'NOT logged'}. The gate stops denying on ${id}'s next tool call, and the watchdog`
+        + ' judges it against the new allowance from its next tick.');
       return OK;
     }
 

@@ -970,7 +970,7 @@ test('a lead already warned in the log is not warned again', async () => {
   });
   await tick(c.deps);
   assert.deepEqual(eventsOf(c, 'BUDGET'), []);
-  assert.deepEqual(c.calls.warnBudget, [], 'the flag goes with the event: a lead warned once is not written a second note');
+  assert.deepEqual(c.calls.warnBudget, [], 'the flag goes with the event: a session warned once is not written a second note');
 });
 
 // ════════════════════ The 80% warning reaches the lead ════════════════════
@@ -978,8 +978,8 @@ test('a lead already warned in the log is not warned again', async () => {
 // The BUDGET event lands on the orchestrator's stream, which the lead never reads. So at the 80%
 // verdict the watchdog also writes `leads/<id>/BUDGET_WARNED`, and the PreToolUse gate hands the lead
 // a note on its next allowed tool call (`bin/hooks/lead-gate.mjs`, job 5). The flag goes FIRST: the
-// logged BUDGET is the once-per-lead dedupe, so a write that failed after it landed would never be
-// retried and the lead would never be told.
+// logged BUDGET is the dedupe, once per lead SESSION and ALLOWANCE, so a write that failed after it
+// landed would never be retried and the lead would never be told.
 
 test('at 80% the watchdog writes the lead its flag, then logs the BUDGET', async () => {
   const { tick } = await load('warnflag-' + Date.now());
@@ -1054,6 +1054,342 @@ test('the real warnBudget writes the flag at warnPath, and heals a thinned state
     else process.env.SOMA_HOME = savedHome;
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+// ════════════════════ The 80% note is per session, not per lead ════════════════════
+//
+// Spend is the worktree directory's, so it carries across revivals; the note does not. A lead
+// revived `fresh` is a new session (a new `lead_session_uuid`) with none of the old context, so it
+// starts already past 80% of the same budget and has never been told. So the dedupe is per SESSION:
+// every BUDGET names the session it covers, and the 80% branch fires while no BUDGET covers the
+// row's current one. A `resume` keeps the uuid, and with it the note it already had. A BUDGET
+// logged before events named a session covers every session of its lead, so a lead in flight at the
+// upgrade is not told twice.
+
+/** A lead at 85% of a 1,000-token class, on session `uuid`, alive, with `orchEvents` in the log. */
+const warned = (uuid, orchEvents, over = {}) => ctx({
+  cfg: cfgOf({ budgets: { standard: { tokens_cap: 1000, turn_cap: 0, wall_ms: 0 } } }),
+  fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: uuid })] },
+  alive: new Set(['lead-a']),
+  readDirUsage: () => dirUsage({ est_tokens: 850, sessions: [usage({ uuid: 'u' }), usage({ uuid: 'v' })] }),
+  orchEvents,
+  ...over,
+});
+
+test('a lead warned on one session is warned again on a fresh one, which never saw the note', async () => {
+  const { tick } = await load('warn-fresh-' + Date.now());
+  const c = warned('v', [ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80, session_uuid: 'u' })]);
+  await tick(c.deps);
+  assert.deepEqual(c.calls.warnBudget, ['a'], 'session v was never told it is past 80%');
+  const budget = oneEvent(c, 'BUDGET');
+  assert.equal(budget.payload.pct, 80);
+  assert.equal(budget.payload.session_uuid, 'v');
+  ranBefore(c.order, 'warnBudget:a', 'event:BUDGET');
+  assert.deepEqual(c.calls.notify, [], 'a warning is still not toasted');
+});
+
+test('a resume keeps its session, and with it the note: no second warning', async () => {
+  const { tick } = await load('warn-resume-' + Date.now());
+  const c = warned('u', [
+    ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80, session_uuid: 'u' }),
+    ev('REVIVED', 'a', NOW - 10 * MIN, { plan: 'resume', attempt: 1, session_uuid: 'u' }),
+  ]);
+  await tick(c.deps);
+  assert.deepEqual(c.calls.warnBudget, []);
+  assert.deepEqual(eventsOf(c, 'BUDGET'), []);
+});
+
+test('a BUDGET logged before events named a session covers every session of its lead', async () => {
+  const { tick } = await load('warn-legacy-' + Date.now());
+  // No `session_uuid` key at all: what every BUDGET written before this change looks like. Read as
+  // one session it would re-warn every lead in flight at the upgrade. Read as all of them, a lead
+  // warned before the upgrade is not told again on any fresh session it starts after it: one missed
+  // note per such revival, and the gap closes as those leads finish.
+  const c = warned('v', [ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80 })]);
+  await tick(c.deps);
+  assert.deepEqual(c.calls.warnBudget, []);
+  assert.deepEqual(eventsOf(c, 'BUDGET'), []);
+});
+
+test('a BUDGET line whose payload is not a record is read as the legacy shape, never thrown on: the tick runs and still warns', async () => {
+  const { tick } = await load('warn-torn-' + Date.now());
+  // `orchHistory` folds the log before every phase, outside every phase's try, so a fold that threw
+  // on one torn line would reject the tick every 30 s: no census, no revival, no breaker, for the
+  // whole fleet. `Object.hasOwn(null, …)` throws, and the record check in front of it is the
+  // difference. Lead `b` has no row, so its five torn lines decide nothing but whether the fold
+  // survives them (a line with no lead never reaches the check), and lead `a`'s own warning is the
+  // evidence the fold ran to its end.
+  const torn = [null, undefined, 'garbage', 42, []].map((payload, i) => {
+    const e = ev('BUDGET', 'b', NOW - (30 - i) * MIN, payload);
+    if (payload === undefined) delete e.payload;                 // absent, not the helper's `{}`
+    return e;
+  });
+  assert.equal(Object.hasOwn(torn[1], 'payload'), false, 'the fixture must carry a line with no payload key at all');
+  // Lead `c` is at 85% on session `w` and has one torn line of its OWN. Read as the legacy shape, it
+  // covers every session of `c`, so `c` is not told: the line reads as already said, the same safe
+  // direction as a blind stream. A fold that skipped a torn line instead of reading it so would tell
+  // `c` a note the line may already stand for.
+  const h = warned('v', [...torn, ev('BUDGET', 'c', NOW - 20 * MIN, null)], {
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'v' }), row({ id: 'c', status: 'spawned', lead_session_uuid: 'w' })] },
+    alive: new Set(['lead-a', 'lead-c']),
+  });
+  await tick(h.deps);
+  assert.ok(h.calls.paneStates >= 1, 'phase 0 ran: the fold did not reject the tick');
+  assert.deepEqual(eventsOf(h, 'WATCHDOG_ERROR'), []);
+  assert.deepEqual(h.calls.warnBudget, ['a'], 'a, at 85% on a known session, is still told; c, whose own torn line reads as already said, is not');
+  const budget = oneEvent(h, 'BUDGET');
+  assert.equal(budget.lead, 'a');
+  assert.equal(budget.payload.session_uuid, 'v');
+});
+
+test('a BUDGET for a session with no uuid covers only that, not the session that later gets one', async () => {
+  const { tick } = await load('warn-null-' + Date.now());
+  // `session_uuid: null` is a BUDGET logged while the row had no uuid. It is a session like any
+  // other, not the legacy shape, so it does not cover the uuid a fresh revival writes later.
+  const told = warned(null, [ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80, session_uuid: null })]);
+  await tick(told.deps);
+  assert.deepEqual(told.calls.warnBudget, [], 'the same null session is covered');
+  const fresh = warned('v', [ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80, session_uuid: null })]);
+  await tick(fresh.deps);
+  assert.deepEqual(fresh.calls.warnBudget, ['a']);
+  assert.equal(oneEvent(fresh, 'BUDGET').payload.session_uuid, 'v');
+});
+
+test('every BUDGET the meter writes names its session, trip and warn alike, and null when the row has none', async () => {
+  const { tick } = await load('warn-names-' + Date.now());
+  const spend = (est, uuid) => ctx({
+    cfg: cfgOf({ budgets: { standard: { tokens_cap: 1000, turn_cap: 0, wall_ms: 0 } } }),
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: uuid })] },
+    alive: new Set(['lead-a']),
+    readDirUsage: () => dirUsage({ est_tokens: est, sessions: [usage({ uuid: 'u' })] }),
+  });
+  for (const [est, uuid, pct, want] of [[850, 'u', 80, 'u'], [1000, 'u', 100, 'u'], [850, null, 80, null], [1000, null, 100, null]]) {
+    const c = spend(est, uuid);
+    await tick(c.deps);
+    const budget = oneEvent(c, 'BUDGET');
+    assert.equal(budget.payload.pct, pct);
+    assert.equal(Object.hasOwn(budget.payload, 'session_uuid'), true, `${pct}%: the key itself, or a reader takes it for the legacy shape`);
+    assert.equal(budget.payload.session_uuid, want, `${pct}% on ${uuid}`);
+  }
+});
+
+test('a dead lead revived fresh is told on the same tick: the meter runs after the revival', async () => {
+  const { tick } = await load('warn-revived-' + Date.now());
+  const c = ctx({
+    cfg: cfgOf({ budgets: { standard: { tokens_cap: 1000, turn_cap: 0, wall_ms: 0 } } }),
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'old', attempts: 0 })] },
+    alive: new Set(),
+    readUsage: () => usage({ uuid: 'old', live_context: 900_000 }),                  // saturated: fresh
+    spawnLead: () => ({ lead: 'a', session_uuid: 'new', tmux_target: 'lead-a', cwd: '/w/a' }),
+    readDirUsage: () => dirUsage({ est_tokens: 850, sessions: [usage({ uuid: 'old' })] }),
+    orchEvents: [ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80, session_uuid: 'old' })],
+  });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'REVIVED').payload.plan, 'fresh');
+  assert.deepEqual(c.calls.warnBudget, ['a'], 'the new session starts past 80% and would otherwise first hear of it at the trip');
+  assert.equal(oneEvent(c, 'BUDGET').payload.session_uuid, 'new');
+  ranBefore(c.order, 'spawnLead:a', 'warnBudget:a');
+});
+
+test('a tripped lead on a fresh session is not warned: the trip already told it', async () => {
+  const { tick } = await load('warn-tripped-' + Date.now());
+  const c = warned('v', [ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80, session_uuid: 'u' })], {
+    readDirUsage: () => dirUsage({ est_tokens: 1000, sessions: [usage({ uuid: 'v' })] }),
+    tripped: () => true,
+  });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.warnBudget, []);
+  assert.deepEqual(eventsOf(c, 'BUDGET'), []);
+});
+
+test('an unreadable event log warns no session, fresh or not: it reads as already said', async () => {
+  const { tick } = await load('warn-blind-' + Date.now());
+  const c = warned('v', [], { deps: { orchEvents: () => { throw new Error('EACCES: events/orch.jsonl'); } } });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.warnBudget, []);
+  assert.deepEqual(eventsOf(c, 'BUDGET'), []);
+});
+
+// ════════════════════ A cleared trip: one more allowance per clear ════════════════════
+//
+// Removing BUDGET_TRIPPED alone was undone by the next tick: the lead was still over its cap, so it
+// tripped again, with a second BUDGET 100 and a second toast. A clear (`soma clear-trip`,
+// `soma_clear_trip`, both through `wd/budget.clearTrip`) raises the row's `budget_grants`, and the
+// meter judges every cap at (1 + grants) times the class's. Each new allowance gets its own 80% note.
+
+/** A lead on session `u` with `budget_grants: grants` and `est` directory tokens, alive, priced at `cls`. */
+const granted = (grants, est, over = {}, cls = { tokens_cap: 1000, turn_cap: 0, wall_ms: 0 }) => ctx({
+  cfg: cfgOf({ budgets: { standard: cls } }),
+  fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u', ...(grants === undefined ? {} : { budget_grants: grants }) })] },
+  alive: new Set(['lead-a']),
+  readDirUsage: () => dirUsage({ est_tokens: est, sessions: [usage({ uuid: 'u' })] }),
+  ...over,
+});
+
+test('a lead granted one more allowance is judged at twice its class: 1.5x is quiet, 1.7x warns, 2x trips', async () => {
+  const { tick } = await load('grant-judge-' + Date.now());
+  // 1,500 of 1,000 trips at no grant. One clear later it is 75% of a 2,000 allowance: no event.
+  const quiet = granted(1, 1500);
+  await tick(quiet.deps);
+  assert.deepEqual(eventsOf(quiet, 'BUDGET'), []);
+  assert.deepEqual(quiet.calls.tripBudget, [], 'a cleared lead is not re-tripped on the allowance it was granted past');
+  // The control: the same spend on a row never cleared trips.
+  const control = granted(undefined, 1500);
+  await tick(control.deps);
+  assert.deepEqual(control.calls.tripBudget, ['a']);
+
+  const warn = granted(1, 1700);
+  await tick(warn.deps);
+  assert.equal(oneEvent(warn, 'BUDGET').payload.pct, 80);
+  assert.deepEqual(warn.calls.warnBudget, ['a']);
+  const trip = granted(1, 2000);
+  await tick(trip.deps);
+  assert.equal(oneEvent(trip, 'BUDGET').payload.pct, 100);
+  assert.deepEqual(trip.calls.tripBudget, ['a']);
+  assert.equal(trip.calls.notify.length, 1);
+  // Two clears, three allowances: 2,999 is under the 3,000 cap.
+  const twice = granted(2, 2999);
+  await tick(twice.deps);
+  assert.equal(oneEvent(twice, 'BUDGET').payload.pct, 80);
+  assert.deepEqual(twice.calls.tripBudget, []);
+});
+
+test('every BUDGET names the allowance it judged: grants, and the caps as granted', async () => {
+  const { tick } = await load('grant-payload-' + Date.now());
+  // Every cap live, so a payload that carried the class's own caps could not pass for the granted ones.
+  for (const [grants, est, pct] of [[undefined, 850_000, 80], [undefined, 1_000_000, 100], [1, 1_700_000, 80], [1, 2_000_000, 100], [3, 4_000_000, 100]]) {
+    const c = granted(grants, est, {}, { ...CLASS });
+    await tick(c.deps);
+    const budget = oneEvent(c, 'BUDGET');
+    const g = grants ?? 0;
+    assert.equal(budget.payload.pct, pct, `grants ${g}, est ${est}`);
+    assert.equal(Object.hasOwn(budget.payload, 'grants'), true, 'the key itself, so a reader never has to infer it');
+    assert.equal(budget.payload.grants, g);
+    assert.deepEqual(
+      { tokens_cap: budget.payload.tokens_cap, turn_cap: budget.payload.turn_cap, wall_ms: budget.payload.wall_ms },
+      { tokens_cap: CLASS.tokens_cap * (1 + g), turn_cap: CLASS.turn_cap * (1 + g), wall_ms: CLASS.wall_ms * (1 + g) },
+      `grants ${g}: the caps the verdict was judged against`,
+    );
+    assert.equal(budget.payload.est_tokens, est);
+  }
+});
+
+test('a wall-clock trip is judged against (1 + grants) times wall_ms, and a turn trip against (1 + grants) times turn_cap', async () => {
+  const { tick } = await load('grant-wall-' + Date.now());
+  const cls = { tokens_cap: 1_000_000, turn_cap: 600, wall_ms: 8 * 3600 * 1000 };
+  // Nine hours in: past one 8-hour allowance, inside two.
+  const nine = (grants) => granted(grants, 0, { fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u', started_at: NOW - 9 * 3600 * 1000, ...(grants === undefined ? {} : { budget_grants: grants }) })] } }, cls);
+  const tripped = nine(undefined);
+  await tick(tripped.deps);
+  assert.deepEqual(tripped.calls.tripBudget, ['a']);
+  const cleared = nine(1);
+  await tick(cleared.deps);
+  assert.deepEqual(cleared.calls.tripBudget, [], 'nine hours is inside two eight-hour allowances');
+  // 700 of the lead's own turns: past 600, inside 1,200.
+  const turns = (grants) => granted(grants, 0, { readDirUsage: () => dirUsage({ est_tokens: 0, sessions: [usage({ uuid: 'u', turns: 700 })] }) }, cls);
+  const over = turns(undefined);
+  await tick(over.deps);
+  assert.deepEqual(over.calls.tripBudget, ['a']);
+  const under = turns(1);
+  await tick(under.deps);
+  assert.deepEqual(under.calls.tripBudget, []);
+});
+
+test('a budget_grants that is not a count is read as no grant at all, the strict direction', async () => {
+  const { tick } = await load('grant-garbage-' + Date.now());
+  // A hand edit the meter cannot read must not widen the allowance, and must not cost the lead its
+  // breaker either (a throw here is a WATCHDOG_ERROR and no verdict).
+  for (const bad of ['1', -1, 1.5, null, {}]) {
+    const c = granted(bad, 1500);
+    await tick(c.deps);
+    assert.deepEqual(c.calls.tripBudget, ['a'], `budget_grants ${JSON.stringify(bad)}`);
+    assert.equal(oneEvent(c, 'BUDGET').payload.grants, 0);
+    assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), []);
+  }
+});
+
+test('the 80% note re-arms for each new allowance: a BUDGET 80 covers its own session AND its own grants', async () => {
+  const { tick } = await load('grant-rearm-' + Date.now());
+  // Told at 80% of the first allowance, tripped, cleared: at 85% of the second it is told again.
+  const before = [ev('BUDGET', 'a', NOW - 60 * MIN, { pct: 80, session_uuid: 'u', grants: 0 }), ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 100, session_uuid: 'u', grants: 0 })];
+  const again = granted(1, 1700, { orchEvents: before });
+  await tick(again.deps);
+  assert.deepEqual(again.calls.warnBudget, ['a'], 'a new allowance is a new 80% to be told about');
+  assert.equal(oneEvent(again, 'BUDGET').payload.grants, 1);
+  ranBefore(again.order, 'warnBudget:a', 'event:BUDGET');
+  // Told once at the second allowance, it is not told twice.
+  const once = granted(1, 1700, { orchEvents: [...before, ev('BUDGET', 'a', NOW - MIN, { pct: 80, session_uuid: 'u', grants: 1 })] });
+  await tick(once.deps);
+  assert.deepEqual(once.calls.warnBudget, []);
+  assert.deepEqual(eventsOf(once, 'BUDGET'), []);
+  // The other session at the same allowance is still its own: the key is the pair.
+  const fresh = granted(1, 1700, { orchEvents: [ev('BUDGET', 'a', NOW - MIN, { pct: 80, session_uuid: 'v', grants: 1 })] });
+  await tick(fresh.deps);
+  assert.deepEqual(fresh.calls.warnBudget, ['a']);
+});
+
+test('a BUDGET with no grants counts as grants 0, and a legacy one with no session covers every session at grants 0 only', async () => {
+  const { tick } = await load('grant-legacy-' + Date.now());
+  // Written before allowances existed: it covers grants 0 on its own session…
+  const noGrants = [ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80, session_uuid: 'u' })];
+  const same = granted(undefined, 850, { orchEvents: noGrants });
+  await tick(same.deps);
+  assert.deepEqual(same.calls.warnBudget, []);
+  // …and not the allowance a clear granted since.
+  const later = granted(1, 1700, { orchEvents: noGrants });
+  await tick(later.deps);
+  assert.deepEqual(later.calls.warnBudget, ['a']);
+  // Written before events named a session: every session, but only the first allowance.
+  const legacy = [ev('BUDGET', 'a', NOW - 30 * MIN, { pct: 80 })];
+  const anySession = granted(undefined, 850, { orchEvents: legacy, fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'v' })] }, readDirUsage: () => dirUsage({ est_tokens: 850, sessions: [usage({ uuid: 'v' })] }) });
+  await tick(anySession.deps);
+  assert.deepEqual(anySession.calls.warnBudget, []);
+  const cleared = granted(1, 1700, { orchEvents: legacy });
+  await tick(cleared.deps);
+  assert.deepEqual(cleared.calls.warnBudget, ['a']);
+  assert.equal(oneEvent(cleared, 'BUDGET').payload.grants, 1);
+});
+
+test('the trip is written inside a fleet transaction, and only when the live row still has the grants the verdict used', async () => {
+  const { tick } = await load('grant-race-' + Date.now());
+  // The tick snapshots the fleet at its start, and phases 0-2 can take seconds before the meter runs.
+  // A clear landing in that window removes the flag and raises budget_grants on the LIVE row: judged
+  // on the snapshot's old allowance, the verdict is still 'trip', the flag is gone, and an unguarded
+  // write trips the lead again, with a second BUDGET 100 and a second toast. So the write re-checks
+  // the live row inside the transaction, and writes nothing on a mismatch; the next tick judges the
+  // new allowance.
+  const raced = granted(1, 1500);
+  // The snapshot predates the clear: grants 0, on the row the meter judges. The live row has 1.
+  raced.deps.readFleet = () => { const s = structuredClone(raced.store); s.tasks[0].budget_grants = 0; return s; };
+  await tick(raced.deps);
+  assert.deepEqual(raced.calls.tripBudget, [], 'the clear that landed after the snapshot is not undone');
+  assert.deepEqual(eventsOf(raced, 'BUDGET'), [], 'no BUDGET without the write it reports');
+  assert.deepEqual(raced.calls.notify, [], 'and no toast');
+  assert.deepEqual(eventsOf(raced, 'WATCHDOG_ERROR'), []);
+  assert.equal(raced.task().budget_grants, 1, 'the clear stands');
+
+  // The control: the snapshot and the live row agree, so the same reading trips, inside the
+  // transaction, and only then logs and toasts.
+  const agreed = granted(undefined, 1500);
+  const inner = agreed.deps.updateFleet;
+  let inside = false;
+  const tripInside = [];
+  agreed.deps.updateFleet = (mutate) => { inside = true; try { return inner(mutate); } finally { inside = false; } };
+  agreed.deps.tripBudget = (id) => { tripInside.push(inside); agreed.calls.tripBudget.push(id); agreed.order.push(`tripBudget:${id}`); };
+  await tick(agreed.deps);
+  assert.deepEqual(agreed.calls.tripBudget, ['a']);
+  assert.deepEqual(tripInside, [true], 'the flag is written under the fleet lock, where a clear cannot interleave');
+  ranBefore(agreed.order, 'tripBudget:a', 'event:BUDGET');
+  assert.equal(agreed.calls.notify.length, 1);
+
+  // A row the transaction no longer finds is not tripped either.
+  const gone = granted(undefined, 1500);
+  gone.deps.readFleet = () => structuredClone(gone.store);
+  const innerGone = gone.deps.updateFleet;
+  gone.deps.updateFleet = (mutate) => innerGone((live) => mutate({ ...live, tasks: [] }));
+  await tick(gone.deps);
+  assert.deepEqual(gone.calls.tripBudget, []);
+  assert.deepEqual(eventsOf(gone, 'BUDGET'), []);
 });
 
 // ════════════════════════ Which class prices a lead ════════════════════════
@@ -1369,6 +1705,68 @@ test('a row enqueued before the pin existed has no budget_override key at all, a
   assert.deepEqual(eventsOf(early, 'WATCHDOG_ERROR'), []);
 });
 
+/**
+ * The braces-balanced body that follows the first match of `head` in `code`, with every string and
+ * template literal blanked to spaces first (lengths kept), so a brace or a call spelled inside a
+ * string counts for nothing. '' when `head` does not occur, so a pin on it fails rather than
+ * passing on an empty subject.
+ */
+const bodyAfter = (code, head) => {
+  const blank = code.replace(/'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\[\s\S]|[^`\\])*`/g, (s) => s[0] + ' '.repeat(s.length - 2) + s[0]);
+  const m = head.exec(blank);
+  const open = m === null ? -1 : blank.indexOf('{', m.index + m[0].length);
+  if (open === -1) return '';
+  let depth = 0;
+  for (let i = open; i < blank.length; i++) {
+    if (blank[i] === '{') depth += 1;
+    else if (blank[i] === '}' && --depth === 0) return blank.slice(open, i + 1);
+  }
+  return '';
+};
+
+/**
+ * `src` as the exact pin below compares it: comments stripped as the source pins here strip them,
+ * every run of whitespace collapsed to one space, and the ends trimmed. Both sides go through it,
+ * so the expected wiring can be laid out as the source lays it out.
+ */
+const normalised = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s+/g, ' ').trim();
+
+test('the breaker prices through the one resolver soma_status calls: budgetClassOf returns resolveBudgetClass and keeps no rule of its own', () => {
+  // Issue #59 was `soma_status` and this breaker naming different classes for one lead, because
+  // each carried its own rule. Both now call `resolveBudgetClass` (`wd/budget-class.mjs`), and no
+  // behavioural test here can tell when the tick grows its own copy again: the old rule inlined
+  // back, even with drift (a HARNESS tie going to the earlier row, a blocked lead skipping its
+  // stream, newest by position rather than by stamp), left the whole suite green. So the source is
+  // pinned, comments stripped as the other source pins here strip them, and `budgetClassOf`'s body,
+  // whitespace collapsed, is pinned EXACTLY, on purpose. A looser pin can be passed by a shape that
+  // keeps the call and prices around it: the call only in a trailing comment, a statement of its
+  // own ahead of the call, a row altered on its way in, a second call chained after it. A
+  // shared-resolver invariant has no partial form, so editing this wiring means editing this pin,
+  // deliberately. And `meter` prices through `budgetClassOf`.
+  const WIRING = `{
+    return resolveBudgetClass(task, (id) => deps.leadEvents(id), cfg, (harness) => {
+      const cls = deps.budgetClassFor(harness);
+      return cls === null || cls === undefined ? null : { name: null, cls };
+    });
+  }`;
+  const code = WD_SRC.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.match(code, /^import\s*\{[^}]*\bresolveBudgetClass\b[^}]*\}\s*from\s*'\.\/lib\/wd\/budget-class\.mjs';?$/m,
+    'the tick must import the shared resolver');
+  const body = bodyAfter(code, /\bfunction budgetClassOf\s*\(/);
+  assert.notEqual(body, '', 'budgetClassOf must be findable, or the pin below tests nothing');
+  assert.equal(normalised(body), normalised(WIRING),
+    'budgetClassOf must be exactly the shared-resolver wiring; changing it means changing this pin');
+  assert.match(bodyAfter(code, /\bfunction meter\s*\(/), /\bbudgetClassOf\s*\(\s*deps\s*,\s*cfg\s*,\s*task\s*\)/,
+    'and the meter must price through budgetClassOf');
+  // The old inline rule's helpers, by their own names: none of them comes back beside the call.
+  for (const name of ['definedClass', 'fallbackClass', 'pinName', 'DEFAULT_CLASS']) {
+    assert.doesNotMatch(code, new RegExp(`\\b(?:function|const|let|var)\\s+${name}\\b`), `${name} belongs to the inline rule the resolver replaced`);
+  }
+  // The control: the extraction is ONE function's body, not the file. `meter` mentions the resolver
+  // nowhere, so a call to it must not turn up in `meter`'s extracted body.
+  assert.doesNotMatch(bodyAfter(code, /\bfunction meter\s*\(/), /\bresolveBudgetClass\s*\(/, 'the extractor scopes to one body');
+});
+
 // ════════════════════════ Model deviation ════════════════════════
 
 test('deviation comes from modelDeviation() against the exported pin, and the pin is an INFIX', async () => {
@@ -1653,6 +2051,206 @@ test('liveness that could not be read skips reconcile and revival, and says so',
   // The breaker still runs: metering reads transcripts, not tmux, and a spend cap that
   // switched itself off whenever tmux hiccuped would be inert exactly when things are wrong.
   assert.deepEqual(c.calls.readDirUsage, ['/w/a']);
+});
+
+// ════════════════════════ The revival backoff ════════════════════════
+//
+// Every 30 s tick used to be allowed a revival, so a lead that died for a persistent reason (a bad
+// credential, a broken worktree) spent all three attempts in about 90 s and gave up before anyone
+// could read its death screen. Now the second revival comes no sooner than 15 minutes after the
+// first and the third no sooner than an hour after the second, timed from the row's `revived_at`.
+// While a lead waits, nothing happens at all: the dead pane stays up for `soma peek`, and the row
+// keeps its status and its slot.
+
+/**
+ * A dead lead (no live pane) whose last revival was `ago` ms before NOW, after `attempts` of them.
+ * `pane_state` and `started_at` are seeded so the census and the meter have nothing of their own to
+ * write: any write to this row is then the revival's.
+ */
+const waiting = (attempts, ago, over = {}) => row({
+  id: 'a', status: 'spawned', lead_session_uuid: 'u', attempts, revived_at: NOW - ago,
+  pane_state: 'absent', started_at: NOW - 180 * MIN, ...over,
+});
+
+/**
+ * Which of row `id`'s fields each transaction changed, one sorted list per transaction that changed
+ * any. Read off `c.store`, so a field the tick sets only on its own snapshot never shows.
+ */
+const rowWrites = (c, id = 'a') => {
+  const writes = [];
+  const inner = c.deps.updateFleet;
+  c.deps.updateFleet = (mutate) => {
+    const before = structuredClone(c.store.tasks.find((t) => t?.id === id) ?? {});
+    const out = inner(mutate);
+    const after = c.store.tasks.find((t) => t?.id === id) ?? {};
+    const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+      .filter((k) => JSON.stringify(before[k]) !== JSON.stringify(after[k]));
+    if (keys.length > 0) writes.push(keys.sort());
+    return out;
+  };
+  return writes;
+};
+
+test('a dead lead revived a minute ago waits out its 15 minutes: nothing is captured, logged, charged, killed or written', async () => {
+  const { tick } = await load('backoff-wait-' + Date.now());
+  const c = ctx({ fleet: { tasks: [waiting(1, MIN)] }, alive: new Set() });
+  const writes = rowWrites(c);
+  await tick(c.deps);
+  assert.deepEqual(eventsOf(c, 'LEAD_DEAD'), [], 'the death is logged when the relaunch happens, not on every tick of the wait');
+  assert.deepEqual(eventsOf(c, 'REVIVED'), []);
+  assert.deepEqual(eventsOf(c, 'GAVE_UP'), []);
+  assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), []);
+  assert.deepEqual(c.calls.capturePane, [], 'the death scene is read at the relaunch, off the pane the wait leaves standing');
+  assert.deepEqual(c.calls.killSession, [], 'that pane is what `soma peek` shows, and keeping it readable is what the wait is for');
+  assert.deepEqual(c.calls.spawnLead, []);
+  assert.deepEqual(c.calls.resumeLead, []);
+  assert.deepEqual(c.calls.notify, []);
+  assert.deepEqual(writes, [], `no transaction may touch the row while it waits: ${JSON.stringify(writes)}`);
+  assert.equal(c.task().attempts, 1);
+  assert.equal(c.task().revived_at, NOW - MIN);
+  assert.equal(c.task().status, 'spawned', 'the row keeps its status, and with it its slot');
+});
+
+test('a hand-edited fractional attempts count waits out its step too: 1.5 is held like 1, not relaunched at once', async () => {
+  const { tick } = await load('backoff-frac-' + Date.now());
+  // `planRevival` accepts any non-negative finite `attempts`, so a row hand-edited to 1.5 is one the
+  // tick revives. The schedule has no entry at index 1.5: unfloored, the step is undefined, the wait
+  // is NaN, `NaN > 0` is false, and the lead is relaunched at once with no backoff at all.
+  const c = ctx({ fleet: { tasks: [waiting(1.5, MIN)] }, alive: new Set() });
+  await tick(c.deps);
+  assert.deepEqual(eventsOf(c, 'WATCHDOG_ERROR'), [], 'a count planRevival accepts is not refused here either');
+  assert.deepEqual(eventsOf(c, 'LEAD_DEAD'), []);
+  assert.deepEqual(c.calls.capturePane, []);
+  assert.deepEqual(c.calls.killSession, []);
+  assert.deepEqual(c.calls.resumeLead, []);
+  assert.deepEqual(c.calls.spawnLead, []);
+  assert.equal(c.task().attempts, 1.5, 'no attempt is charged while it waits');
+  // The control: fifteen minutes on, the same row goes, as a row at 1 would.
+  const due = ctx({ fleet: { tasks: [waiting(1.5, 15 * MIN)] }, alive: new Set() });
+  await tick(due.deps);
+  assert.deepEqual(due.calls.resumeLead, ['a']);
+});
+
+test('a waiting lead does not pick a seat either: the pick belongs to the relaunch', async () => {
+  const { tick } = await load('backoff-seat-' + Date.now());
+  // The pick reads the pool and can throw on a malformed `seats` entry. Made on every tick of an
+  // hour's wait, it would be an hour of reads, and of WATCHDOG_ERRORs for a relaunch not yet due.
+  const mk = (ago) => ctx({
+    cfg: cfgOf({ seats: [{ config_dir: '/s/a', label: 'seat-a' }] }),
+    fleet: { tasks: [waiting(1, ago, { seat: 'seat-a' })] },
+    alive: new Set(),
+    pickSeat: () => ({ config_dir: '/s/a', label: 'seat-a', closed_until: 0, closed_reason: null, unverified: false }),
+  });
+  const held = mk(MIN);
+  await tick(held.deps);
+  assert.equal(held.calls.pickSeat, 0);
+  assert.deepEqual(held.calls.resumeLead, []);
+  // The control: once the wait is over, the same fixture picks and relaunches onto the seat.
+  const due = mk(15 * MIN);
+  await tick(due.deps);
+  assert.equal(due.calls.pickSeat, 1);
+  assert.deepEqual(due.calls.resumeLead, ['a']);
+  assert.deepEqual(due.calls.resumeOpts, [{ configDir: '/s/a' }]);
+});
+
+test('fifteen minutes after the first revival, the second one goes', async () => {
+  const { tick } = await load('backoff-15-' + Date.now());
+  const c = ctx({ fleet: { tasks: [waiting(1, 15 * MIN)] }, alive: new Set() });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'LEAD_DEAD').payload.attempts, 1);
+  assert.deepEqual(c.calls.killSession, ['lead-a']);
+  assert.deepEqual(c.calls.resumeLead, ['a']);
+  assert.equal(oneEvent(c, 'REVIVED').payload.attempt, 2);
+  assert.equal(c.task().attempts, 2);
+  assert.equal(c.task().revived_at, NOW, 'the third revival is timed from this one');
+});
+
+test('the third revival waits an hour after the second, not fifteen minutes', async () => {
+  const { tick } = await load('backoff-60-' + Date.now());
+  for (const ago of [16 * MIN, 59 * MIN]) {
+    const held = ctx({ fleet: { tasks: [waiting(2, ago)] }, alive: new Set() });
+    await tick(held.deps);
+    assert.deepEqual(eventsOf(held, 'LEAD_DEAD'), [], `${ago / MIN} minutes into the hour`);
+    assert.deepEqual(held.calls.killSession, []);
+    assert.deepEqual(held.calls.resumeLead, []);
+    assert.equal(held.task().attempts, 2);
+  }
+  const due = ctx({ fleet: { tasks: [waiting(2, 60 * MIN)] }, alive: new Set() });
+  await tick(due.deps);
+  assert.equal(oneEvent(due, 'REVIVED').payload.attempt, 3);
+  assert.deepEqual(due.calls.resumeLead, ['a']);
+  assert.equal(due.task().attempts, 3);
+  assert.equal(due.task().revived_at, NOW);
+});
+
+test('a revival stamps revived_at and attempts in ONE transaction, the first revival included', async () => {
+  const { tick } = await load('backoff-txn-' + Date.now());
+  // attempts 0 and no stamp, which is every row before its first death. The first revival is
+  // immediate, and it is also the one that has to stamp the row, or the second is never held.
+  const c = ctx({
+    fleet: { tasks: [row({ id: 'a', status: 'spawned', lead_session_uuid: 'u', attempts: 0, pane_state: 'absent', started_at: NOW - 180 * MIN })] },
+    alive: new Set(),
+  });
+  const writes = rowWrites(c);
+  await tick(c.deps);
+  assert.deepEqual(c.calls.resumeLead, ['a']);
+  assert.equal(c.task().attempts, 1);
+  assert.equal(c.task().revived_at, NOW);
+  // Two writes would leave a window in which the attempt is charged and the stamp is not, and a
+  // revival read in it would go at once, which is the storm this exists to end.
+  assert.deepEqual(writes.filter((keys) => keys.includes('attempts') || keys.includes('revived_at')), [['attempts', 'revived_at']]);
+});
+
+test('at three attempts it gives up at once: the backoff never delays GAVE_UP', async () => {
+  const { tick } = await load('backoff-giveup-' + Date.now());
+  // A minute after the third revival. Held by the backoff, this lead would sit dead in its slot
+  // for another hour before saying so, and the GAVE_UP and its toast are what a human acts on.
+  const c = ctx({ fleet: { tasks: [waiting(3, MIN)] }, alive: new Set() });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'GAVE_UP').payload.attempts, 3);
+  assert.equal(c.calls.notify.length, 1);
+  assert.deepEqual(c.calls.killSession, [], 'the dead pane is still the post-mortem');
+  assert.deepEqual(c.calls.spawnLead, []);
+  assert.deepEqual(c.calls.resumeLead, []);
+});
+
+test('a lead still waiting is not this tick\'s launch, so admission goes ahead', async () => {
+  const { tick } = await load('backoff-admit-' + Date.now());
+  const c = ctx({ fleet: { tasks: [waiting(1, MIN), row({ id: 'b', status: 'queued' })] }, alive: new Set() });
+  await tick(c.deps);
+  assert.deepEqual(c.calls.resumeLead, [], 'a is waiting');
+  assert.deepEqual(c.calls.spawnLead, ['b'], 'so the one launch this tick allows is b\'s');
+  assert.equal(c.task('b').status, 'spawned');
+  assert.equal(c.task('a').status, 'spawned', 'a keeps its slot while it waits');
+});
+
+test('a revived_at in the future holds nothing: the lead is revived at once and re-stamped from the corrected clock', async () => {
+  const { tick } = await load('backoff-future-' + Date.now());
+  // A year ahead: the clock stepped back since the last revival, or the row was edited by hand.
+  // Held against it, this lead would sit dead in its slot, with nothing logged, for a year and an
+  // hour. Revived now, it is stamped from this clock, and every later wait is bounded again.
+  const c = ctx({ fleet: { tasks: [waiting(2, -365 * 24 * 60 * MIN)] }, alive: new Set() });
+  await tick(c.deps);
+  assert.equal(oneEvent(c, 'LEAD_DEAD').payload.attempts, 2);
+  assert.deepEqual(c.calls.killSession, ['lead-a']);
+  assert.deepEqual(c.calls.resumeLead, ['a']);
+  assert.equal(c.task().attempts, 3);
+  assert.equal(c.task().revived_at, NOW);
+});
+
+test('a revived_at that is not a time is refused by name, before anything is spent', async () => {
+  const { tick } = await load('backoff-bad-' + Date.now());
+  const c = ctx({ fleet: { tasks: [waiting(1, 0, { revived_at: 'soon' })] }, alive: new Set() });
+  await tick(c.deps);
+  const err = oneEvent(c, 'WATCHDOG_ERROR');
+  assert.equal(err.lead, 'a');
+  assert.equal(err.payload.where, 'revival');
+  assert.match(err.payload.error, /revived_at/);
+  assert.deepEqual(eventsOf(c, 'LEAD_DEAD'), []);
+  assert.deepEqual(c.calls.capturePane, []);
+  assert.deepEqual(c.calls.killSession, []);
+  assert.deepEqual(c.calls.resumeLead, []);
+  assert.equal(c.task().attempts, 1, 'no attempt is charged on a stamp nobody can read');
 });
 
 // ════════════════════════ The pane census ════════════════════════

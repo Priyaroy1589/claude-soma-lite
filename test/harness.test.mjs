@@ -227,6 +227,49 @@ test('a class the config cannot price is refused, not reserved', async (t) => {
   assert.equal(h.validateHarnessReport({ harness_id: 'H1', budget_class: 'standard' }).ok, true); // others unaffected
 });
 
+// ---------------------------------------------------------------------------
+// The class NAME, for `soma_status` (issue #59). It is reported beside caps the breaker binds, so
+// it has to come out of the same resolution, and a class that cannot price must have no name.
+// ---------------------------------------------------------------------------
+
+test('namedBudgetClassFor names the class budgetClassFor prices, for every harness and every spelling', async () => {
+  const h = await import('../bin/lib/harness.mjs?named-' + Date.now());
+  const { DEFAULTS } = await import('../bin/lib/config.mjs?named-' + Date.now());
+  for (const [id, entry] of Object.entries(h.loadHarnesses())) {
+    assert.deepEqual(h.namedBudgetClassFor(id), { name: entry.budget_class, cls: DEFAULTS.budgets[entry.budget_class] }, id);
+  }
+  // Whatever `budgetClassFor` prices, this names, with the very same caps.
+  for (const spelling of ['h3', ' H3 ', 'H3 TDD-LOOP', 'TDD-LOOP', 'tdd loop', 'H2 or maybe H3', 'H4 — the review loop']) {
+    const named = h.namedBudgetClassFor(spelling);
+    assert.notEqual(named, null, `unresolved ${spelling}`);
+    assert.deepEqual(named.cls, h.budgetClassFor(spelling), spelling);
+  }
+  // And whatever it cannot price, this does not name: near-misses, Object.prototype's own keys, and
+  // values that are not spellings at all.
+  for (const wrong of ['H10', 'H0', 'H', 'HARNESS 3', '', 'loop', '__proto__', 'constructor', 'toString', undefined, null, 42, {}, ['H3']]) {
+    assert.equal(h.namedBudgetClassFor(wrong), null, `named ${JSON.stringify(wrong)}`);
+    assert.equal(h.budgetClassFor(wrong), null, `priced ${JSON.stringify(wrong)}`);
+  }
+});
+
+test('namedBudgetClassFor names a class only while soma.json prices it, and follows the operator overlay', async (t) => {
+  sandbox(t);
+  const { writeConfig } = await import('../bin/lib/config.mjs?named-overlay-' + Date.now());
+  writeConfig({ budgets: { iterate: { tokens_cap: 42 } } });
+  const h = await import('../bin/lib/harness.mjs?named-overlay-' + Date.now());
+  const iterate = h.namedBudgetClassFor('H3');
+  assert.equal(iterate.name, 'iterate');
+  assert.equal(iterate.cls.tokens_cap, 42, 'the retuned caps, as the breaker binds them');
+  assert.deepEqual(iterate.cls, h.budgetClassFor('H3'));
+
+  // Caps replaced by a scalar: the breaker cannot bind `iterate`, so nothing may show it as the
+  // class a lead is priced at.
+  writeConfig({ budgets: { iterate: 5 } });
+  assert.equal(h.budgetClassFor('H3'), null);
+  assert.equal(h.namedBudgetClassFor('H3'), null, 'a name was reported for a class that does not price');
+  assert.equal(h.namedBudgetClassFor('H1').name, 'standard', 'others unaffected');
+});
+
 test('writeStanding composes the task facts, publishes atomically, and refuses a non-id', async (t) => {
   const home = sandbox(t);
   const s = await import('../bin/lib/standing.mjs?facts-' + Date.now());

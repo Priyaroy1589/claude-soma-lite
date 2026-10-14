@@ -16,7 +16,7 @@ import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -856,6 +856,127 @@ test('thaw against the real file: the CLI default deps read and clear state/back
   const s = real();
   assert.equal(await dispatch(['thaw'], s.deps), 3);
   assert.equal(readFileSync(fp, 'utf8'), stormBytes);
+});
+
+// --------------------------------------------------------------------------- clear-trip
+//
+// `rm leads/<id>/BUDGET_TRIPPED` alone is undone by the next tick: the lead is still over its cap,
+// so it trips again, with a second BUDGET 100 and a second toast. `soma clear-trip` goes through
+// `wd/budget.clearTrip`, the one guarded function the bus's `soma_clear_trip` calls too, which
+// removes the flag and grants one more allowance of the lead's class in one fleet transaction.
+
+test('clear-trip clears through clearTrip with the CLI\'s own store, logs TRIP_CLEARED after it, and says by whom', async (t) => {
+  root(t);
+  const order = [];
+  const seen = [];
+  const h = mk({
+    clearTrip: (id, opts) => { order.push('clear'); seen.push({ id, opts }); return { lead: id, grants: 2 }; },
+    appendEvent: (stream, ev) => { order.push(`log:${ev.type}`); h.calls.appendEvent.push({ stream, ev }); return { id: '1', ts: 1 }; },
+  });
+  assert.equal(await dispatch(['clear-trip', 'cr-1'], h.deps), 0);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].id, 'cr-1');
+  // The transaction every other mutating verb here writes through. A second store would be a second
+  // lock, and the clear could then interleave with the meter's trip write.
+  assert.equal(seen[0].opts.updateFleet, h.deps.updateFleet, 'clearTrip is handed the CLI\'s own updateFleet');
+  // The event follows the transaction: logged first, a clear that was then refused would leave a
+  // TRIP_CLEARED in the history for a trip that still stands.
+  assert.deepEqual(order, ['clear', 'log:TRIP_CLEARED']);
+  const ev = h.calls.appendEvent.find((a) => a.ev.type === 'TRIP_CLEARED');
+  assert.equal(ev.stream, 'orch');
+  assert.equal(ev.ev.lead, 'cr-1');
+  assert.deepEqual(ev.ev.payload, { grants: 2, by: 'operator' });
+  assert.match(h.stdout(), /acting as operator/, 'the actor note, printed by the arm that acts');
+  assert.match(h.stdout(), /budget_grants 2\b/);
+  assert.match(h.stdout(), /3x/, 'what the grant means: every cap is now 1 + grants times the class\'s');
+  assert.match(h.stdout(), /event logged/);
+  assert.deepEqual(h.calls.heartbeat, [], 'the operator is not the lease holder and must not warm its clock');
+
+  // `--as` that proves the lease: the clear is the orchestrator's, and its heartbeat is stamped.
+  const orch = mk({ readLease: () => ({ session_id: 'mine', lease_seq: 4 }), clearTrip: (id) => ({ lead: id, grants: 1 }) });
+  assert.equal(await dispatch(['clear-trip', 'cr-1', '--as', 'mine'], orch.deps), 0);
+  assert.deepEqual(orch.calls.appendEvent.find((a) => a.ev.type === 'TRIP_CLEARED')?.ev.payload, { grants: 1, by: 'orchestrator' });
+  assert.deepEqual(orch.calls.heartbeat, ['mine']);
+  assert.match(orch.stdout(), /acting as orchestrator mine/);
+  assert.match(orch.stdout(), /2x/);
+});
+
+test('clear-trip relays clearTrip\'s refusal and logs nothing; a bad id, or an --as without the lease, never reaches it', async (t) => {
+  root(t);
+  const refused = mk({ clearTrip: (id) => { throw new Error(`clearTrip: ${id} is not tripped (no BUDGET_TRIPPED), so there is nothing to clear`); } });
+  assert.equal(await dispatch(['clear-trip', 'cr-1'], refused.deps), 3);
+  assert.match(refused.stderr(), /cr-1 is not tripped \(no BUDGET_TRIPPED\), so there is nothing to clear/, 'the reason, verbatim');
+  assert.deepEqual(refused.calls.appendEvent, [], 'no TRIP_CLEARED for a clear that did not happen');
+  assert.doesNotMatch(refused.stdout(), /budget_grants/);
+
+  let asked = 0;
+  const counting = (over = {}) => mk({ clearTrip: (id) => { asked += 1; return { lead: id, grants: 1 }; }, ...over });
+  // Mutating, so `--as` is checked like every other mutating verb: a session that does not hold the
+  // lease may not clear a trip, and an `--as` with no value is not an anonymous act.
+  const notHolder = counting({ readLease: () => ({ session_id: 'other', lease_seq: 2 }) });
+  assert.equal(await dispatch(['clear-trip', 'cr-1', '--as', 'mine'], notHolder.deps), 3);
+  assert.match(notHolder.stderr(), /other/, 'who does hold it');
+  assert.deepEqual(notHolder.calls.heartbeat, []);
+  const bare = counting({ readLease: () => ({ session_id: 'mine', lease_seq: 2 }) });
+  assert.equal(await dispatch(['clear-trip', 'cr-1', '--as'], bare.deps), 3);
+  assert.match(bare.stderr(), /--as needs a session id/);
+  // A missing or malformed id is usage, refused before anything is asked.
+  for (const argv of [['clear-trip'], ['clear-trip', 'CR-1'], ['clear-trip', '../cr-1']]) {
+    const u = counting();
+    assert.equal(await dispatch(argv, u.deps), 1, argv.join(' '));
+    assert.deepEqual(u.calls.appendEvent, []);
+  }
+  assert.equal(asked, 0, 'nothing reached clearTrip');
+});
+
+test('clear-trip that cleared but could not log says the event was NOT logged, and still exits 0', async (t) => {
+  root(t);
+  const h = mk({ clearTrip: (id) => ({ lead: id, grants: 1 }), appendEvent: () => { throw new Error('EACCES: events'); } });
+  // The clear is in effect, so the exit says so; the line says the history does not have it.
+  assert.equal(await dispatch(['clear-trip', 'cr-1'], h.deps), 0);
+  assert.match(h.stdout(), /budget_grants 1\b/);
+  assert.match(h.stdout(), /event NOT logged/);
+});
+
+test('clear-trip against the real files: the default deps grant in fleet.json, remove the flags, and log TRIP_CLEARED', async (t) => {
+  const home = root(t);
+  mkdirSync(join(home, 'state'), { recursive: true });
+  const fleetFile = join(home, 'state', 'fleet.json');
+  writeFileSync(fleetFile, JSON.stringify({ tasks: [{ id: 'cr-1', status: 'spawned', budget_grants: 1 }, { id: 'cr-2', status: 'done' }] }));
+  const dir = join(home, 'leads', 'cr-1');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'BUDGET_TRIPPED'), '1\n');
+  writeFileSync(join(dir, 'BUDGET_WARNED'), '1\n');
+  // The real store, the real event log and the real clearTrip: only the guarded deps stay stubbed.
+  const real = () => { const h = mk(); for (const k of ['readFleet', 'updateFleet', 'appendEvent', 'readEvents']) delete h.deps[k]; return h; };
+  const h = real();
+  assert.equal(await dispatch(['clear-trip', 'cr-1'], h.deps), 0, h.stderr());
+  const row = JSON.parse(readFileSync(fleetFile, 'utf8')).tasks.find((r) => r.id === 'cr-1');
+  assert.equal(row.budget_grants, 2, 'one more allowance, on the row the meter reads');
+  assert.equal(existsSync(join(dir, 'BUDGET_TRIPPED')), false, 'the gate stops denying');
+  assert.equal(existsSync(join(dir, 'BUDGET_WARNED')), false, 'an 80% note about the old allowance is gone with it');
+  const logged = () => readFileSync(join(home, 'events', 'orch.ndjson'), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+    .filter((e) => e.type === 'TRIP_CLEARED');
+  assert.equal(logged().length, 1);
+  assert.equal(logged()[0].lead, 'cr-1');
+  assert.deepEqual(logged()[0].payload, { grants: 2, by: 'operator' });
+  assert.match(h.stdout(), /budget_grants 2\b/);
+
+  // Cleared once, it is not tripped: a second clear is refused, and grants nothing.
+  const again = real();
+  assert.equal(await dispatch(['clear-trip', 'cr-1'], again.deps), 3);
+  assert.match(again.stderr(), /not tripped/);
+  // A row the meter does not judge has no allowance to grant, tripped or not.
+  mkdirSync(join(home, 'leads', 'cr-2'), { recursive: true });
+  writeFileSync(join(home, 'leads', 'cr-2', 'BUDGET_TRIPPED'), '1\n');
+  const done = real();
+  assert.equal(await dispatch(['clear-trip', 'cr-2'], done.deps), 3);
+  assert.match(done.stderr(), /metered/);
+  assert.equal(existsSync(join(home, 'leads', 'cr-2', 'BUDGET_TRIPPED')), true);
+  const after = JSON.parse(readFileSync(fleetFile, 'utf8')).tasks;
+  assert.equal(after.find((r) => r.id === 'cr-1').budget_grants, 2);
+  assert.equal(Object.hasOwn(after.find((r) => r.id === 'cr-2'), 'budget_grants'), false);
+  assert.equal(logged().length, 1, 'a refusal logs nothing');
 });
 
 // --------------------------------------------------------------------------- enqueue
@@ -3320,7 +3441,7 @@ test('USAGE names every verb the dispatcher answers, and no verb it does not', a
   // USAGE while falling through to `default: print(USAGE); return 1`, and
   // `skills/soma-promote/SKILL.md` claims CLI parity on every verb that dispatches work.
   const verbs = ['init', 'up', 'down', 'status', 'attach', 'peek', 'send', 'enqueue', 'retry',
-    'kill', 'resume', 'hold', 'release', 'gc', 'doctor', 'digest', 'thaw'];
+    'kill', 'resume', 'hold', 'release', 'gc', 'doctor', 'digest', 'thaw', 'clear-trip'];
   for (const v of verbs) assert.ok(USAGE.includes(v), `USAGE must name ${v}`);
 
   // The positive control, and it is what makes the loop below a measurement rather than a

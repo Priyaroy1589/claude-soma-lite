@@ -79,7 +79,7 @@ after(() => {
 
 const ORCH_TOOLS = [
   'soma_adopt', 'soma_release', 'soma_enqueue', 'soma_queue', 'soma_spawn', 'soma_status',
-  'soma_inbox', 'soma_send', 'soma_kill', 'soma_resume', 'soma_transcript', 'soma_digest',
+  'soma_inbox', 'soma_send', 'soma_kill', 'soma_resume', 'soma_clear_trip', 'soma_transcript', 'soma_digest',
 ];
 
 /** `orchTools` behind the real wiring, for the environment given. */
@@ -141,7 +141,7 @@ test('buildTools returns lead set for role=lead, candidate set for role=candidat
   assert.deepEqual(candNames.sort(), ['soma_adopt', 'soma_status']);
 });
 
-test('the orchestrator gets twelve tools, the lead three, and anything unrecognised is a candidate', () => {
+test('the orchestrator gets thirteen tools, the lead three, and anything unrecognised is a candidate', () => {
   freshHome();
   assert.deepEqual([...bus.buildTools({ SOMA_ROLE: 'orchestrator' }).tools.keys()].sort(), [...ORCH_TOOLS].sort());
   assert.deepEqual([...bus.buildTools({ SOMA_ROLE: 'lead', SOMA_LEAD_NAME: 'cr-1' }).tools.keys()].sort(),
@@ -192,7 +192,7 @@ test('realDeps wires every dep bus-tools reaches for, and the only absences are 
   freshHome();
   const deps = bus.realDeps();
   const consumed = [...consumedDeps()].sort();
-  assert.ok(consumed.length >= 34, `expected the full dep surface, found ${consumed.length}: ${consumed}`);
+  assert.ok(consumed.length >= 35, `expected the full dep surface, found ${consumed.length}: ${consumed}`);
 
   const unwired = consumed.filter((name) => typeof deps[name] !== 'function').sort();
   // `buildDigest` is the declared v1.x gap (spec §16's cut line). The two spawn deps
@@ -776,7 +776,7 @@ test('a session that already holds the lease starts as the orchestrator, so the 
   // A session with no identity, on a fleet with no lease, is a candidate — its own
   // case because the two absences compare EQUAL: an unguarded
   // `readLease()?.session_id === id` is `undefined === undefined`, which would hand
-  // twelve control tools to every fresh session on a machine that has no fleet.
+  // thirteen control tools to every fresh session on a machine that has no fleet.
   freshHome();
   assert.equal(lease.readLease(), null);
   assert.equal(wire({ env: {} }).role, 'candidate');
@@ -826,7 +826,7 @@ const handlerParams = () => {
 
 test('every tool declares the arguments its handler actually reads', () => {
   const params = handlerParams();
-  assert.equal(params.size, 15, `expected all 15 registrations, found ${[...params.keys()]}`);
+  assert.equal(params.size, 16, `expected all 16 registrations, found ${[...params.keys()]}`);
 
   for (const [name, expected] of params) {
     const spec = bus.describe(name);
@@ -1203,4 +1203,114 @@ test('realDeps reaches the REAL seats.pick: the bus\'s one decisive dep is wired
   // The clock is the caller's, not `Date.now()` inside the wiring: a fixed-arity forward is what
   // `seatsSummary` above also pins, and for the same reason.
   assert.equal(pickSeat.length, 2, 'pickSeat takes (now, cfg) — a dropped parameter would silently use the wrong clock');
+});
+
+test('soma_status prices a lead through the real wiring: its own HARNESS, the registry, and every transcript the meter reads', async (t) => {
+  // Issue #59. `realDeps wires every dep bus-tools reaches for` asks only `typeof === 'function'`,
+  // so a wiring that read the wrong stream, the wrong directory or the lead's session alone would
+  // pass it. This drives the real files end to end, and checks the spend against the watchdog's
+  // own reading of the same row.
+  freshHome();
+  // Transcripts live under Claude Code's config root, which a machine running these tests often
+  // has set: aimed at a throwaway root, and put back.
+  const savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  const configDir = mkdtempSync(join(tmpdir(), 'soma-t12-claude-'));
+  trash.push(configDir);
+  process.env.CLAUDE_CONFIG_DIR = configDir;
+  t.after(() => {
+    if (savedConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = savedConfigDir;
+  });
+  const { writeConfig } = await import('../bin/lib/config.mjs');
+  const { worktreeDir } = await import('../bin/lib/paths.mjs');
+  const { slugForCwd } = await import('../bin/lib/tokens.mjs');
+
+  writeConfig({ budgets: { iterate: { tokens_cap: 10_000_000 } } });
+  fleet.enqueue([{ id: 'cr-1', title: 't', repo: 'r', brief: 'b' }]);
+  fleet.setTaskStatus('cr-1', 'spawned');
+  fleet.updateFleet((f) => { f.tasks[0].lead_session_uuid = 'lead-uuid'; return true; });
+  // The lead's step-1 report on its own stream, which no inbox drain has folded onto the row.
+  events.appendEvent('cr-1', { type: 'HARNESS', payload: { harness_id: 'H3', budget_class: 'iterate', plan_summary: 'p' }, lead: 'cr-1' });
+
+  // The lead and one teammate, in the directory Claude Code keeps for the lead's worktree.
+  const slugDir = join(configDir, 'projects', slugForCwd(worktreeDir('r', 'cr-1')));
+  mkdirSync(slugDir, { recursive: true });
+  const turn = (tokens) => JSON.stringify({ message: { role: 'assistant', model: 'claude-opus-5', usage: { input_tokens: tokens, output_tokens: 0 } } });
+  writeFileSync(join(slugDir, 'lead-uuid.jsonl'), `${turn(1_900_000)}\n`);
+  writeFileSync(join(slugDir, 'teammate-uuid.jsonl'), `${turn(1_900_000)}\n${turn(3_800_000)}\n`);
+
+  const row = (await orch().get('soma_status')({})).leads[0];
+  assert.equal(fleet.readFleet().tasks[0].budget_class, null, 'the premise: nothing told the row its class');
+  assert.equal(row.budget_class, 'iterate', 'H3 reserves iterate, read off the lead\'s own stream');
+  assert.equal(row.est_tokens, 1_900_000, 'the lead\'s own session');
+  assert.equal(row.budget_est_tokens, 7_600_000, 'the lead and its teammate');
+  assert.equal(row.budget_pct, 76, '7.6M of the 10M iterate cap soma.json sets');
+
+  // The very reading the watchdog meters for this row, through its own wiring.
+  const wd = await import('../bin/soma-watchdog.mjs?budget-' + Date.now());
+  const meter = wd.realDeps();
+  assert.equal(row.budget_est_tokens, meter.readDirUsage(meter.leadCwd(fleet.readFleet().tasks[0])).est_tokens);
+});
+
+/**
+ * The braces-balanced body that follows the first match of `head` in `code`, with every string and
+ * template literal blanked to spaces first (lengths kept), so a bracket or a call spelled inside a
+ * string counts for nothing. '' when `head` does not occur.
+ */
+const bodyAfter = (code, head) => {
+  const blank = code.replace(/'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\[\s\S]|[^`\\])*`/g, (s) => s[0] + ' '.repeat(s.length - 2) + s[0]);
+  const m = head.exec(blank);
+  const open = m === null ? -1 : blank.indexOf('{', m.index + m[0].length);
+  if (open === -1) return '';
+  let depth = 0;
+  for (let i = open; i < blank.length; i++) {
+    if (blank[i] === '{') depth += 1;
+    else if (blank[i] === '}' && --depth === 0) return blank.slice(open, i + 1);
+  }
+  return '';
+};
+
+/** The value after the first match of `key` in `code`, up to the `,` or closing bracket that ends it at its own depth. */
+const valueAfter = (code, key) => {
+  const m = key.exec(code);
+  if (m === null) return '';
+  const from = m.index + m[0].length;
+  let depth = 0;
+  for (let i = from; i < code.length; i++) {
+    const ch = code[i];
+    if ('([{'.includes(ch)) depth += 1;
+    else if (')]}'.includes(ch) && depth-- === 0) return code.slice(from, i);
+    else if (ch === ',' && depth === 0) return code.slice(from, i);
+  }
+  return '';
+};
+
+/**
+ * `src` as the exact pin below compares it: comments stripped as the source pins here strip them,
+ * every run of whitespace collapsed to one space, and the ends trimmed. Both sides go through it,
+ * so the expected wiring can be laid out as the source lays it out.
+ */
+const normalised = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s+/g, ' ').trim();
+
+test('soma_status prices through the one resolver the breaker calls: realDeps.budgetClassOf calls resolveBudgetClass', () => {
+  // Issue #59 was this status and the watchdog's breaker naming different classes for one lead.
+  // The end-to-end test above drives one lead through the real files, which an inline rule that
+  // ignores `budget_override` still satisfies: replacing the wiring with one left the suite green.
+  // So the source is pinned, comments stripped as the CLAUDE_SESSION_ID pin strips them: the import,
+  // and the `budgetClassOf:` entry of `realDeps()`, whose value, whitespace collapsed, is pinned
+  // EXACTLY, on purpose. A looser pin can be passed by a shape that keeps the call and prices
+  // around it: the call only in a trailing comment, a row altered on its way in
+  // (`{ ...task, budget_override: ... }`), a second call chained after it. A shared-resolver
+  // invariant has no partial form, so editing this wiring means editing this pin, deliberately.
+  const WIRING = '(task, cfg) => resolveBudgetClass(task, (id) => events.readEvents(id), cfg, namedBudgetClassFor)';
+  const code = BUS_SRC.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.match(code, /^import\s*\{[^}]*\bresolveBudgetClass\b[^}]*\}\s*from\s*'\.\/lib\/wd\/budget-class\.mjs';?$/m,
+    'the bus must import the shared resolver');
+  const deps = bodyAfter(code, /\bexport function realDeps\s*\(\s*\)/);
+  assert.notEqual(deps, '', 'realDeps must be findable, or the pins below test nothing');
+  // ONE entry: a second `budgetClassOf:` later in the literal would silently replace the first.
+  assert.equal((deps.match(/\bbudgetClassOf\s*:/g) ?? []).length, 1, 'realDeps must wire budgetClassOf exactly once');
+  assert.equal(normalised(valueAfter(deps, /\bbudgetClassOf\s*:/)), normalised(WIRING),
+    'realDeps.budgetClassOf must be exactly the shared-resolver wiring; changing it means changing this pin');
+  // The control: the entry beside it is extracted on its own, and does not carry the call.
+  assert.doesNotMatch(valueAfter(deps, /\breadDirUsage\s*:/), /\bresolveBudgetClass\b/, 'the extractor scopes to one entry');
 });

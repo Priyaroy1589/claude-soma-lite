@@ -246,6 +246,24 @@ const TMUX_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 /** A task row that has finished, one way or another. */
 const TERMINAL_STATES = new Set(['done', 'failed', 'skipped']);
 
+/**
+ * The rows the watchdog's budget breaker meters: a copy of `wd/budget.mjs`'s `METERED`, since this
+ * module imports nothing. A `blocked` lead keeps its live session and its team keeps spending, so
+ * it is metered; a finished lead is out of the breaker's hands, and a queued one never reached
+ * them. `soma_status` reads a spend for these rows alone (`budgetOf`). Exported only so a test can
+ * hold this copy equal to the original.
+ */
+export const METERED_STATES = new Set(['spawned', 'blocked']);
+
+/**
+ * How many extra allowances a row has been granted, by `wd/budget.mjs`'s `grantsOf` rule (a copy,
+ * since this module imports nothing, held to the original by a test): its own `budget_grants`
+ * when that is a non-negative safe integer, else 0. Each cleared trip adds one, and the breaker
+ * judges every cap at (1 + grants) times the class's, so this is the allowance it is acting on.
+ */
+const grantsOfRow = (task) => (isRecord(task) && Object.hasOwn(task, 'budget_grants')
+  && Number.isSafeInteger(task.budget_grants) && task.budget_grants >= 0 ? task.budget_grants : 0);
+
 /** The two a not-yet-promoted session gets: take the fleet, or look at it. */
 const CANDIDATE_TOOLS = ['soma_adopt', 'soma_status'];
 
@@ -849,10 +867,10 @@ export function leadTools(ctx) {
  * that has not been promoted yet may ask.
  * ===========================================================================
  *
- * Twelve tools, and between them they are the entire operator loop: take the
+ * Thirteen tools, and between them they are the entire operator loop: take the
  * fleet, put work in it, start and stop leads, read the mail, answer a question,
- * hand the fleet back. Same shape as the lead half — pure, `ctx.deps` for every
- * effect, no imports — so this whole surface is driven in
+ * clear a budget trip, hand the fleet back. Same shape as the lead half — pure,
+ * `ctx.deps` for every effect, no imports — so this whole surface is driven in
  * `test/bus-tools.orch.test.mjs` with no lease, no tmux, no fleet on disk.
  *
  * Six things here are load-bearing, and each one is a bug that was reached for
@@ -896,7 +914,7 @@ export function leadTools(ctx) {
  *   verbatim. Every dep call that can fail is caught; what comes back is a
  *   sentence plus an errno, and the path stays in the process.
  *
- *   **The lease is the licence, re-checked on every call.** Seven of the twelve tools
+ *   **The lease is the licence, re-checked on every call.** Eight of the thirteen tools
  *   refuse a caller that no longer holds the orchestrator lease (see `notHolder` and
  *   `def`'s `open` flag); the five exceptions are `soma_adopt`, `soma_release` and the
  *   three pure readers, each argued at its own `def`. This is not belt-and-braces over
@@ -913,8 +931,12 @@ export function leadTools(ctx) {
  * every adopt claims notify wake and the heartbeat repairs no pane), `updateFleet`
  * (`soma_spawn` refuses outright — it will not admit
  * non-transactionally), `admit`+`loadConfig` (no `max_leads` gate on a manual
- * spawn; no repo validation at intake; no budget percentage), `eventStreams` (the
- * inbox falls back to every task row plus `orch`), `heartbeatAgeMs`, `listPanes`,
+ * spawn; no repo validation at intake; no budget class or percentage), `budgetClassOf`
+ * (`budget_class` and `budget_pct` read null, never the row's own `budget_class`, which
+ * only the inbox drain moves), `readDirUsage`/`worktreeDir` (`budget_est_tokens` and
+ * `budget_pct` read null, never the lead's own session in place of its team's spend),
+ * `clearTrip` (`soma_clear_trip` refuses, and nothing is cleared),
+ * `eventStreams` (the inbox falls back to every task row plus `orch`), `heartbeatAgeMs`, `listPanes`,
  * `queuePaused`/`setQueuePaused`, `backpressureState`, `tailLog`, `buildDigest`,
  * `resumeLead`, `readUsage`, `validateHarnessReport` (each degrades to a null
  * column or an honest refusal, never to a lie).
@@ -1833,14 +1855,93 @@ export function orchTools(ctx) {
     }
   };
 
-  /** The token cap this task is priced against, from the config's own numbers. */
-  const capOf = (task, cfg) => {
-    const budgets = cfg?.budgets;
-    // hasOwn, not `in`: a budget class named `constructor` would otherwise resolve
-    // through Object.prototype and price a lead against a function.
-    if (!isRecord(budgets) || !nonEmpty(task?.budget_class) || !Object.hasOwn(budgets, task.budget_class)) return null;
-    const cap = budgets[task.budget_class]?.tokens_cap;
-    return Number.isFinite(cap) && cap > 0 ? cap : null;
+  /**
+   * A number as the breaker reads one (`reqNum`, in `wd/budget.mjs` and in the watchdog's meter):
+   * a finite non-negative number, or a non-blank string that converts to one, so a hand-edited
+   * "1500000" in soma.json prices as 1500000 in both places. Null where the breaker would refuse
+   * the value outright.
+   */
+  const meterNumber = (raw) => {
+    const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+    return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : null;
+  };
+
+  /**
+   * The token cap `budget_pct` is a share of, read as `checkBudget` reads it, or null when there is
+   * no share to show: a class with no own `tokens_cap`, or 0, meters no tokens, and a cap the
+   * breaker refuses is no cap it enforces. The one place the status reads a cap.
+   */
+  const tokensCapOf = (cls) => {
+    const cap = isRecord(cls) && Object.hasOwn(cls, 'tokens_cap') ? meterNumber(cls.tokens_cap) : null;
+    return cap !== null && cap > 0 ? cap : null;
+  };
+
+  /**
+   * The four budget columns, read the way the breaker reads them (issue #59):
+   * `{budget_class, budget_grants, budget_est_tokens, budget_pct}`.
+   *
+   * The CLASS comes from `budgetClassOf`, the resolver the watchdog's meter calls
+   * (`wd/budget-class.mjs`), and never from the row's `budget_class`. Only the inbox
+   * drain moves that field, so until a drain an unpinned lead's row said null while the
+   * breaker was already metering it at its harness's class, and after an H1 -> H4
+   * supersede the row named the old class. With no resolver or no config to hand it, the
+   * column is null rather than that field. Every row with a lead id gets one: a stream
+   * read is small, and a queued or finished lead's class is still the one it would be, or
+   * was, priced at.
+   *
+   * The SPEND is the meter's: `readDirUsage(worktreeDir(repo, id))`, the lead AND its
+   * teammates, whose turns go to transcripts of their own (`tokens.readDirUsage`).
+   * `budget_est_tokens` carries it so the percentage can be checked against it. It is read
+   * for the rows the breaker meters (`METERED_STATES`) and no others: anywhere else there
+   * is no percentage the breaker is acting on, and a finished lead's whole team history is
+   * not streamed on every status call to make one up. The lead's own session stays where
+   * it was, in `est_tokens` and `turns`: `turn_cap` is calibrated per lead, and those two
+   * columns mean what they always meant.
+   *
+   * The ALLOWANCE is the row's own: each cleared trip (`soma_clear_trip`, `soma clear-trip`)
+   * raises `budget_grants`, and the breaker judges every cap at (1 + grants) times the class's.
+   * So the percentage is the spend over (1 + grants) times the token cap, read by the same rule,
+   * and the count is a column of its own. Priced against the class alone, a lead cleared once and
+   * working inside its new allowance would read past 100%, a trip that is not there.
+   *
+   * An id that is not a lead id names no stream and no directory this bus will read, so
+   * its row gets none of the three read columns; the count is the row's own field and reads no
+   * file. Each read is caught on its own: one row's unreadable stream or transcript directory
+   * costs that row its columns, not the whole status.
+   */
+  const budgetOf = async (task, cfg) => {
+    const readable = LEAD_RE.test(task.id) && !RESERVED_STREAMS.has(task.id);
+    let name = null;
+    let cap = null;
+    if (readable && has('budgetClassOf') && isRecord(cfg)) {
+      try {
+        const priced = await deps.budgetClassOf(task, cfg);
+        if (isRecord(priced) && nonEmpty(priced.name)) {
+          name = priced.name;
+          cap = tokensCapOf(priced.cls);
+        }
+      } catch {
+        // A resolver that could not answer: this row's class is not known, and the rest of the
+        // status still is. (An unreadable stream is not this case: the resolver prices by the
+        // row's harness then, as the breaker does.)
+      }
+    }
+    let spent = null;
+    if (readable && METERED_STATES.has(task.status) && nonEmpty(task.repo) && has('readDirUsage') && has('worktreeDir')) {
+      try {
+        const usage = await deps.readDirUsage(await deps.worktreeDir(task.repo, task.id));
+        spent = isRecord(usage) ? meterNumber(usage.est_tokens) : null;
+      } catch {
+        // a transcript directory that cannot be read is not a spend of zero
+      }
+    }
+    const grants = grantsOfRow(task);
+    return {
+      budget_class: cut(name, 32),
+      budget_grants: grants,
+      budget_est_tokens: spent,
+      budget_pct: cap !== null && spent !== null ? Math.round((spent / (cap * (1 + grants))) * 100) : null,
+    };
   };
 
   const teamOf = async (target) => {
@@ -1936,8 +2037,7 @@ export function orchTools(ctx) {
     const live = liveness === 'alive';
     const recordedState = cut(task?.pane_state, 32);
     const usage = await usageOf(task);
-    const cap = capOf(task, cfg);
-    const est = Number.isFinite(usage.est_tokens) ? usage.est_tokens : null;
+    const budget = await budgetOf(task, cfg);
     return {
       lead: task.id,
       task_id: task.id,
@@ -1968,10 +2068,15 @@ export function orchTools(ctx) {
       // the orchestrator sees a lead approaching it.
       rotations_last_hour: rotationsLastHour(task?.rotations),
       harness: cut(task.harness, 32),
-      budget_class: cut(task.budget_class, 32),
+      // The class the breaker prices this lead at, how many extra allowances of it a cleared trip has
+      // granted, and its spend as the breaker meters it: the lead and its team. `turns` and
+      // `est_tokens` are the lead's own session. See `budgetOf`.
+      budget_class: budget.budget_class,
+      budget_grants: budget.budget_grants,
       turns: Number.isFinite(usage.turns) ? usage.turns : null,
-      est_tokens: est,
-      budget_pct: cap !== null && est !== null ? Math.round((est / cap) * 100) : null,
+      est_tokens: Number.isFinite(usage.est_tokens) ? usage.est_tokens : null,
+      budget_est_tokens: budget.budget_est_tokens,
+      budget_pct: budget.budget_pct,
       // A fallback off the pinned model is detected, not prevented: this column is how the
       // orchestrator and the digest see that it happened. NOTE that with leads pinned to
       // `opus` the within-family case (Opus 5 -> Opus 4.5) satisfies the pin and so reaches
@@ -2337,7 +2442,7 @@ export function orchTools(ctx) {
   });
 
   // -------------------------------------------------------------------------
-  // soma_send / soma_kill / soma_resume — intervening
+  // soma_send / soma_kill / soma_resume / soma_clear_trip — intervening
   // -------------------------------------------------------------------------
 
   def('soma_send', async ({ lead, message, force = false } = {}) => {
@@ -2523,6 +2628,47 @@ export function orchTools(ctx) {
     return { resumed: true, lead, session_uuid: uuid, tmux_target: target, status_set, seat };
   });
 
+  /**
+   * Clear a lead's budget trip by granting it one more allowance of its class.
+   *
+   * Removing `leads/<id>/BUDGET_TRIPPED` alone is undone within a tick: the lead is still over its
+   * cap, so the meter trips it again, with a second BUDGET 100 and a second toast. So this goes
+   * through `deps.clearTrip` (`wd/budget.clearTrip`, the one guarded function the CLI's `soma
+   * clear-trip` calls too), handed this bus's own `updateFleet`: in one fleet transaction it
+   * removes the flag and raises the row's `budget_grants`, and the meter judges every cap at
+   * (1 + grants) times the class's from then on. Gated on the lease holder, like `soma_kill`.
+   *
+   * Its own refusals (an unknown lead, a row the meter does not judge, a lead that is not tripped, a
+   * count that is not one) are the reason the orchestrator needs, and they are relayed when they
+   * carry no path; a refusal that quotes a hand-edited value shaped like one is not. Any other
+   * failure is an unlink or a lock, whose message names files, so only its errno crosses. The event
+   * is logged AFTER the transaction, so a refused or failed clear leaves no TRIP_CLEARED behind, and
+   * `logged` says whether it landed.
+   */
+  def('soma_clear_trip', async ({ lead } = {}) => {
+    const bad = badId(lead, 'lead');
+    if (bad) return bad;
+    if (!has('clearTrip') || !has('updateFleet')) {
+      return { ...refuse('this bus cannot clear budget trips: no clearTrip or no fleet store is wired, so nothing was cleared. `soma clear-trip <lead>` in a shell does the same'), cleared: false };
+    }
+    let out;
+    try {
+      out = await deps.clearTrip(lead, { updateFleet: deps.updateFleet });
+    } catch (e) {
+      const said = typeof e?.message === 'string' ? e.message : '';
+      const own = said.startsWith('clearTrip: ') && !/[/\\]/.test(said);
+      return {
+        ...refuse(own
+          ? said.slice(0, MAX_FIELD)
+          : `the trip could not be cleared${codeOf(e)}, and nothing was granted; \`soma clear-trip ${lead}\` in a shell prints the full reason`),
+        cleared: false,
+      };
+    }
+    const grants = Number.isSafeInteger(out?.grants) && out.grants > 0 ? out.grants : null;
+    const logged = await logOrch({ type: 'TRIP_CLEARED', payload: { grants, by: 'orchestrator' }, lead });
+    return { cleared: true, lead, grants, logged };
+  });
+
   // -------------------------------------------------------------------------
   // soma_transcript / soma_digest — looking
   // -------------------------------------------------------------------------
@@ -2576,7 +2722,7 @@ export function orchTools(ctx) {
  * This is the surface every interactive Claude Code session on the machine carries,
  * because `soma init` registers the bus at user scope in candidate role — which is
  * what makes promotion need no restart and no mid-session MCP mounting. The other
- * ten tools are absent rather than refusing, so an unpromoted session's tool list
+ * eleven tools are absent rather than refusing, so an unpromoted session's tool list
  * does not advertise a control plane it may not touch.
  *
  * Built by *selecting* from `orchTools`, never by re-implementing: the two handlers
