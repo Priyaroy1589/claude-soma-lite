@@ -405,6 +405,9 @@ worktree exist, `every worktree guard file carries rules`, `guard file matches t
 `lead mcp single-server` are unobserved as well. Every other row can read `ok`. §10 *The rows
 `soma doctor` cannot take* says how to confirm the three by hand.
 
+**`soma up` runs this same doctor** before it projects any spend (§5.3 step 5), and refuses on
+`FAIL` with **exit 3** unless you pass `--ignore-doctor`. `INCOMPLETE` does not stop it.
+
 ### 5.3 `soma up` — the spend gate
 
 ```bash
@@ -416,13 +419,13 @@ Order of operations, and every step can stop it:
 1. `ensureTree()` and the hard-link probe → **exit 2** on failure.
 2. **Already-live short-circuit.** If tmux reports `soma-watchdog` live, nothing is started and no
    new spend is authorised, but **`soma.json` and the pause flag are still read** — a live watchdog
-   is *not* an open queue. A `soma.json` the loader refuses (step 4) is **exit 2** here too: the
-   refusal names the key and says that the running watchdog, which loads the same file at the start
-   of every tick, is refusing it and admits nothing until it is fixed. Otherwise the pause flag is
-   reported and it is exit 0 — **unless you passed `--canary`**: then the canary runs here too (§5.4),
-   with no projection and no prompt, and anything but a pass is **exit 3**. The watchdog that was
-   already running is left exactly as it is, and the refusal says so, then carries the same NOTE as
-   §5.4:
+   is *not* an open queue. Doctor is not run: nothing is opened. A `soma.json` the loader refuses
+   (step 4) is **exit 2** here too: the refusal names the key and says that the running watchdog,
+   which loads the same file at the start of every tick, is refusing it and admits nothing until it
+   is fixed. Otherwise the pause flag is reported and it is exit 0 — **unless you passed
+   `--canary`**: then the canary runs here too (§5.4), with no projection and no prompt, and
+   anything but a pass is **exit 3**. The watchdog that was already running is left exactly as it
+   is, and the refusal says so, then carries the same NOTE as §5.4:
 
    ```
    soma up: the canary did not report a pass (its verdict is on stderr above), and the watchdog that
@@ -437,20 +440,37 @@ Order of operations, and every step can stop it:
    found is **exit 3**, naming its pid and the recovery, and so is a process table that cannot be
    read. Only *none found* goes on, as a fresh start.
 4. `loadConfig()` → **exit 2** if it throws: a `soma.json` that does not parse, or a value §4 says
-   is refused. Nothing is projected, asked or started.
-5. **Print the worst-case spend projection.**
-6. **Ask, on the terminal.**
-7. `--canary`, if you passed it (§5.4) → **exit 3** unless it reports a pass. This is where it runs
+   is refused. Nothing is projected, asked or started, and doctor does not run.
+5. **Run doctor**: the same checks and report as `soma doctor` (§5.2), after a line saying so. It
+   makes two billed `claude -p` calls and one `git fetch --dry-run` per configured repo, so it takes
+   a little while. A `FAIL` → **exit 3**, with nothing projected, asked or started:
+
+   ```
+   soma up: doctor reported FAIL (its report is above), so the queue was not opened: nothing was
+   projected or asked, and no watchdog was started. Fix what it reports (each FAIL row names what it
+   read) and run `soma up` again, or pass --ignore-doctor to open it anyway: doctor still runs and
+   prints every row, and the spend confirmation still follows.
+   ```
+
+   A doctor that throws, or answers anything but a verdict, is refused the same way, and the
+   refusal says which. `INCOMPLETE` goes on: `PASS` is unreachable on this build (§5.2), so refusing
+   it would refuse every machine. `--ignore-doctor` still runs doctor and prints every row; when
+   doctor does not pass, `up` warns that the flag was passed and that it fixes nothing doctor
+   found, then goes on to step 6. It is not a `--yes`: step 7 still needs the typed `yes`.
+6. **Print the worst-case spend projection.**
+7. **Ask, on the terminal.**
+8. `--canary`, if you passed it (§5.4) → **exit 3** unless it reports a pass. This is where it runs
    on a fresh start; with a watchdog already live it runs at step 2 instead.
-8. Start the watchdog in a detached tmux session under `env -i`.
-9. **Read tmux back.** `tmux new-session` exits 0 for a command `env -i` cannot resolve, leaving a
+9. Start the watchdog in a detached tmux session under `env -i`.
+10. **Read tmux back.** `tmux new-session` exits 0 for a command `env -i` cannot resolve, leaving a
    session whose pane died instantly — which reads as a running watchdog to anything that asks by
    name. Unreadable → **exit 3, UNVERIFIED**. Readable but absent → **exit 3, dead pane**.
-10. Report the node, the log path, the state root, and the queue's actual pause state.
+11. Report the node, the log path, the state root, and the queue's actual pause state.
 
 #### What the projection says, and the numbers
 
-With shipped defaults (`max_leads: 10`), `soma up` prints exactly this before asking anything:
+With shipped defaults (`max_leads: 10`), `soma up` prints exactly this after doctor's report
+(step 5) and before asking anything:
 
 ```
 Fleet worst case: 10 leads × 38,000,000 est_tokens (iterate, the largest budget class) = 380,000,000 est_tokens.
@@ -700,7 +720,7 @@ Confirmed against the `switch` in `bin/soma.mjs`. Nothing below is aspirational.
 | `soma` / `soma help` | usage (bare invocation exits **1**, `help` exits 0) |
 | `soma init [--seat <dir>]` | state tree, `/soma-promote` skill, MCP bus — each read back. `--seat <dir>` moves the skill install and the bus registration **into `<dir>`**, with this fleet's `SOMA_HOME` and socket pins — once per seat. It does **not** move the state tree: that is still created under this shell's `$SOMA_HOME`, exactly as a plain `init` does, so run it from a shell pinned to this fleet or you get a second state root *and* a seat pinned to it. See *Provisioning a seat* below |
 | `soma doctor` | 48 checks + per-repo rows; stdout |
-| `soma up [--canary]` | spend projection → confirm → start watchdog → verify |
+| `soma up [--canary] [--ignore-doctor]` | doctor → spend projection → confirm → start watchdog → verify |
 | `soma down` | stop the watchdog. **Leads are NOT stopped** |
 | `soma status` | state root, queue and backpressure (three-state each), lease, watchdog, the seat pool on one `seats:` line (three-state: UNREADABLE · none configured · one clause per seat, open · closed until its reset with the reason · unverified), one row per lead with its `SEAT` beside `PANE`, totals |
 | `soma attach <lead>` | hand your terminal to the lead's pane |
@@ -887,7 +907,7 @@ stopped fleet and one you only believe is stopped. Run `soma status`, then `soma
 v2 item. After a reboot or a re-login:
 
 ```bash
-soma up            # re-confirm the spend, restart the watchdog
+soma up            # re-run doctor, re-confirm the spend, restart the watchdog
 soma status
 ```
 
@@ -976,7 +996,6 @@ recorded in `docs/ROADMAP.md` as v1.x.
 |---|---|---|
 | **No `PostCompact` installer.** `bin/hooks/lead-postcompact.mjs` exists; nothing registers it (the generator writes `PostToolUse`, `Stop` and `PreToolUse` only). | After an auto-compact — routine, measured on this build around a ~994k prompt — a lead loses its HARNESS contract and its standing orders with nothing to restore them. It keeps working and stops being the thing you briefed. | `soma_send` the lead a pointer to `soma_task()`, which is the tool the missing injected line would have named. Watch for a lead whose reports change shape mid-run. |
 | **A tripped budget cannot be cleared.** Nothing unlinks `leads/<id>/BUDGET_TRIPPED` — no CLI verb, no MCP tool — and the deny message tells the lead *"Ask the orchestrator to clear the trip"*, which the orchestrator has no way to do. | A tripped lead is alive, holding its slot, and able to call nothing but the bus. It will ask, and nothing can answer. | Delete the file by hand (`rm "$SOMA_HOME/leads/<id>/BUDGET_TRIPPED"`) or `soma kill` the lead. There is no third option. |
-| **`soma up` never calls doctor.** Spec §13's "the queue refuses to open until all three pass" is not enforced anywhere; `runDoctor` is reachable only through `soma doctor`. | A fleet opens on a machine with a failing MCP-deny-drift check, an erased guard file, or unauthenticated `gh`. This is **wider than the `--canary` gap in §5.4**. | Run `soma doctor` yourself, every time, before `soma up`. Treat the golden path in §5 as three commands and not two. |
 | **`serialize_with` does not exist.** The orchestrator prompt used to instruct it; `soma_enqueue`'s schema sets `additionalProperties:false` and omits it, and admission is pure FIFO. The instruction is removed as of this branch. | Two tickets touching one module get two leads and two draft PRs that fight. | Enqueue same-module tickets one at a time — the second after the first reports `COMPLETED`. The orchestrator prompt now says so. |
 | **No revival cooldown.** The 1-hour backoff the design pairs with the 3-attempt limit is not implemented. | A lead that dies for a persistent reason (bad credential, wedged repo) burns **all three revival attempts in about 90 seconds** of consecutive ticks and lands on `GAVE_UP` before you can look at it. | Read the `LEAD_DEAD` payload's captured death screen rather than the `GAVE_UP`. `soma peek` still has the pane. |
 | **A Claude Code build that prompts under bypass** (the stalled-lead incident). Claude Code 2.1.259 raised a bypass-immune permission prompt on `cd <dir> && grep <relative file>` whenever a `Read()` deny existed — leads carry 13 — and `tested_claude` admits patch releases by design. 2.1.263 fixed it; the fleet cannot tell which build a lead runs from inside a hook. | A lead or teammate sits on `Do you want to proceed?` with nobody at the pane: measured 79 stalls summing 214 hours, the worst 40 hours, all on 2.1.259. `soma doctor`'s `claude cd-compound read runs` check is **FAIL** on such a build. | Cycle the leads onto a fixed build (`soma kill` + `soma_resume` relaunches `claude` from PATH). If the fleet must keep running on the asking build, arm the gate's emergency lever **per lead**: `touch "$SOMA_HOME/leads/<id>/CD_COMPOUND_ASKS"` — the PreToolUse gate then denies the asking shape with a reason that says what to type instead (one retry turn per matching call, ~14% of Bash calls on a 2.1.259-class build) — and `rm` the flag once the lead is on a fixed build. Unarmed it costs nothing and does nothing; never leave it armed on a build that does not ask. |
@@ -1530,6 +1549,7 @@ lease at that server's pane id at once.
 | `npm test` prints no `pass`/`fail` lines | Node < 24. The test glob matched nothing. §1 |
 | `SOMA_HOME must be an absolute path` | relative value, or a quoted `~`. §3 |
 | `does not support hard links (link(2) returned …)` | exFAT/FAT/FUSE/cloud-sync mount. Move `SOMA_HOME`. exit 2 |
+| `soma up` exits 3, "doctor reported FAIL" | a doctor row did not hold, so nothing was projected, asked or started. Fix the `FAIL` rows (each names what it read) and run `soma up` again; `--ignore-doctor` goes on anyway and fixes nothing. §5.3 step 5 |
 | `soma up` refuses with "no terminal here to confirm" | not a TTY. There is no `--yes`. §5.3 |
 | `soma up` exits 3, "its pane is already dead" | the watchdog exited on startup. Read `$SOMA_HOME/logs/watchdog.log` |
 | `soma up` exits 3, "whether a watchdog is already running is UNKNOWN" | tmux could not be read, so a running watchdog cannot be ruled out. `soma status`, `soma doctor`. §5.3, §11.10 |
