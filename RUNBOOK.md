@@ -672,11 +672,13 @@ The watchdog tick (default 30 s) does seven things:
    minute for everything else). That is not the longest launch possible, because every git call in a
    launch gets its own two minutes. Past it the row is treated as dead, as every starting row was
    before the mark: usually a spawner that died, revived like any dead lead. A launch that is only
-   slower than the bound is revived under its spawner: a `LEAD_DEAD` and a charged revival attempt
-   every tick until its session appears (`GAVE_UP` after three), and if its session appears between
-   a tick's read and the revival's kill, that new session is killed and replaced. Two sessions never
-   run at once: the spawner holds the repo lock across the launch and checks for the session again
-   under it. Recording the session clears the mark, and so does a failed spawn's rollback.
+   slower than the bound is revived under its spawner, with its attempts spaced out like any dead
+   lead's (above): the first revival is immediate, and each later one waits out its step. A
+   `LEAD_DEAD` and a charged attempt come with each revival, none on a tick spent waiting, and
+   `GAVE_UP` comes after the third. If its session appears between a tick's read and the revival's
+   kill, that new session is killed and replaced. Two sessions never run at once: the spawner holds
+   the repo lock across the launch and checks for the session again under it. Recording the session
+   clears the mark, and so does a failed spawn's rollback.
    Meanwhile `soma status` shows the lead as LIVE `starting`, PANE `-`, and `soma_status` as
    `liveness: starting`.
 2. **Budget breakers and model deviation**, over every `spawned` *and* `blocked` row.
