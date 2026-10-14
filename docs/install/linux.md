@@ -30,7 +30,7 @@ what its guardrails do not cover.
 | git | 2.31 or newer | one git worktree per task |
 | Claude Code (`claude`) | logged in | every lead is a `claude` process |
 | GitHub CLI (`gh`) | logged in | draft pull requests are opened through it |
-| `notify-send` | any | desktop notifications (optional, but `soma doctor` checks for it) |
+| `notify-send` | any | desktop notifications (optional, but `soma doctor` checks for it, and `soma up` refuses while that check fails unless you pass `--ignore-doctor`) |
 
 soma itself has no npm dependencies, so there is nothing to `npm install`. Each lead does start one
 extra MCP server, `npx -y @modelcontextprotocol/server-sequential-thinking`, so leads need `npx` and
@@ -369,9 +369,9 @@ Stay at the terminal for this. It is the use RUNBOOK §11 says the project is re
    soma up
    ```
 
-   `up` prints a worst-case token projection and asks you to type `yes`. There is no `--yes` flag,
-   and it refuses to run without a terminal. Do **not** use `--canary`: it cannot pass on this
-   build.
+   `up` runs doctor first and refuses on a `FAIL` row (exit 3), then prints a worst-case token
+   projection and asks you to type `yes`. There is no `--yes` flag, and it refuses to run without a
+   terminal. Do **not** use `--canary`: it cannot pass on this build.
 
 2. **Start the orchestrator inside soma's own tmux server, and promote it.**
 

@@ -15,7 +15,7 @@
 import './soma-home.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
@@ -38,6 +38,9 @@ const { ENV_ALLOW } = await import('../bin/lib/spawn.mjs');
 // The clock the `seats:` line renders with — imported so a test can use the already-pinned
 // formatter as its oracle instead of re-deriving a local-time string.
 const { clock } = await import('../bin/lib/seats-summary.mjs');
+// The launch bound `status` reads a starting lead by — the same one the watchdog's reconcile and
+// `soma_status` read — so the tests below sit on either side of it rather than of a copy.
+const { LAUNCH_GRACE_MS } = await import('../bin/lib/fleet.mjs');
 
 const CLI = fileURLToPath(new URL('../bin/soma.mjs', import.meta.url));
 
@@ -72,15 +75,21 @@ const mk = (over = {}, { answer = false } = {}) => {
     // The seat a resume picked, the options the spawner got, and every fleet the store was asked
     // to mutate — so a test can read the row a `resume` wrote without a real checkpoint.
     resumeOpts: [], pickSeat: [], updateFleet: [],
+    // One entry per process-table scan `up` made, so a test can tell "found nothing" from "never looked".
+    serverProcesses: [],
   };
   const deps = {
     print: (s) => out.push(String(s)),
     warn: (s) => err.push(String(s)),
     liveSessions: () => new Set(),
-    // Asked only about a `null` listing, by `status` and `down`. `false` is the inert answer: it
-    // claims nothing about the server, so a `null` keeps its `unverified` reading and `down` keeps
-    // its exit 3 — the arms that read "no server" hand over `() => true` themselves.
+    // Asked only about a `null` listing, by `status`, `down` and `up`. `false` is the inert answer: it
+    // claims nothing about the server, so a `null` keeps its `unverified` reading, `down` keeps its
+    // exit 3 and `up` refuses — the arms that read "no server" hand over `() => true` themselves.
     serverAbsent: () => false,
+    // No tmux process for soma's socket. Never the real scan, on purpose: on a machine running a
+    // fleet it finds that fleet's server, and every `up` test would then refuse for a reason that is
+    // the machine's, not the test's. Asked only by `up`, after a "no server" from `serverAbsent`.
+    serverProcesses: () => { calls.serverProcesses.push(1); return []; },
     // The pane census's listing: `null` is the inert answer ("not measured"), so `status` prints
     // `?` in the PANE column and `send` refuses to type blind — the arms about panes hand over
     // an explicit listing (`panesFor`).
@@ -166,6 +175,50 @@ const panesFor = (...names) => ({ paneStates: () => new Map(names.map((n) => [n,
 const startsClean = () => {
   let n = 0;
   return () => (++n === 1 ? new Set() : new Set(['soma-watchdog']));
+};
+
+/** The real-tmux tests below run wherever tmux is installed, and skip only where it is not. */
+const tmuxInstalled = spawnSync('tmux', ['-V']).status === 0;
+
+/**
+ * A REAL tmux server in a sandbox of its own, read the way a shell with no UTF-8 locale reads it:
+ * issue #45's operator, whose `soma resume` from such a shell killed a live lead and resumed it.
+ *
+ * `run` is the transport `tmux.mjs`' readers take, and it executes `tmux` with `tmux.tmuxArgs`, so
+ * whatever the module puts on every call rides along exactly as in production. Its environment is
+ * this process's minus LC_ALL, LC_CTYPE and TMUX, with LANG=C: tmux decides UTF-8 from the first of
+ * the three locale variables that is set, and (measured) treats any client that sees $TMUX as UTF-8,
+ * so a suite run from inside a tmux pane would not reproduce the bug without dropping it.
+ *
+ * The socket is `tmux.socketName()`, because this file pins SOMA_TMUX_SOCKET before `tmux.mjs`
+ * loads and `tmuxArgs` names nothing else. It is unique all the same: TMUX_TMPDIR is a fresh
+ * directory, under /tmp because a Unix socket path is limited to about 104 bytes on macOS (#46),
+ * and no other server lives in it. Setup, the control and teardown use the sandbox's own `-L`.
+ */
+const cLocaleTmux = (t, ...sessions) => {
+  const dir = mkdtempSync('/tmp/st-');
+  const env = { ...process.env, LANG: 'C', TMUX_TMPDIR: dir };
+  for (const k of ['LC_ALL', 'LC_CTYPE', 'TMUX', 'TMUX_PANE']) delete env[k];
+  const sandbox = (args) => spawnSync('tmux', ['-L', tmux.socketName(), ...args], { encoding: 'utf8', env });
+  t.after(() => {
+    sandbox(['kill-server']);
+    rmSync(dir, { recursive: true, force: true });
+  });
+  sessions.forEach((name, i) => {
+    // `-f /dev/null` on the call that starts the server: an operator's ~/.tmux.conf may load
+    // plugins that save and restore sessions, and a throwaway server must run none of them.
+    const r = sandbox([...(i === 0 ? ['-f', '/dev/null'] : []), 'new-session', '-d', '-s', name, 'sleep 600']);
+    assert.equal(r.status, 0, `the sandbox server must start ${name}: ${r.stderr}`);
+  });
+  // The control: this shell really does mangle the listing, or a test built on it measures nothing.
+  const raw = sandbox(['list-panes', '-a', '-F', '#{session_name}\t#{pane_dead}']).stdout;
+  assert.ok(raw.includes(`${sessions[0]}_0`), `a C-locale client must print the tab as "_" here; it printed ${JSON.stringify(raw)}`);
+  const run = (args) => {
+    const r = spawnSync('tmux', tmux.tmuxArgs(args), { encoding: 'utf8', env, timeout: 5000 });
+    return { stdout: r.stdout ?? '', stderr: r.stderr ?? '', code: r.status ?? 1 };
+  };
+  const alive = (name) => sandbox(['has-session', '-t', `=${name}`]).status === 0;
+  return { run, alive };
 };
 
 // --------------------------------------------------------------------------- status
@@ -274,6 +327,76 @@ test('the PANE column names what each pane is doing, for every row with a sessio
   assert.match(rowOf(unknown, 'cr-1'), /^cr-1\s+spawned\s+\?\s+\?\s/);
   assert.doesNotMatch(rowOf(unknown, 'cr-2'), /\b(shell|gone|exited)\b/);
   assert.equal(unknown.calls.capturePane.length, 0);
+});
+
+test('a lead whose spawn has not made its session yet reads LIVE starting and PANE -, not dead and gone, until the bound', async (t) => {
+  root(t);
+  // `launching_at` is the claim's mark: the spawn flips the row to `spawned` first and creates the
+  // session last, after a fetch that may take two minutes, and for that whole window this row read
+  // `spawned  dead  gone`, exactly like a lead that had died.
+  const fleet = (age) => () => ({ tasks: [{ id: 'cr-1', status: 'spawned', tmux_session: null, launching_at: Date.now() - age }] });
+  const rowOf = (h) => h.stdout().split('\n').find((l) => l.startsWith('cr-1 '));
+
+  // Thirty seconds into the fetch: tmux answers, and the lead's session is not on it yet.
+  const starting = mk({ readFleet: fleet(30_000), liveSessions: () => new Set(), paneStates: () => new Map() });
+  assert.equal(await dispatch(['status'], starting.deps), 0);
+  assert.match(rowOf(starting), /^cr-1\s+spawned\s+starting\s+-\s/);
+  assert.doesNotMatch(rowOf(starting), /\b(dead|gone)\b/);
+  // No tmux server answering at all reads as an empty server, and a launch may be what starts one.
+  const noServer = mk({ readFleet: fleet(30_000), liveSessions: () => null, serverAbsent: () => true });
+  await dispatch(['status'], noServer.deps);
+  assert.match(rowOf(noServer), /^cr-1\s+spawned\s+starting\s+-\s/);
+
+  // Past the bound the row reads as it did before the mark, `dead  gone`, and revival deals with it.
+  const expired = mk({ readFleet: fleet(LAUNCH_GRACE_MS), liveSessions: () => new Set(), paneStates: () => new Map() });
+  await dispatch(['status'], expired.deps);
+  assert.match(rowOf(expired), /^cr-1\s+spawned\s+dead\s+gone\s/);
+  // The session beats the mark (a record write that failed leaves one behind on a lead that is up).
+  const up = mk({ readFleet: fleet(30_000), liveSessions: () => new Set(['lead-cr-1']), paneStates: () => new Map([['lead-cr-1', pane()]]) });
+  await dispatch(['status'], up.deps);
+  assert.match(rowOf(up), /^cr-1\s+spawned\s+yes\s+idle\s/);
+  // tmux unreadable is `?` in both columns: a hiccup is never a launch.
+  const unread = mk({ readFleet: fleet(30_000), liveSessions: () => null, paneStates: () => null });
+  await dispatch(['status'], unread.deps);
+  assert.match(rowOf(unread), /^cr-1\s+spawned\s+\?\s+\?\s/);
+  // A pane the census already sees is shown as itself: the session can appear between the two reads.
+  const between = mk({ readFleet: fleet(30_000), liveSessions: () => new Set(), paneStates: () => new Map([['lead-cr-1', pane()]]) });
+  await dispatch(['status'], between.deps);
+  assert.match(rowOf(between), /^cr-1\s+spawned\s+starting\s+idle\s/);
+  // Only a claimed `spawned` row is ever starting.
+  const blocked = mk({ readFleet: () => ({ tasks: [{ id: 'cr-1', status: 'blocked', launching_at: Date.now() - 30_000 }] }), paneStates: () => new Map() });
+  await dispatch(['status'], blocked.deps);
+  assert.match(rowOf(blocked), /^cr-1\s+blocked\s+dead\s+gone\s/);
+});
+
+test('the status table stays aligned now that LIVE can read starting: every cell starts under its header', async (t) => {
+  root(t);
+  const h = mk({
+    readFleet: () => ({ tasks: [
+      { id: 'cr-1', status: 'spawned', launching_at: Date.now() - 30_000 },   // starting
+      { id: 'cr-2', status: 'spawned', lead_session_uuid: 'u2' },            // yes, with a usage reading
+      { id: 'cr-3', status: 'spawned' },                                     // dead
+      { id: 'cr-4', status: 'queued' },                                      // -
+    ] }),
+    liveSessions: () => new Set(['lead-cr-2']),
+    paneStates: () => new Map([['lead-cr-2', pane()]]),
+    readUsage: () => ({ turns: 12, est_tokens: 3456, last_model: 'claude-fable-5' }),
+  });
+  await dispatch(['status'], h.deps);
+  const lines = h.stdout().split('\n');
+  const header = lines.find((l) => l.startsWith('LEAD '));
+  assert.ok(header, 'the table header is printed');
+  const cols = ['STATUS', 'LIVE', 'PANE', 'SEAT', 'TURNS', 'TOKENS', 'MODEL'].map((name) => [name, header.indexOf(name)]);
+  const row = (id) => lines.find((l) => l.startsWith(`${id} `));
+  assert.equal(row('cr-1').slice(cols[1][1], cols[2][1]).trim(), 'starting', 'the widest LIVE word is in the table under test');
+  for (const id of ['cr-1', 'cr-2', 'cr-3', 'cr-4']) {
+    const line = row(id);
+    for (const [name, at] of cols) {
+      assert.ok(at > 0, `${name} is in the header`);
+      assert.notEqual(line[at], ' ', `${id}: the ${name} cell starts at column ${at}: ${JSON.stringify(line)}`);
+      assert.equal(line[at - 1], ' ', `${id}: the cell before ${name} ends before column ${at}: ${JSON.stringify(line)}`);
+    }
+  }
 });
 
 test('status prints what it resolved: state root, queue, lease holder, watchdog', async (t) => {
@@ -1163,6 +1286,110 @@ test('up is idempotent: a live watchdog is reported, not duplicated, and costs n
   assert.match(h.stdout(), /already/i);
 });
 
+test('up, from a shell with no UTF-8 locale, reads a live watchdog as live and asks for no spend (#45)', { skip: !tmuxInstalled && 'tmux not installed' }, async (t) => {
+  root(t);
+  // `up`'s idempotency read through the REAL reader, over a real server with a live watchdog on it.
+  // Without `-u` tmux printed the listing's tab as `_`, the watchdog read as absent, and `up` went on
+  // to the worst-case spend prompt — and on a yes, to a second `new-session` for a name that exists.
+  const srv = cLocaleTmux(t, 'soma-watchdog');
+  const h = mk({ liveSessions: () => tmux.liveSessions(srv.run) }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 0, h.stderr());
+  assert.match(h.stdout(), /watchdog: live already/);
+  assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend for a fleet that is already running');
+  assert.equal(h.calls.newSession.length, 0, 'a second watchdog was started');
+  assert.equal(srv.alive('soma-watchdog'), true);
+});
+
+test('up refuses when tmux cannot be read, before it projects, asks or starts anything (#66)', async (t) => {
+  root(t);
+  // `null` is "not measured" — a timeout, a missing binary, a permission error — and the already-
+  // running check counted only a listing that HAD the watchdog, so `null` read as "none running": the
+  // projection, the prompt, and on a yes a watchdog started beside one tmux could not show.
+  const h = mk({ liveSessions: () => null }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 3, h.stderr());
+  assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend with the fleet\'s state unknown');
+  assert.equal(h.calls.newSession.length, 0, 'a watchdog was started beside one tmux could not show');
+  assert.doesNotMatch(h.stdout(), /worst case/i, 'nothing is projected on an unreadable tmux');
+  assert.match(h.stderr(), /^soma up: tmux could not be read/m);
+  assert.match(h.stderr(), /UNKNOWN/);
+  assert.ok(h.stderr().includes(tmux.socketName()), 'the socket that could not be read is named');
+  assert.match(h.stderr(), /`soma status`/, 'and how to check is said');
+  assert.match(h.stderr(), /RUNBOOK §11\.10/);
+  // The scan is for tmux's "no server" only; anything else unreadable refuses without it.
+  assert.equal(h.calls.serverProcesses.length, 0);
+});
+
+test('up over a listing tmux answered but soma cannot parse refuses, through the real readers (#66)', async (t) => {
+  root(t);
+  // #45's mangled listing — exit 0, every tab a `_` — read by the REAL `liveSessions` and
+  // `serverAbsent` over one stub transport. The listing is now `null`, and tmux answered, so it is not
+  // "no server": `up` must refuse, not fall through to a second watchdog.
+  const run = (args) => (args[0] === 'list-panes'
+    ? { stdout: 'soma-watchdog_0\n', stderr: '', code: 0 }
+    : { stdout: 'soma-watchdog\n', stderr: '', code: 0 });
+  const h = mk({ liveSessions: () => tmux.liveSessions(run), serverAbsent: () => tmux.serverAbsent(run) }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 3, h.stderr());
+  assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend over a listing soma could not read');
+  assert.equal(h.calls.newSession.length, 0, 'a second watchdog was started');
+  assert.match(h.stderr(), /UNKNOWN/);
+});
+
+test('up on tmux\'s "no server" refuses while a tmux process for its socket is still alive, and names it (#66)', async (t) => {
+  root(t);
+  // RUNBOOK §11.10 measured two LIVE servers that say "no server answers": one whose socket file was
+  // deleted while it ran, one wedged until its accept queue overflowed. A `new-session` in either
+  // starts a SECOND server on the same path, beside the first and its running leads.
+  const h = mk({ liveSessions: () => null, serverAbsent: () => true, serverProcesses: () => [4242, 4343] }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 3, h.stderr());
+  assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend beside a live server');
+  assert.equal(h.calls.newSession.length, 0, 'a second server was started beside a live one');
+  const e = h.stderr();
+  assert.match(e, /pid 4242, 4343/, 'every process found is named, by pid');
+  assert.ok(e.includes(`socket ${tmux.socketName()}`), 'and the socket it was found for');
+  assert.match(e, /socket file was deleted/, 'the first of the two states');
+  assert.match(e, /accept queue overflowed/, 'the second');
+  assert.match(e, /kill -USR1 <pid>/, 'the recovery for a deleted socket file');
+  assert.match(e, /kill -CONT <pid>/, 'and for a stopped server');
+  assert.match(e, /`soma status`/);
+});
+
+test('up on tmux\'s "no server" refuses on ONE live tmux process for its socket, and names it (#66)', async (t) => {
+  root(t);
+  // One process is the ordinary case: the fleet's own server, its socket file deleted or its accept
+  // queue overflowed. Every other refusal here passes two pids or none, so a check that wanted more
+  // than one would pass them all and start a second server beside this one.
+  const h = mk({ liveSessions: () => null, serverAbsent: () => true, serverProcesses: () => [4242] }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 3, h.stderr());
+  assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend beside a live server');
+  assert.equal(h.calls.newSession.length, 0, 'a second server was started beside a live one');
+  assert.match(h.stderr(), /\(pid 4242\)/, 'the one process found is named, by pid');
+});
+
+test('up on tmux\'s "no server" refuses when the process table cannot be read (#66)', async (t) => {
+  root(t);
+  // "Cannot tell" is not "none found": the second is the answer that starts a server.
+  const h = mk({ liveSessions: () => null, serverAbsent: () => true, serverProcesses: () => null }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 3, h.stderr());
+  assert.equal(h.calls.confirm.length, 0);
+  assert.equal(h.calls.newSession.length, 0);
+  assert.match(h.stderr(), /process table could not be read/);
+  assert.match(h.stderr(), /RUNBOOK §11\.10/);
+});
+
+test('up on tmux\'s "no server" with no tmux process for its socket is a fresh machine: projection, prompt, start (#66)', async (t) => {
+  root(t);
+  // The control for the three refusals above, and where every machine stands before its first `soma
+  // up`: no server answers, and no tmux for the socket is alive. That one goes on exactly as before.
+  let n = 0;
+  const h = mk({ liveSessions: () => (++n === 1 ? null : new Set(['soma-watchdog'])), serverAbsent: () => true }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 0, h.stderr());
+  assert.equal(h.calls.serverProcesses.length, 1, 'the process table was looked at, once, before starting a server');
+  assert.match(h.stdout(), /Fleet worst case/);
+  assert.equal(h.calls.confirm.length, 1);
+  assert.equal(h.calls.newSession.length, 1);
+  assert.match(h.stdout(), /watchdog: live \(tmux session soma-watchdog/);
+});
+
 test('up refuses a state root that cannot take a hard link, once, before anything starts', async (t) => {
   root(t);
   // Without `link(2)` every `withFleetLock` acquisition throws the same diagnosis for the
@@ -1192,6 +1419,67 @@ test('up refuses a seats that is not an array before it projects, asks, or start
   assert.doesNotMatch(h.stdout(), /worst case/i, 'a spend projection was printed from a config soma refuses');
   assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend on a refused config');
   assert.equal(h.calls.newSession.length, 0, 'a watchdog was started on a refused config');
+});
+
+test('up beside a watchdog already running reads soma.json too, and refuses one that watchdog is refusing (#53)', async (t) => {
+  const home = root(t);
+  // The already-live path returned before soma.json was ever read: on a file the loader refuses it
+  // printed "the queue is already open" and exited 0, while the running watchdog — which loads the
+  // same file at the top of every tick — logged WATCHDOG_ERROR on each one and admitted nothing. A
+  // fresh `soma up` on the same file exits 2 naming the key. The REAL loader, as in the test above.
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ seats: {} }));
+  const h = mk({ loadConfig, liveSessions: () => new Set(['soma-watchdog']) }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 2, 'the exit a fresh `soma up` gives the same file');
+  assert.match(h.stderr(), /^soma up: .*\bseats\b/m, 'the refusal must name the key');
+  assert.match(h.stderr(), /watchdog .*is refusing it/, 'and say the running watchdog is refusing the same file');
+  assert.match(h.stderr(), /admits nothing/, 'and what that costs: nothing is admitted until it is fixed');
+  assert.doesNotMatch(h.stdout(), /queue is already open/, 'the false claim, in its own words');
+  assert.equal(h.calls.confirm.length, 0);
+  assert.equal(h.calls.newSession.length, 0);
+
+  // THE CONTROL: the same path over a file the loader accepts is unchanged — exit 0, the queue line,
+  // and nothing on stderr. Without it, an arm that refused every live `up` would pass the above.
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ seats: [] }));
+  const ok = mk({ loadConfig, liveSessions: () => new Set(['soma-watchdog']) }, { answer: true });
+  assert.equal(await dispatch(['up'], ok.deps), 0, ok.stderr());
+  assert.match(ok.stdout(), /queue is already open/);
+  assert.equal(ok.stderr(), '');
+  assert.equal(ok.calls.confirm.length, 0);
+});
+
+test('up asks about the max_leads admission will run, when soma.json spells it as a string (#21)', async (t) => {
+  const home = root(t);
+  // The REAL loader, for the same reason as above: the bug was two readers disagreeing about one
+  // file. The projection read `"10"` as 0 and asked to open the queue to 0 leads; admission ran ten.
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ max_leads: '10' }));
+  const h = mk({ loadConfig });   // declined: the prompt is the subject, nothing need start
+  await dispatch(['up'], h.deps);
+  assert.equal(h.calls.confirm.length, 1);
+  assert.match(h.calls.confirm[0], /Open the queue to 10 concurrent leads\?/);
+  assert.match(h.stdout(), /Fleet worst case: 10 leads × 38,000,000 est_tokens \(iterate/);
+});
+
+test('up refuses a max_leads no reader accepts, before it asks or starts anything (#21)', async (t) => {
+  const home = root(t);
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  // Two refusals, both exit ENV before the prompt: the real loader refuses the file, and — for a
+  // config that reached the arm unjudged (the stub below) — the projection refuses it too.
+  const cases = [
+    [{ max_leads: 'ten' }, /max_leads/],
+    [{ max_leads: 2.5 }, /max_leads/],
+  ].map(([overlay, key]) => [JSON.stringify(overlay), () => { writeFileSync(join(home, 'soma.json'), JSON.stringify(overlay)); return loadConfig; }, key]);
+  cases.push(['an unjudged cfg', () => () => ({ max_leads: 'ten', budgets: {} }), /projectFleetSpend: max_leads/]);
+  for (const [label, arrange, key] of cases) {
+    const h = mk({ loadConfig: arrange() }, { answer: true });
+    assert.equal(await dispatch(['up'], h.deps), 2, `${label}: the ENV exit code`);
+    assert.match(h.stderr(), /^soma up: /m);
+    assert.match(h.stderr(), key, `${label}: the refusal must name the key`);
+    assert.doesNotMatch(h.stdout(), /worst case/i, 'a projection was printed from a refused value');
+    assert.equal(h.calls.confirm.length, 0, 'the operator was asked to approve spend on a refused value');
+    assert.equal(h.calls.newSession.length, 0, 'a watchdog was started on a refused value');
+  }
 });
 
 test('up --canary does not open the queue on a verdict that is not a pass', async (t) => {
@@ -1267,6 +1555,318 @@ test('up wraps ensureTree rather than letting a library throw reach the operator
   // launch never reaches, so the message is all that survives to explain itself.
   assert.match(e, /each process's own cwd/);
   assert.equal(e.includes('    at '), false, 'a stack trace, not a diagnosis, is what the wrap removes');
+});
+
+// ------------------------------------------------------------------------------ up: doctor first (issue #17)
+
+/*
+ * `soma up` opened the queue without running doctor. The golden path is init -> doctor -> up and
+ * nothing held the middle step, so an operator who skipped it started a watchdog draining real
+ * work on a machine nobody had checked. A fresh start now prints a notice, runs the FULL doctor
+ * once (after the config is read, before the spend figure) and refuses with exit 3 on anything but
+ * a pass. `--ignore-doctor` overrides the verdict, not the run: doctor still runs, the override is
+ * announced before the figure, and the spend prompt still decides.
+ *
+ * The stubs mean what the real dep means. `realDeps().doctor` is `runDoctor()`, which writes its
+ * own report straight to process.stdout (so a stub prints nothing, and `h.stdout()` holds only what
+ * `up` printed) and resolves `true` for PASS and INCOMPLETE alike, `false` for FAIL. The
+ * already-live path does not change: nothing new is spent there, so there is nothing to gate.
+ */
+
+/** The stderr lines carrying `up`'s own prefix, which every `up` refusal starts with. */
+const upLines = (s) => s.split('\n').filter((l) => l.startsWith('soma up: '));
+
+/**
+ * `doctor` named as the CAUSE. The flag's own spelling contains the word, so a refusal that only
+ * said "pass --ignore-doctor" would satisfy a bare /doctor/ without ever saying what refused.
+ */
+const namesDoctor = (s) => s.replaceAll('--ignore-doctor', '').includes('doctor');
+
+/**
+ * A fresh `up` whose every step lands in ONE ordered trace, because the gate's claims are about
+ * order and two sinks cannot see a reorder ('up prints the projection BEFORE it asks' is the
+ * precedent). `doctor` is the verdict under test, wrapped rather than replaced, so a sync throw
+ * stays synchronous and a rejection stays a rejection. One entry per `print`/`warn` call, tagged
+ * `out:`/`err:`. `print`, `warn`, `confirm` and `newSession` are all replaced, so `mk()`'s own
+ * recorders hold nothing and every count is read off the trace.
+ */
+const tracedUp = (doctor, { answer = true } = {}) => {
+  const trace = [];
+  const seen = startsClean();
+  const config = mk().deps.loadConfig;   // the stub config every other `up` test projects
+  const { deps } = mk({
+    linkProbe: () => { trace.push('linkProbe'); return { ok: true, code: null, dir: '/state' }; },
+    liveSessions: () => { trace.push('liveSessions'); return seen(); },
+    loadConfig: () => { trace.push('loadConfig'); return config(); },
+    print: (s) => { trace.push(`out:${s}`); },
+    warn: (s) => { trace.push(`err:${s}`); },
+    doctor: () => { trace.push('doctor'); return doctor(); },
+    confirm: () => { trace.push('confirm'); return answer; },
+    canary: async () => { trace.push('canary'); return true; },
+    newSession: () => { trace.push('newSession'); },
+  });
+  return { deps, trace, count: (step) => trace.filter((l) => l === step).length };
+};
+
+test('a fresh up prints a notice naming soma doctor first, then runs doctor once, after the config and before the projection', async (t) => {
+  root(t);
+  // The whole fresh-start sequence in one trace, with and without --canary. The steps that were
+  // already there keep their places; the notice and doctor go between the config read and the
+  // spend figure. After the config, because doctor is the slow, billed step (it runs real
+  // `claude -p` probes) and refusing a bad soma.json costs nothing. Before the figure, because the
+  // operator should approve the spend on a machine doctor has already checked. The notice is the
+  // first thing on stdout because doctor's report lands there next and its probes can take minutes.
+  for (const argv of [['up'], ['up', '--canary']]) {
+    const { deps, trace, count } = tracedUp(async () => true);
+    assert.equal(await dispatch(argv, deps), 0, `${argv.join(' ')}: a passing doctor must not stop the run`);
+    const at = `${argv.join(' ')}: trace was ${JSON.stringify(trace)}`;
+    const notice = trace.findIndex((l) => l.startsWith('out:') && l.includes('soma doctor'));
+    assert.notEqual(notice, -1, `a notice naming \`soma doctor\` is printed before doctor runs; ${at}`);
+    assert.equal(trace.findIndex((l) => l.startsWith('out:')), notice, `nothing reaches stdout before the notice; ${at}`);
+    assert.equal(count('doctor'), 1, `doctor runs exactly once; ${at}`);
+    // The steps that were there before the gate, each found before its place is compared. The
+    // notice and doctor were found just above, so they are not checked twice.
+    const before = [
+      ['the link probe', trace.indexOf('linkProbe')],
+      ['the live check', trace.indexOf('liveSessions')],
+      ['the config read', trace.indexOf('loadConfig')],
+    ];
+    const after = [
+      ['the projection', trace.findIndex((l) => l.startsWith('out:Fleet worst case'))],
+      ['the prompt', trace.indexOf('confirm')],
+      ...(argv.includes('--canary') ? [['the canary', trace.indexOf('canary')]] : []),
+      ['the start', trace.indexOf('newSession')],
+    ];
+    for (const [step, i] of [...before, ...after]) assert.notEqual(i, -1, `${step} is missing; ${at}`);
+    const steps = [
+      ...before,
+      ['the notice', notice],
+      ['doctor', trace.indexOf('doctor')],
+      ...after,
+      // The SECOND listing, and not presence-checked above: once the live check is found a
+      // lastIndexOf cannot miss. With no read-back it IS the live check, and the comparison with
+      // the start below is what fails.
+      ['the read-back', trace.lastIndexOf('liveSessions')],
+    ];
+    for (let k = 1; k < steps.length; k += 1) {
+      assert.ok(steps[k - 1][1] < steps[k][1], `${steps[k - 1][0]} must come before ${steps[k][0]}; ${at}`);
+    }
+  }
+});
+
+test('a doctor that resolves true (PASS or INCOMPLETE) lets a fresh up run exactly as before, with nothing on stderr', async (t) => {
+  root(t);
+  // One stub stands for both verdicts because `runDoctor` resolves `true` for INCOMPLETE as well
+  // as PASS (doctor.test.mjs pins that). It has to: PASS is not reachable on this build, since two
+  // rows are always unobserved (RUNBOOK §5.2), so an `up` that refused INCOMPLETE would refuse
+  // every run.
+  let doctors = 0;
+  const h = mk({ liveSessions: startsClean(), doctor: async () => { doctors += 1; return true; } }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 0);
+  assert.equal(h.stderr(), '', 'a pass has nothing to warn about');
+  assert.match(h.stdout(), /Fleet worst case: 10 leads/);
+  assert.equal(h.calls.confirm.length, 1, 'the spend prompt is still asked, once');
+  assert.equal(h.calls.newSession.length, 1);
+  assert.match(h.stdout(), /watchdog: live/);
+  // Last, so a run that never asked doctor fails here and nowhere above: the pass was READ from
+  // doctor, not assumed.
+  assert.equal(doctors, 1, 'the verdict that let up through came from doctor');
+});
+
+test('a doctor FAIL refuses a fresh up with exit 3 before it projects, asks, runs the canary or starts a watchdog', async (t) => {
+  root(t);
+  // `startsClean()` and a yes, deliberately. With the default listing an `up` that ignored the
+  // verdict would reach the read-back, find no watchdog and refuse with exit 3 too, so the code
+  // below would pass for the wrong reason. Here an ungated run goes all the way to exit 0.
+  for (const argv of [['up'], ['up', '--canary']]) {
+    let doctors = 0;
+    let canaries = 0;
+    const h = mk({
+      liveSessions: startsClean(),
+      doctor: async () => { doctors += 1; return false; },
+      canary: async () => { canaries += 1; return true; },
+    }, { answer: true });
+    const at = argv.join(' ');
+    assert.equal(await dispatch(argv, h.deps), 3, `${at}: a FAIL is soma refusing, exit 3`);
+    assert.equal(doctors, 1, `${at}: doctor runs once`);
+    assert.doesNotMatch(h.stdout(), /worst case/i, `${at}: a spend figure was projected for a machine doctor failed`);
+    assert.equal(h.calls.confirm.length, 0, `${at}: the operator was asked to approve spend after a FAIL`);
+    assert.equal(canaries, 0, `${at}: the canary ran after a FAIL; doctor is the first gate`);
+    assert.equal(h.calls.newSession.length, 0, `${at}: a watchdog was started after a FAIL`);
+    // ONE line carries the whole refusal: what refused, the verdict, what did not happen, and the
+    // way past it. Spread over several lines, a terminal shows the operator only part of it.
+    const refusal = upLines(h.stderr()).find((l) => namesDoctor(l) && l.includes('FAIL')
+      && l.includes('the queue was not opened') && l.includes('--ignore-doctor'));
+    assert.ok(refusal, `${at}: one \`soma up: \` line must name doctor, FAIL, "the queue was not opened" and`
+      + ` --ignore-doctor; stderr was ${JSON.stringify(h.stderr())}`);
+  }
+});
+
+test('only a strict true from doctor is a pass: a string, a number, null, undefined or an object refuses up the same way', async (t) => {
+  root(t);
+  // The `doctor` arm's own rule, `=== true`, and `runDoctor`'s doc says why it returns a strict
+  // boolean: a gate written `if (!await doctor())` opens on the truthy ones here ('true', 'false',
+  // 1, {}). The falsy ones are listed too, so the refusal is shown for every non-pass, not only
+  // for the ones a loose gate gets wrong.
+  for (const verdict of ['true', 'false', 1, 0, null, undefined, {}]) {
+    const at = `doctor resolved ${JSON.stringify(verdict) ?? 'undefined'}`;
+    let doctors = 0;
+    const h = mk({ liveSessions: startsClean(), doctor: async () => { doctors += 1; return verdict; } }, { answer: true });
+    assert.equal(await dispatch(['up'], h.deps), 3, `${at}: not a pass, so exit 3`);
+    assert.equal(doctors, 1, `${at}: doctor runs once`);
+    assert.doesNotMatch(h.stdout(), /worst case/i, `${at}: the figure was projected anyway`);
+    assert.equal(h.calls.confirm.length, 0, `${at}: the operator was asked anyway`);
+    assert.equal(h.calls.newSession.length, 0, `${at}: a watchdog was started anyway`);
+    assert.ok(namesDoctor(h.stderr()), `${at}: the refusal must name doctor; stderr was ${JSON.stringify(h.stderr())}`);
+    assert.match(h.stderr(), /--ignore-doctor/, `${at}: and the way past it`);
+  }
+});
+
+test('a doctor that throws or rejects refuses up with exit 3 and its error, instead of crashing the CLI with exit 2', async (t) => {
+  root(t);
+  // A rejection out of `dispatch` reaches the entrypoint's last-resort handler, which prints one
+  // `soma:` line and exits 2, "this machine cannot run soma". That is the wrong code for a check
+  // that did not finish, and the shape the real canary wiring once shipped with. Both forms are
+  // tried: a gate that only chained a `.catch()` onto the call would still let a sync throw escape.
+  for (const [how, msg, fn] of [
+    ['throws', 'the probe table could not be built (sync throw)', (m) => { throw new Error(m); }],
+    ['rejects', 'the probe table could not be built (async rejection)', async (m) => { throw new Error(m); }],
+  ]) {
+    let doctors = 0;
+    const h = mk({ liveSessions: startsClean(), doctor: () => { doctors += 1; return fn(msg); } }, { answer: true });
+    let code;
+    try {
+      code = await dispatch(['up'], h.deps);
+    } catch (e) {
+      assert.fail(`doctor ${how}: up rejected instead of refusing (the CLI would exit 2): ${e?.message}`);
+    }
+    assert.equal(code, 3, `doctor ${how}: an unfinished check is a refusal, exit 3`);
+    assert.equal(doctors, 1, `doctor ${how}: doctor runs once`);
+    assert.ok(h.stderr().includes(msg), `doctor ${how}: the error itself must reach the operator; stderr was ${JSON.stringify(h.stderr())}`);
+    assert.match(h.stderr(), /--ignore-doctor/, `doctor ${how}: and the way past it`);
+    assert.doesNotMatch(h.stdout(), /worst case/i, `doctor ${how}: the figure was projected anyway`);
+    assert.equal(h.calls.confirm.length, 0, `doctor ${how}: the operator was asked anyway`);
+    assert.equal(h.calls.newSession.length, 0, `doctor ${how}: a watchdog was started anyway`);
+  }
+});
+
+test('up --ignore-doctor still runs doctor once, warns before the projection, and the spend prompt still decides', async (t) => {
+  root(t);
+  // The override passes the VERDICT, not the run and not the spend gate. Doctor still runs, so the
+  // operator who overrides it still gets its report. The override is announced on stderr BEFORE
+  // the figure, so the spend is approved knowing doctor did not pass. And it is not a yes: `up`
+  // has no --yes on purpose ("a flag anyone can add is the warning-that-scrolls-past this gate
+  // exists to prevent"), so a no still opens nothing.
+  const fails = [
+    ['resolves false', async () => false],
+    ['throws', () => { throw new Error('the probe table could not be built (sync throw)'); }],
+    ['rejects', async () => { throw new Error('the probe table could not be built (async rejection)'); }],
+  ];
+  for (const [how, doctor] of fails) {
+    for (const [answer, code, started] of [[true, 0, 1], [false, 1, 0]]) {
+      const { deps, trace, count } = tracedUp(doctor, { answer });
+      let got;
+      try {
+        got = await dispatch(['up', '--ignore-doctor'], deps);
+      } catch (e) {
+        assert.fail(`doctor ${how}: up --ignore-doctor rejected (the CLI would exit 2): ${e?.message}`);
+      }
+      const at = `doctor ${how}, answer ${answer ? 'yes' : 'no'}: trace was ${JSON.stringify(trace)}`;
+      assert.equal(got, code, `the spend prompt decides the exit code; ${at}`);
+      assert.equal(count('doctor'), 1, `the override still runs doctor, once; ${at}`);
+      const warned = trace.findIndex((l) => l.startsWith('err:') && upLines(l.slice(4)).some((x) => x.includes('--ignore-doctor')));
+      const projected = trace.findIndex((l) => l.startsWith('out:Fleet worst case'));
+      assert.notEqual(warned, -1, `a \`soma up: \` line on stderr must name --ignore-doctor; ${at}`);
+      assert.notEqual(projected, -1, `the figure is still shown; ${at}`);
+      assert.ok(warned < projected, `the override is announced BEFORE the figure; ${at}`);
+      assert.equal(count('confirm'), 1, `the operator is still asked, once; ${at}`);
+      assert.ok(projected < trace.indexOf('confirm'), `the figure still precedes the prompt; ${at}`);
+      assert.equal(count('newSession'), started, `a ${answer ? 'yes' : 'no'} starts ${started} watchdog(s); ${at}`);
+    }
+  }
+});
+
+test('up --ignore-doctor over a passing doctor is the same run as plain up, and warns nothing', async (t) => {
+  root(t);
+  const run = async (argv) => {
+    let doctors = 0;
+    const h = mk({ liveSessions: startsClean(), doctor: async () => { doctors += 1; return true; } }, { answer: true });
+    const code = await dispatch(argv, h.deps);
+    return { code, h, doctors };
+  };
+  const plain = await run(['up']);
+  const flagged = await run(['up', '--ignore-doctor']);
+  assert.equal(flagged.code, 0);
+  assert.equal(flagged.h.stderr(), '', 'an override that overrode nothing has nothing to warn about');
+  assert.match(flagged.h.stdout(), /Fleet worst case/);
+  assert.equal(flagged.h.calls.confirm.length, 1, 'the spend prompt is asked, once');
+  assert.match(flagged.h.stdout(), /watchdog: live/);
+  // The same run, measured on what it DID rather than on the words it printed, which the arm owns:
+  // the exit code, one prompt, and the same watchdog started the same way.
+  assert.deepEqual([flagged.code, flagged.h.calls.confirm.length], [plain.code, plain.h.calls.confirm.length],
+    'the flag changed the exit code or the number of prompts');
+  assert.equal(flagged.h.calls.newSession.length, 1);
+  assert.deepEqual(flagged.h.calls.newSession, plain.h.calls.newSession, 'the flag changed the watchdog it started');
+  // Last, so a run that never asked doctor fails here and nowhere above.
+  assert.deepEqual([plain.doctors, flagged.doctors], [1, 1], 'both runs read their pass from doctor, once');
+});
+
+test('up never runs doctor when the watchdog is already live: plain, --ignore-doctor or --canary, exit 0 as before', async (t) => {
+  root(t);
+  // A doctor that would FAIL, so a call on this path shows twice: in the count, and in the exit
+  // code of any gate that then refused. `up` here is usually "is the fleet running?", and the queue
+  // is already open; a billed doctor run on every such check would gate nothing.
+  for (const argv of [['up'], ['up', '--ignore-doctor'], ['up', '--canary']]) {
+    let doctors = 0;
+    const h = mk({
+      liveSessions: () => new Set(['soma-watchdog']),
+      doctor: async () => { doctors += 1; return false; },
+      canary: async () => true,
+    }, { answer: true });
+    const at = argv.join(' ');
+    assert.equal(await dispatch(argv, h.deps), 0, `${at}: the already-live exit code is unchanged`);
+    assert.equal(h.calls.newSession.length, 0, `${at}: this is the already-live path, not the fresh-start one`);
+    assert.match(h.stdout(), /already/i, `${at}: and it says so`);
+    assert.equal(doctors, 0, `${at}: doctor ran on the already-live path`);
+  }
+});
+
+test('up never runs doctor on a soma.json that loadConfig refuses: exit 2, as before', async (t) => {
+  const home = root(t);
+  // The REAL loader on the file the seats test above uses, because the refusal has to be
+  // loadConfig's own: a stub that threw would measure only the stub. Doctor answers `true`, so a
+  // gate that ran it first would still exit 2 and only the count tells the two orders apart.
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ seats: {} }));
+  let doctors = 0;
+  const h = mk({ loadConfig, doctor: async () => { doctors += 1; return true; } }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 2);
+  assert.equal(doctors, 0, 'billed doctor probes ran for a config soma refuses for free');
+});
+
+test('the up line of USAGE names --ignore-doctor', () => {
+  // Every doctor refusal names the flag, so --help has to offer it where the operator looks for
+  // what `up` takes. The first line opening with `up` is the command table's.
+  const line = USAGE.split('\n').find((l) => /^ {2}up\b/.test(l));
+  assert.ok(line, 'the up line must be findable, or the check below is vacuous');
+  assert.ok(line.includes('--ignore-doctor'), `the up line must offer the override; it reads ${JSON.stringify(line)}`);
+});
+
+test('up resolves the doctor dep before it prints anything: a missing doctor is a TypeError naming it, with stdout empty', async (t) => {
+  root(t);
+  // `need`'s TypeError is a wiring bug in the caller, and this arm resolves doctor before its
+  // notice, so the bug never reads as a fleet state. An `up` that printed the
+  // notice first would announce a doctor run that cannot happen. The quotes are deliberate:
+  // `need`'s message lists every guarded name, so the bare word is in it whichever dep was missing,
+  // and only `"doctor"` says doctor is the one.
+  const h = mk({ liveSessions: startsClean() }, { answer: true });
+  delete h.deps.doctor;
+  await assert.rejects(
+    () => dispatch(['up'], h.deps),
+    (e) => e instanceof TypeError && e.message.includes('"doctor"'),
+    'a fresh up must resolve doctor, and refuse its absence by name',
+  );
+  assert.equal(h.stdout(), '', 'something was printed before the doctor dep was resolved');
 });
 
 test('init wraps ensureTree the same way', async (t) => {
@@ -2246,6 +2846,42 @@ test('resume refuses a lead that is still live unless forced', async (t) => {
   assert.equal(forced.calls.killSession.length, 1, 'forced still kills first — that ordering is not the guard');
 });
 
+test('resume, from a shell with no UTF-8 locale, reads a live lead as live and neither kills nor resumes it (#45)', { skip: !tmuxInstalled && 'tmux not installed' }, async (t) => {
+  root(t);
+  // The operator's report on #45, end to end through soma's REAL readers: `liveSessions` and
+  // `killSession` are tmux.mjs's own, over a real server holding a live `lead-cr-1`. Only the spawner
+  // stays a recorder, so nothing real is launched. Without `-u` tmux printed the listing's tab as
+  // `_`, the lead read as not live, and resume KILLED its session and put a second claude on its
+  // worktree — the one outcome the liveness guard exists to prevent.
+  const srv = cLocaleTmux(t, 'lead-cr-1');
+  const kills = [];
+  const h = mk({
+    readFleet: () => ({ tasks: [{ id: 'cr-1', status: 'spawned', lead_session_uuid: 'u1' }] }),
+    liveSessions: () => tmux.liveSessions(srv.run),
+    killSession: (name) => { kills.push(name); return tmux.killSession(name, srv.run); },
+  });
+  assert.equal(await dispatch(['resume', 'cr-1'], h.deps), 3, h.stderr());
+  assert.deepEqual(kills, [], 'a live lead\'s session was killed');
+  assert.equal(h.calls.resumeLead.length, 0, 'a second claude session was put on a live lead\'s worktree');
+  assert.equal(srv.alive('lead-cr-1'), true, 'the live session must still be there');
+  assert.match(h.stderr(), /cr-1 is still live/);
+});
+
+test('resume refuses a listing tmux answered but soma cannot parse as unmeasured, never as a dead lead (#45)', async (t) => {
+  root(t);
+  // The backstop beside `-u`, through the real reader over a stub transport: exit 0, every tab a `_`.
+  // Read as an empty server, that listing is "cr-1 is not live", and resume kills and resumes it.
+  const mangled = () => ({ stdout: 'lead-cr-1_0\n', stderr: '', code: 0 });
+  const h = mk({
+    readFleet: () => ({ tasks: [{ id: 'cr-1', status: 'spawned', lead_session_uuid: 'u1' }] }),
+    liveSessions: () => tmux.liveSessions(mangled),
+  });
+  assert.equal(await dispatch(['resume', 'cr-1'], h.deps), 3, h.stderr());
+  assert.equal(h.calls.killSession.length, 0, 'a session was killed on a listing soma could not read');
+  assert.equal(h.calls.resumeLead.length, 0);
+  assert.match(h.stderr(), /could not be measured/);
+});
+
 test('resume refuses a row with no recorded claude session', async (t) => {
   root(t);
   const h = mk({ readFleet: () => ({ tasks: [{ id: 'cr-1', status: 'failed', lead_session_uuid: null }] }) });
@@ -2284,6 +2920,30 @@ test('resume refuses a soma.json loadConfig refuses BEFORE the kill, with the re
 
   // The control: the same row on a config that loads is killed first and resumed.
   writeFileSync(join(home, 'soma.json'), JSON.stringify({ seats: [] }));
+  const ok = mk({ readFleet: fleet, loadConfig });
+  assert.equal(await dispatch(['resume', 'cr-1'], ok.deps), 0, ok.stderr());
+  assert.equal(ok.calls.killSession.length, 1);
+  assert.equal(ok.calls.resumeLead.length, 1);
+});
+
+test('resume refuses a max_leads loadConfig refuses BEFORE the seat pick and the kill, with exit 2 (#21)', async (t) => {
+  const home = root(t);
+  // The same refusal as the seats one above, reached through the same `validated`: a seated
+  // config, so a pick that ran before the refusal would be recorded.
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ max_leads: 'ten', seats: [{ config_dir: '/s/a', label: 'seat-a' }] }));
+  const fleet = () => ({ tasks: [{ id: 'cr-1', status: 'failed', lead_session_uuid: 'u1' }] });
+  const h = mk({ readFleet: fleet, loadConfig });
+  assert.equal(await dispatch(['resume', 'cr-1'], h.deps), 2, 'the same exit `soma up` gives a config it cannot load');
+  assert.equal(h.calls.pickSeat.length, 0, 'no seat was picked');
+  assert.equal(h.calls.killSession.length, 0, 'the dead pane is still standing');
+  assert.equal(h.calls.resumeLead.length, 0);
+  assert.equal(h.calls.setTaskStatus.length, 0);
+  assert.equal(h.calls.updateFleet.length, 0);
+  assert.match(h.stderr(), /^soma resume: .*\bmax_leads must be a non-negative integer\b.*got "ten"/m, 'the loader\'s reason, which names the key');
+
+  // The control: a numeric string is a number, not a refusal, and the resume goes ahead.
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ max_leads: '10' }));
   const ok = mk({ readFleet: fleet, loadConfig });
   assert.equal(await dispatch(['resume', 'cr-1'], ok.deps), 0, ok.stderr());
   assert.equal(ok.calls.killSession.length, 1);
@@ -2522,7 +3182,7 @@ test('release names the lease verb it is not', async (t) => {
 
 /** One arm per guarded dep — the arm that actually calls it. */
 const ARM_FOR = {
-  liveSessions: ['status'], serverAbsent: ['status'], paneStates: ['status'], newSession: ['up'], killSession: ['down'], sendKeys: ['send', 'cr-1', 'x'],
+  liveSessions: ['status'], serverAbsent: ['status'], serverProcesses: ['up'], paneStates: ['status'], newSession: ['up'], killSession: ['down'], sendKeys: ['send', 'cr-1', 'x'],
   capturePane: ['peek', 'cr-1'], resumeLead: ['resume', 'cr-1'], exec: ['attach', 'cr-1'],
   capture: ['init'], doctor: ['doctor'], canary: ['up', '--canary'], confirm: ['up'],
   linkProbe: ['up'], installSkill: ['init'], installInjectHook: ['init', '--inject-hook'],

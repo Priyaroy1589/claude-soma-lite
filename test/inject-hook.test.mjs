@@ -741,7 +741,7 @@ const initDeps = async ({ home, cfg }) => {
     try { return /orch-inject\.mjs/.test(readFileSync(settingsPath, 'utf8')); } catch { return false; }
   };
   const calls = {
-    installSkill: [], capture: [], installInjectHook: [], newSession: [], killSession: [], sendKeys: [], resumeLead: [], exec: [], confirm: [],
+    installSkill: [], capture: [], installInjectHook: [], serverProcesses: [], newSession: [], killSession: [], sendKeys: [], resumeLead: [], exec: [], confirm: [],
   };
   const deps = {
     print: (s) => out.push(String(s)),
@@ -766,6 +766,7 @@ const initDeps = async ({ home, cfg }) => {
     canary: async () => true,
     confirm: (q) => { calls.confirm.push(q); return false; },
     linkProbe: () => ({ ok: true, code: null, dir: home }),
+    serverProcesses: () => { calls.serverProcesses.push(1); return []; },
     installSkill: (cfgRoot) => { calls.installSkill.push(cfgRoot); return { ok: true, dest: join(cfgRoot, 'skills', 'soma-promote') }; },
     installInjectHook: (opts) => {
       calls.installInjectHook.push(opts);
