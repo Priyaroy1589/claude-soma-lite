@@ -634,8 +634,11 @@ Monitor({ command: "SOMA_HOME=<root> SOMA_TMUX_SOCKET=<socket> <node> <soma>/bin
 - **What it says.** One line per event that asks the orchestrator for a move (the wake table in
   `prompts/orchestrator.md`; `--all` for every event), in the bus's own words:
   `[soma] cr-1 NEEDS_INPUT. Call soma_inbox.` Who and what, never a payload. At most 20 such lines
-  per poll, then one `…and N more` line. `[soma] health: …` lines report the watchdog going down or
-  coming back and the lease being lost, stale or held by nobody, once each time the state changes.
+  per poll, then one `…and N more` line. A freeze's `BACKPRESSURE` rings once, not on every re-emit:
+  the watchdog repeats a storm's on every frozen tick, and a repeat (the same `reason` with the same
+  `since`, or within 10 minutes of the last) stays in the mailbox. `[soma] health: …` lines report
+  the watchdog going down or coming back and the lease being lost, stale or held by nobody, once
+  each time the state changes.
 - **What it never does.** It reads the `orch` cursor only to skip what `soma_inbox` already
   consumed, and writes nothing: no cursor, no event, no keystroke, no toast. `soma_inbox` still
   returns every event the watcher announced, and any number of watchers may run.
@@ -1030,14 +1033,15 @@ soma resume task-42              # after a kill, or after a reboot
 soma retry task-42               # put a failed/skipped row back on the queue
 ```
 
-Four things worth knowing before you use them:
+Five things worth knowing before you use them:
 
 - **`soma watch` is written for a Monitor, not for you.** Its stdout carries wake lines and nothing
   else, and its banner goes to stderr. It reads the `orch` cursor and writes nothing, so it consumes
   no event and any number of watchers may run; from a terminal it is a live tail of what would wake
   the orchestrator. Its `[soma] health: …` lines read the watchdog the way `status` does: a
   listing without the `soma-watchdog` session, or tmux's own "no server", is down, and a tmux that
-  cannot be read says nothing at all.
+  cannot be read says nothing at all. The lease's pane is read the same way: tmux's "no server"
+  means it is gone, and an unreadable tmux does not make the lease stale.
 - **`status` reports `?`, not `dead`, when tmux cannot be read.** A 5 s timeout on a wedged server
   is byte-identical to a healthy server with nothing on it. No tmux server answering on soma's
   socket at all is a different answer, because tmux says so, and it reads as an empty server:

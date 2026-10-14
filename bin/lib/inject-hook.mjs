@@ -68,7 +68,7 @@ export function injectCommand(root, node = process.execPath) {
  * `this` only for a spelling `/bin/sh` reads back as exactly `root` — the quoted form
  * `injectCommand` writes, the bare form the README's hand-wired example used (when `root` needs
  * no quoting), or double quotes — and only as a whole word, so `/x/soma` does not match a pin on
- * `/x/soma-work`.
+ * `/x/soma2`.
  */
 const pinOf = (command, root) => {
   const names = (word) => {

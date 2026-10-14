@@ -51,6 +51,11 @@ export const RING_TYPES = (() => {
 export const MAX_LINES = 20;
 /** How often the watchdog and the lease are looked at. They change on the watchdog's 30 s tick, no faster. */
 export const HEALTH_EVERY_MS = 30_000;
+/**
+ * How close a same-reason BACKPRESSURE must follow the last one to count as the same freeze when
+ * its `since` cannot say so. Far above any tick: the watchdog's default is 30 s.
+ */
+export const BACKPRESSURE_QUIET_MS = 10 * 60 * 1000;
 export const INTERVAL_DEFAULT_S = 5;
 export const INTERVAL_MIN_S = 1;
 export const INTERVAL_MAX_S = 300;
@@ -123,6 +128,27 @@ export function watcher({ all = false, env = process.env, deps = {} } = {}) {
 
   /** stream -> ids printed and not yet behind the cursor. */
   const printed = new Map();
+
+  /**
+   * The last BACKPRESSURE seen in ring mode, rung or not: `{ reason, since, ts }`.
+   *
+   * A freeze rings once. The watchdog re-emits a storm's BACKPRESSURE on every frozen tick, on
+   * purpose (a storm's end has no event, so the repeats record how long it held), each with a new
+   * id, and a ring per re-emit would wake the orchestrator every tick for as long as the freeze
+   * holds: hours under a five-hour window, days under a weekly one. A re-emit carries its storm's
+   * `since` unchanged, so the same reason and the same `since` is the same freeze. Under a spend
+   * cap's record a storm's re-emits stamp `now` instead, so the same reason within
+   * BACKPRESSURE_QUIET_MS of the last one is the same freeze too. One with no reason names no
+   * freeze (the watchdog's builder always sets one): it rings, and the last freeze stays as it was.
+   */
+  let lastFreeze = null;
+  const sameFreeze = (e) => {
+    if (lastFreeze === null || lastFreeze.reason !== e.payload.reason) return false;
+    const since = e.payload.since;
+    if (Number.isFinite(since) && since === lastFreeze.since) return true;
+    return Number.isFinite(e.ts) && Number.isFinite(lastFreeze.ts) && e.ts - lastFreeze.ts < BACKPRESSURE_QUIET_MS;
+  };
+
   /** stream -> { stamp, since, events }: the unread events last parsed, and what they were read against. */
   const parsed = new Map();
 
@@ -173,18 +199,32 @@ export function watcher({ all = false, env = process.env, deps = {} } = {}) {
     }
     // `(ts, id)`, the order `events.unread` hands `soma_inbox`.
     pending.sort((a, b) => a.e.ts - b.e.ts || (a.e.id < b.e.id ? -1 : a.e.id > b.e.id ? 1 : 0));
-    const lines = pending.slice(0, MAX_LINES).map(({ e }) => wakeLine(e));
-    if (pending.length > MAX_LINES) lines.push(moreLine(pending.length - MAX_LINES));
+    // A freeze rings once (`lastFreeze` above). `--all` is the raw feed and keeps every re-emit.
+    const ringing = [];
+    for (const item of pending) {
+      const { e } = item;
+      if (!all && e?.type === 'BACKPRESSURE' && typeof e.payload?.reason === 'string' && e.payload.reason !== '') {
+        const repeat = sameFreeze(e);
+        lastFreeze = { reason: e.payload.reason, since: e.payload.since, ts: e.ts };
+        if (repeat) continue;
+      }
+      ringing.push(item);
+    }
+    const lines = ringing.slice(0, MAX_LINES).map(({ e }) => wakeLine(e));
+    if (ringing.length > MAX_LINES) lines.push(moreLine(ringing.length - MAX_LINES));
 
-    // Everything considered is printed, the summarised tail too: the more-line already rang for it.
+    // Everything considered is printed: the summarised tail, because the more-line already rang for
+    // it, and a re-emit that did not ring, because its freeze already did.
     for (const { stream, e } of pending) {
       if (!printed.has(stream)) printed.set(stream, new Set());
       printed.get(stream).add(e.id);
     }
-    // And forgotten once `soma_inbox` is past it, since no read returns it again.
+    // And forgotten once `soma_inbox` is past it, since no read returns it again — and only then. A
+    // stream missing from one poll (an unreadable checkpoint leaves `orch` alone) still has unread
+    // events, and forgetting them would announce every one again on the next good poll.
     for (const [stream, ids] of printed) {
       if (cursor !== null) for (const id of ids) if (id <= cursor) ids.delete(id);
-      if (ids.size === 0 || !streams.includes(stream)) printed.delete(stream);
+      if (ids.size === 0) printed.delete(stream);
     }
     return lines;
   };

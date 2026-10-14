@@ -2179,10 +2179,13 @@ export async function dispatch(argv, deps = {}) {
         if (listed === null) return serverAbsent() === true ? 'absent' : 'unknown';
         return listed.has(WATCHDOG) ? 'live' : 'absent';
       };
-      // A listing tmux could not give is no evidence the lease's pane is gone.
+      // The lease's pane, read in `status`'s three states. A listing decides. No listing because tmux
+      // says no server answers on the socket means the pane cannot exist: `status` reads that as an
+      // empty server, and the bus's `hasPane` as a dead server's pane. Any other missing listing is
+      // no evidence the pane is gone.
       const hasPane = (pane) => {
         const panes = paneStates();
-        if (panes === null || panes === undefined) return true;
+        if (panes === null || panes === undefined) return serverAbsent() !== true;
         for (const rec of panes.values()) if (rec?.panes?.some((x) => x?.pane_id === pane)) return true;
         return false;
       };

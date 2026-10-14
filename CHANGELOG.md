@@ -19,13 +19,14 @@ Work tracked as GitHub issues, newest first.
 
 - **`soma watch`**, a keystroke-free event poller for the orchestrator (#35). It prints one stdout
   line per fleet event that asks the orchestrator for a move (`--all`: every event) in the bus's own
-  wake-line words, at most 20 per poll, and a health line when the watchdog goes down or comes back
-  and when the lease is lost, stale or held by nobody. It is written for Claude Code's Monitor tool,
-  which turns each line into a wake with no pane and no keystroke: the promote skill and the
-  orchestrator prompt now arm it as `<node> <soma>/bin/soma.mjs watch` with `SOMA_HOME` and
-  `SOMA_TMUX_SOCKET` pinned, all four values read from `claude mcp get soma`, and re-arm it on every
-  expiry. Not `soma watch`, because a wrapper function's own `SOMA_HOME` wins over a prefix. It reads
-  the `orch` cursor and writes nothing, so `soma_inbox` still returns every event.
+  wake-line words, at most 20 per poll and a freeze's `BACKPRESSURE` once rather than on every
+  re-emit, and a health line when the watchdog goes down or comes back and when the lease is lost,
+  stale or held by nobody. It is written for Claude Code's Monitor tool, which turns each line into
+  a wake with no pane and no keystroke: the promote skill and the orchestrator prompt now arm it as
+  `<node> <soma>/bin/soma.mjs watch` with `SOMA_HOME` and `SOMA_TMUX_SOCKET` pinned, all four values
+  read from `claude mcp get soma`, and re-arm it on every expiry. Not `soma watch`, because a
+  wrapper function's own `SOMA_HOME` wins over a prefix. It reads the `orch` cursor and writes
+  nothing, so `soma_inbox` still returns every event.
 - **`soma init --inject-hook`** registers the orchestrator's inject hook (#13). It appends one
   `UserPromptSubmit` entry to the config root's `settings.json`, pinned to this fleet's
   `SOMA_HOME` and to the absolute `node`, and keeps every other key and hook. It is opt-in because
