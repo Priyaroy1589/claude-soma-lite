@@ -1555,6 +1555,318 @@ test('up wraps ensureTree rather than letting a library throw reach the operator
   assert.equal(e.includes('    at '), false, 'a stack trace, not a diagnosis, is what the wrap removes');
 });
 
+// ------------------------------------------------------------------------------ up: doctor first (issue #17)
+
+/*
+ * `soma up` opened the queue without running doctor. The golden path is init -> doctor -> up and
+ * nothing held the middle step, so an operator who skipped it started a watchdog draining real
+ * work on a machine nobody had checked. A fresh start now prints a notice, runs the FULL doctor
+ * once (after the config is read, before the spend figure) and refuses with exit 3 on anything but
+ * a pass. `--ignore-doctor` overrides the verdict, not the run: doctor still runs, the override is
+ * announced before the figure, and the spend prompt still decides.
+ *
+ * The stubs mean what the real dep means. `realDeps().doctor` is `runDoctor()`, which writes its
+ * own report straight to process.stdout (so a stub prints nothing, and `h.stdout()` holds only what
+ * `up` printed) and resolves `true` for PASS and INCOMPLETE alike, `false` for FAIL. The
+ * already-live path does not change: nothing new is spent there, so there is nothing to gate.
+ */
+
+/** The stderr lines carrying `up`'s own prefix, which every `up` refusal starts with. */
+const upLines = (s) => s.split('\n').filter((l) => l.startsWith('soma up: '));
+
+/**
+ * `doctor` named as the CAUSE. The flag's own spelling contains the word, so a refusal that only
+ * said "pass --ignore-doctor" would satisfy a bare /doctor/ without ever saying what refused.
+ */
+const namesDoctor = (s) => s.replaceAll('--ignore-doctor', '').includes('doctor');
+
+/**
+ * A fresh `up` whose every step lands in ONE ordered trace, because the gate's claims are about
+ * order and two sinks cannot see a reorder ('up prints the projection BEFORE it asks' is the
+ * precedent). `doctor` is the verdict under test, wrapped rather than replaced, so a sync throw
+ * stays synchronous and a rejection stays a rejection. One entry per `print`/`warn` call, tagged
+ * `out:`/`err:`. `print`, `warn`, `confirm` and `newSession` are all replaced, so `mk()`'s own
+ * recorders hold nothing and every count is read off the trace.
+ */
+const tracedUp = (doctor, { answer = true } = {}) => {
+  const trace = [];
+  const seen = startsClean();
+  const config = mk().deps.loadConfig;   // the stub config every other `up` test projects
+  const { deps } = mk({
+    linkProbe: () => { trace.push('linkProbe'); return { ok: true, code: null, dir: '/state' }; },
+    liveSessions: () => { trace.push('liveSessions'); return seen(); },
+    loadConfig: () => { trace.push('loadConfig'); return config(); },
+    print: (s) => { trace.push(`out:${s}`); },
+    warn: (s) => { trace.push(`err:${s}`); },
+    doctor: () => { trace.push('doctor'); return doctor(); },
+    confirm: () => { trace.push('confirm'); return answer; },
+    canary: async () => { trace.push('canary'); return true; },
+    newSession: () => { trace.push('newSession'); },
+  });
+  return { deps, trace, count: (step) => trace.filter((l) => l === step).length };
+};
+
+test('a fresh up prints a notice naming soma doctor first, then runs doctor once, after the config and before the projection', async (t) => {
+  root(t);
+  // The whole fresh-start sequence in one trace, with and without --canary. The steps that were
+  // already there keep their places; the notice and doctor go between the config read and the
+  // spend figure. After the config, because doctor is the slow, billed step (it runs real
+  // `claude -p` probes) and refusing a bad soma.json costs nothing. Before the figure, because the
+  // operator should approve the spend on a machine doctor has already checked. The notice is the
+  // first thing on stdout because doctor's report lands there next and its probes can take minutes.
+  for (const argv of [['up'], ['up', '--canary']]) {
+    const { deps, trace, count } = tracedUp(async () => true);
+    assert.equal(await dispatch(argv, deps), 0, `${argv.join(' ')}: a passing doctor must not stop the run`);
+    const at = `${argv.join(' ')}: trace was ${JSON.stringify(trace)}`;
+    const notice = trace.findIndex((l) => l.startsWith('out:') && l.includes('soma doctor'));
+    assert.notEqual(notice, -1, `a notice naming \`soma doctor\` is printed before doctor runs; ${at}`);
+    assert.equal(trace.findIndex((l) => l.startsWith('out:')), notice, `nothing reaches stdout before the notice; ${at}`);
+    assert.equal(count('doctor'), 1, `doctor runs exactly once; ${at}`);
+    // The steps that were there before the gate, each found before its place is compared. The
+    // notice and doctor were found just above, so they are not checked twice.
+    const before = [
+      ['the link probe', trace.indexOf('linkProbe')],
+      ['the live check', trace.indexOf('liveSessions')],
+      ['the config read', trace.indexOf('loadConfig')],
+    ];
+    const after = [
+      ['the projection', trace.findIndex((l) => l.startsWith('out:Fleet worst case'))],
+      ['the prompt', trace.indexOf('confirm')],
+      ...(argv.includes('--canary') ? [['the canary', trace.indexOf('canary')]] : []),
+      ['the start', trace.indexOf('newSession')],
+    ];
+    for (const [step, i] of [...before, ...after]) assert.notEqual(i, -1, `${step} is missing; ${at}`);
+    const steps = [
+      ...before,
+      ['the notice', notice],
+      ['doctor', trace.indexOf('doctor')],
+      ...after,
+      // The SECOND listing, and not presence-checked above: once the live check is found a
+      // lastIndexOf cannot miss. With no read-back it IS the live check, and the comparison with
+      // the start below is what fails.
+      ['the read-back', trace.lastIndexOf('liveSessions')],
+    ];
+    for (let k = 1; k < steps.length; k += 1) {
+      assert.ok(steps[k - 1][1] < steps[k][1], `${steps[k - 1][0]} must come before ${steps[k][0]}; ${at}`);
+    }
+  }
+});
+
+test('a doctor that resolves true (PASS or INCOMPLETE) lets a fresh up run exactly as before, with nothing on stderr', async (t) => {
+  root(t);
+  // One stub stands for both verdicts because `runDoctor` resolves `true` for INCOMPLETE as well
+  // as PASS (doctor.test.mjs pins that). It has to: PASS is not reachable on this build, since two
+  // rows are always unobserved (RUNBOOK §5.2), so an `up` that refused INCOMPLETE would refuse
+  // every run.
+  let doctors = 0;
+  const h = mk({ liveSessions: startsClean(), doctor: async () => { doctors += 1; return true; } }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 0);
+  assert.equal(h.stderr(), '', 'a pass has nothing to warn about');
+  assert.match(h.stdout(), /Fleet worst case: 10 leads/);
+  assert.equal(h.calls.confirm.length, 1, 'the spend prompt is still asked, once');
+  assert.equal(h.calls.newSession.length, 1);
+  assert.match(h.stdout(), /watchdog: live/);
+  // Last, so a run that never asked doctor fails here and nowhere above: the pass was READ from
+  // doctor, not assumed.
+  assert.equal(doctors, 1, 'the verdict that let up through came from doctor');
+});
+
+test('a doctor FAIL refuses a fresh up with exit 3 before it projects, asks, runs the canary or starts a watchdog', async (t) => {
+  root(t);
+  // `startsClean()` and a yes, deliberately. With the default listing an `up` that ignored the
+  // verdict would reach the read-back, find no watchdog and refuse with exit 3 too, so the code
+  // below would pass for the wrong reason. Here an ungated run goes all the way to exit 0.
+  for (const argv of [['up'], ['up', '--canary']]) {
+    let doctors = 0;
+    let canaries = 0;
+    const h = mk({
+      liveSessions: startsClean(),
+      doctor: async () => { doctors += 1; return false; },
+      canary: async () => { canaries += 1; return true; },
+    }, { answer: true });
+    const at = argv.join(' ');
+    assert.equal(await dispatch(argv, h.deps), 3, `${at}: a FAIL is soma refusing, exit 3`);
+    assert.equal(doctors, 1, `${at}: doctor runs once`);
+    assert.doesNotMatch(h.stdout(), /worst case/i, `${at}: a spend figure was projected for a machine doctor failed`);
+    assert.equal(h.calls.confirm.length, 0, `${at}: the operator was asked to approve spend after a FAIL`);
+    assert.equal(canaries, 0, `${at}: the canary ran after a FAIL; doctor is the first gate`);
+    assert.equal(h.calls.newSession.length, 0, `${at}: a watchdog was started after a FAIL`);
+    // ONE line carries the whole refusal: what refused, the verdict, what did not happen, and the
+    // way past it. Spread over several lines, a terminal shows the operator only part of it.
+    const refusal = upLines(h.stderr()).find((l) => namesDoctor(l) && l.includes('FAIL')
+      && l.includes('the queue was not opened') && l.includes('--ignore-doctor'));
+    assert.ok(refusal, `${at}: one \`soma up: \` line must name doctor, FAIL, "the queue was not opened" and`
+      + ` --ignore-doctor; stderr was ${JSON.stringify(h.stderr())}`);
+  }
+});
+
+test('only a strict true from doctor is a pass: a string, a number, null, undefined or an object refuses up the same way', async (t) => {
+  root(t);
+  // The `doctor` arm's own rule, `=== true`, and `runDoctor`'s doc says why it returns a strict
+  // boolean: a gate written `if (!await doctor())` opens on the truthy ones here ('true', 'false',
+  // 1, {}). The falsy ones are listed too, so the refusal is shown for every non-pass, not only
+  // for the ones a loose gate gets wrong.
+  for (const verdict of ['true', 'false', 1, 0, null, undefined, {}]) {
+    const at = `doctor resolved ${JSON.stringify(verdict) ?? 'undefined'}`;
+    let doctors = 0;
+    const h = mk({ liveSessions: startsClean(), doctor: async () => { doctors += 1; return verdict; } }, { answer: true });
+    assert.equal(await dispatch(['up'], h.deps), 3, `${at}: not a pass, so exit 3`);
+    assert.equal(doctors, 1, `${at}: doctor runs once`);
+    assert.doesNotMatch(h.stdout(), /worst case/i, `${at}: the figure was projected anyway`);
+    assert.equal(h.calls.confirm.length, 0, `${at}: the operator was asked anyway`);
+    assert.equal(h.calls.newSession.length, 0, `${at}: a watchdog was started anyway`);
+    assert.ok(namesDoctor(h.stderr()), `${at}: the refusal must name doctor; stderr was ${JSON.stringify(h.stderr())}`);
+    assert.match(h.stderr(), /--ignore-doctor/, `${at}: and the way past it`);
+  }
+});
+
+test('a doctor that throws or rejects refuses up with exit 3 and its error, instead of crashing the CLI with exit 2', async (t) => {
+  root(t);
+  // A rejection out of `dispatch` reaches the entrypoint's last-resort handler, which prints one
+  // `soma:` line and exits 2, "this machine cannot run soma". That is the wrong code for a check
+  // that did not finish, and the shape the real canary wiring once shipped with. Both forms are
+  // tried: a gate that only chained a `.catch()` onto the call would still let a sync throw escape.
+  for (const [how, msg, fn] of [
+    ['throws', 'the probe table could not be built (sync throw)', (m) => { throw new Error(m); }],
+    ['rejects', 'the probe table could not be built (async rejection)', async (m) => { throw new Error(m); }],
+  ]) {
+    let doctors = 0;
+    const h = mk({ liveSessions: startsClean(), doctor: () => { doctors += 1; return fn(msg); } }, { answer: true });
+    let code;
+    try {
+      code = await dispatch(['up'], h.deps);
+    } catch (e) {
+      assert.fail(`doctor ${how}: up rejected instead of refusing (the CLI would exit 2): ${e?.message}`);
+    }
+    assert.equal(code, 3, `doctor ${how}: an unfinished check is a refusal, exit 3`);
+    assert.equal(doctors, 1, `doctor ${how}: doctor runs once`);
+    assert.ok(h.stderr().includes(msg), `doctor ${how}: the error itself must reach the operator; stderr was ${JSON.stringify(h.stderr())}`);
+    assert.match(h.stderr(), /--ignore-doctor/, `doctor ${how}: and the way past it`);
+    assert.doesNotMatch(h.stdout(), /worst case/i, `doctor ${how}: the figure was projected anyway`);
+    assert.equal(h.calls.confirm.length, 0, `doctor ${how}: the operator was asked anyway`);
+    assert.equal(h.calls.newSession.length, 0, `doctor ${how}: a watchdog was started anyway`);
+  }
+});
+
+test('up --ignore-doctor still runs doctor once, warns before the projection, and the spend prompt still decides', async (t) => {
+  root(t);
+  // The override passes the VERDICT, not the run and not the spend gate. Doctor still runs, so the
+  // operator who overrides it still gets its report. The override is announced on stderr BEFORE
+  // the figure, so the spend is approved knowing doctor did not pass. And it is not a yes: `up`
+  // has no --yes on purpose ("a flag anyone can add is the warning-that-scrolls-past this gate
+  // exists to prevent"), so a no still opens nothing.
+  const fails = [
+    ['resolves false', async () => false],
+    ['throws', () => { throw new Error('the probe table could not be built (sync throw)'); }],
+    ['rejects', async () => { throw new Error('the probe table could not be built (async rejection)'); }],
+  ];
+  for (const [how, doctor] of fails) {
+    for (const [answer, code, started] of [[true, 0, 1], [false, 1, 0]]) {
+      const { deps, trace, count } = tracedUp(doctor, { answer });
+      let got;
+      try {
+        got = await dispatch(['up', '--ignore-doctor'], deps);
+      } catch (e) {
+        assert.fail(`doctor ${how}: up --ignore-doctor rejected (the CLI would exit 2): ${e?.message}`);
+      }
+      const at = `doctor ${how}, answer ${answer ? 'yes' : 'no'}: trace was ${JSON.stringify(trace)}`;
+      assert.equal(got, code, `the spend prompt decides the exit code; ${at}`);
+      assert.equal(count('doctor'), 1, `the override still runs doctor, once; ${at}`);
+      const warned = trace.findIndex((l) => l.startsWith('err:') && upLines(l.slice(4)).some((x) => x.includes('--ignore-doctor')));
+      const projected = trace.findIndex((l) => l.startsWith('out:Fleet worst case'));
+      assert.notEqual(warned, -1, `a \`soma up: \` line on stderr must name --ignore-doctor; ${at}`);
+      assert.notEqual(projected, -1, `the figure is still shown; ${at}`);
+      assert.ok(warned < projected, `the override is announced BEFORE the figure; ${at}`);
+      assert.equal(count('confirm'), 1, `the operator is still asked, once; ${at}`);
+      assert.ok(projected < trace.indexOf('confirm'), `the figure still precedes the prompt; ${at}`);
+      assert.equal(count('newSession'), started, `a ${answer ? 'yes' : 'no'} starts ${started} watchdog(s); ${at}`);
+    }
+  }
+});
+
+test('up --ignore-doctor over a passing doctor is the same run as plain up, and warns nothing', async (t) => {
+  root(t);
+  const run = async (argv) => {
+    let doctors = 0;
+    const h = mk({ liveSessions: startsClean(), doctor: async () => { doctors += 1; return true; } }, { answer: true });
+    const code = await dispatch(argv, h.deps);
+    return { code, h, doctors };
+  };
+  const plain = await run(['up']);
+  const flagged = await run(['up', '--ignore-doctor']);
+  assert.equal(flagged.code, 0);
+  assert.equal(flagged.h.stderr(), '', 'an override that overrode nothing has nothing to warn about');
+  assert.match(flagged.h.stdout(), /Fleet worst case/);
+  assert.equal(flagged.h.calls.confirm.length, 1, 'the spend prompt is asked, once');
+  assert.match(flagged.h.stdout(), /watchdog: live/);
+  // The same run, measured on what it DID rather than on the words it printed, which the arm owns:
+  // the exit code, one prompt, and the same watchdog started the same way.
+  assert.deepEqual([flagged.code, flagged.h.calls.confirm.length], [plain.code, plain.h.calls.confirm.length],
+    'the flag changed the exit code or the number of prompts');
+  assert.equal(flagged.h.calls.newSession.length, 1);
+  assert.deepEqual(flagged.h.calls.newSession, plain.h.calls.newSession, 'the flag changed the watchdog it started');
+  // Last, so a run that never asked doctor fails here and nowhere above.
+  assert.deepEqual([plain.doctors, flagged.doctors], [1, 1], 'both runs read their pass from doctor, once');
+});
+
+test('up never runs doctor when the watchdog is already live: plain, --ignore-doctor or --canary, exit 0 as before', async (t) => {
+  root(t);
+  // A doctor that would FAIL, so a call on this path shows twice: in the count, and in the exit
+  // code of any gate that then refused. `up` here is usually "is the fleet running?", and the queue
+  // is already open; a billed doctor run on every such check would gate nothing.
+  for (const argv of [['up'], ['up', '--ignore-doctor'], ['up', '--canary']]) {
+    let doctors = 0;
+    const h = mk({
+      liveSessions: () => new Set(['soma-watchdog']),
+      doctor: async () => { doctors += 1; return false; },
+      canary: async () => true,
+    }, { answer: true });
+    const at = argv.join(' ');
+    assert.equal(await dispatch(argv, h.deps), 0, `${at}: the already-live exit code is unchanged`);
+    assert.equal(h.calls.newSession.length, 0, `${at}: this is the already-live path, not the fresh-start one`);
+    assert.match(h.stdout(), /already/i, `${at}: and it says so`);
+    assert.equal(doctors, 0, `${at}: doctor ran on the already-live path`);
+  }
+});
+
+test('up never runs doctor on a soma.json that loadConfig refuses: exit 2, as before', async (t) => {
+  const home = root(t);
+  // The REAL loader on the file the seats test above uses, because the refusal has to be
+  // loadConfig's own: a stub that threw would measure only the stub. Doctor answers `true`, so a
+  // gate that ran it first would still exit 2 and only the count tells the two orders apart.
+  const { loadConfig } = await import('../bin/lib/config.mjs');
+  writeFileSync(join(home, 'soma.json'), JSON.stringify({ seats: {} }));
+  let doctors = 0;
+  const h = mk({ loadConfig, doctor: async () => { doctors += 1; return true; } }, { answer: true });
+  assert.equal(await dispatch(['up'], h.deps), 2);
+  assert.equal(doctors, 0, 'billed doctor probes ran for a config soma refuses for free');
+});
+
+test('the up line of USAGE names --ignore-doctor', () => {
+  // Every doctor refusal names the flag, so --help has to offer it where the operator looks for
+  // what `up` takes. The first line opening with `up` is the command table's.
+  const line = USAGE.split('\n').find((l) => /^ {2}up\b/.test(l));
+  assert.ok(line, 'the up line must be findable, or the check below is vacuous');
+  assert.ok(line.includes('--ignore-doctor'), `the up line must offer the override; it reads ${JSON.stringify(line)}`);
+});
+
+test('up resolves the doctor dep before it prints anything: a missing doctor is a TypeError naming it, with stdout empty', async (t) => {
+  root(t);
+  // `need`'s TypeError is a wiring bug in the caller, and this arm resolves doctor before its
+  // notice, so the bug never reads as a fleet state. An `up` that printed the
+  // notice first would announce a doctor run that cannot happen. The quotes are deliberate:
+  // `need`'s message lists every guarded name, so the bare word is in it whichever dep was missing,
+  // and only `"doctor"` says doctor is the one.
+  const h = mk({ liveSessions: startsClean() }, { answer: true });
+  delete h.deps.doctor;
+  await assert.rejects(
+    () => dispatch(['up'], h.deps),
+    (e) => e instanceof TypeError && e.message.includes('"doctor"'),
+    'a fresh up must resolve doctor, and refuse its absence by name',
+  );
+  assert.equal(h.stdout(), '', 'something was printed before the doctor dep was resolved');
+});
+
 test('init wraps ensureTree the same way', async (t) => {
   root(t);
   process.env.SOMA_HOME = './rel';
