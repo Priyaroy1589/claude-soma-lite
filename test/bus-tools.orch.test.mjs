@@ -913,14 +913,21 @@ test('enqueue hands the fleet the configured repo map, so a repo-level verify_hi
   assert.deepEqual(seen[0]?.repos, repos, 'soma_enqueue must pass soma.json\'s repos as enqueue(tasks, { repos })');
 
   // No config to read, unwired or unparseable, means no repo map. It does not mean a failed
-  // enqueue: the task still queues, with nothing to fall back on.
-  for (const [why, loadConfig] of [['unwired', undefined], ['throws', () => { throw new SyntaxError('Unexpected token } in JSON'); }]]) {
+  // enqueue: the task still queues, with nothing to fall back on. When loadConfig threw, the
+  // reply explicitly warns that repo and budget-class checks were skipped.
+  for (const [why, loadConfig, hasWarn] of [['unwired', undefined, false], ['throws', () => { throw new SyntaxError('Unexpected token } in JSON'); }, true]]) {
     const calls = [];
     const bare = orch({ deps: { loadConfig, enqueue: recording(calls) } });
     const r2 = await bt.orchTools(bare).get('soma_enqueue')({ tasks: [{ id: 'cr-2', repo: 'r', brief: 'b' }] });
     assert.deepEqual(r2.queued, ['cr-2'], `loadConfig ${why}: the task must still queue`);
     assert.equal(calls.length, 1, `loadConfig ${why}`);
     assert.equal(calls[0]?.repos ?? null, null, `loadConfig ${why}: there is no repo map to pass`);
+    if (hasWarn) {
+      assert.equal(typeof r2.warning, 'string');
+      assert.match(r2.warning, /repository and budget-class checks were skipped/);
+    } else {
+      assert.equal(r2.warning, undefined);
+    }
   }
 });
 
@@ -952,6 +959,7 @@ test('a budget class soma.json does not define is refused at intake, and the rep
   const fine = await bt.orchTools(c).get('soma_enqueue')({ tasks: [{ id: 'cr-12', budget_class: 'standard' }] });
   assert.deepEqual(fine.queued, ['cr-12']);
   assert.equal(fine.known_budget_classes, undefined);
+  assert.equal(fine.warning, undefined);
 });
 
 test('the class check reads own keys only, and stands down when there is nothing to check against', async () => {
@@ -963,12 +971,17 @@ test('the class check reads own keys only, and stands down when there is nothing
   const r = await bt.orchTools(proto).get('soma_enqueue')({ tasks: [{ id: 'cr-1', budget_class: 'premium' }] });
   assert.deepEqual(r.skipped, [{ id: 'cr-1', reason: 'unknown-budget-class' }]);
   assert.deepEqual(r.known_budget_classes, ['standard']);
+  assert.equal(r.warning, undefined);
 
   // As with an unknown repo: a config that cannot be read, or that defines no class at all,
-  // validates nothing rather than refusing every pin.
+  // validates nothing rather than refusing every pin. An unreadable config warns.
   const unreadable = orch({ deps: { loadConfig: () => { throw new Error('Unexpected token } in JSON at position 9'); } } });
+  const outUnreadable = await bt.orchTools(unreadable).get('soma_enqueue')({ tasks: [{ id: 'cr-1', budget_class: 'anything' }] });
+  assert.deepEqual(outUnreadable.queued, ['cr-1']);
+  assert.equal(outUnreadable.known_budget_classes, undefined);
+  assert.match(outUnreadable.warning, /repository and budget-class checks were skipped/);
+
   for (const c of [
-    unreadable,
     orch({ config: { max_leads: 10, repos: {} } }),
     orch({ config: { max_leads: 10, repos: {}, budgets: null } }),
     orch({ config: { max_leads: 10, repos: {}, budgets: {} } }),
@@ -976,6 +989,7 @@ test('the class check reads own keys only, and stands down when there is nothing
     const out = await bt.orchTools(c).get('soma_enqueue')({ tasks: [{ id: 'cr-1', budget_class: 'anything' }] });
     assert.deepEqual(out.queued, ['cr-1']);
     assert.equal(out.known_budget_classes, undefined);
+    assert.equal(out.warning, undefined);
   }
 });
 
@@ -1011,6 +1025,28 @@ test('a checkpoint that will not take the tasks is a refusal that names no file'
   assert.equal(r.ok, false);
   assert.ok(!/[/\\]/.test(r.error), r.error);
 });
+
+test('a config-loading failure warns that repo and budget-class checks were skipped without leaking paths', async () => {
+  const bt = await load();
+  const c = orch({
+    deps: {
+      loadConfig: () => {
+        throw new Error('cannot read /Users/secret/soma.json: SyntaxError: Unexpected token');
+      },
+    },
+  });
+  const r = await bt.orchTools(c).get('soma_enqueue')({
+    tasks: [{ id: 'cr-1', repo: 'unknown-repo', budget_class: 'unknown-class', brief: 'b' }],
+  });
+  assert.deepEqual(r.queued, ['cr-1']);
+  assert.equal(typeof r.warning, 'string', 'must include a warning when soma.json fails to load');
+  assert.match(r.warning, /repo/i, 'warning must mention repo checks');
+  assert.match(r.warning, /budget-class/i, 'warning must mention budget-class checks');
+  assert.match(r.warning, /skip|not performed/i, 'warning must state checks were skipped');
+  assert.ok(!r.warning.includes('/Users/secret'), 'must not expose the filesystem path of soma.json');
+  assert.ok(!/[/\\]/.test(r.warning), 'must not expose any filesystem path separators');
+});
+
 
 // ---------------------------------------------------------------------------
 // soma_queue
