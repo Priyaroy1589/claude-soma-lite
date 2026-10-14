@@ -120,9 +120,10 @@ export function injection(input, env, deps) {
 
   // One sweep over every lead's stream plus the orchestrator's own (SPAWNED,
   // WATCHDOG_ERROR and the rest of the watchdog's output land there).
-  // De-duplicated because `enqueue` would accept a task literally named `orch`, and
-  // filtered because a task id from a hand-edited checkpoint reaches the filesystem
-  // as a path.
+  // De-duplicated because a task literally named `orch` can still be on the checkpoint
+  // (both enqueue doors refuse it, but `fleet.enqueue`'s id rule admits it and the file
+  // is hand-editable), and filtered because a task id from a hand-edited checkpoint
+  // reaches the filesystem as a path.
   const tasks = deps.readFleet()?.tasks ?? [];
   const streams = [...new Set(tasks.map((t) => t?.id).filter((id) => typeof id === 'string' && STREAM_RE.test(id)).concat('orch'))];
 

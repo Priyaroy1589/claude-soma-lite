@@ -41,7 +41,9 @@ way: a change that needs a package needs a very good reason, and an issue first.
   left behind; that directory is never removed). An inherited `SOMA_HOME` is never used, so running
   one file with `node --test` is as safe as `npm test`. No test can touch a real fleet's `~/.soma`.
   A new test file needs the same first import, and `test/soma-home.test.mjs` fails without it.
-- Tests that drive a real tmux use their own socket, never the `soma` socket a live fleet runs on.
+- Tests that drive a real tmux start their servers in a fresh private socket directory, short
+  enough for the socket to bind whatever your `TMPDIR` is, and with `-f /dev/null`: no socket
+  name, not even `soma`, can reach a live fleet's server, and your `~/.tmux.conf` never loads.
   They skip themselves when tmux is not installed. The git-dependent tests skip when git is
   missing, and a few permission tests skip when run as root.
 - On Node 20, the quoted glob matches nothing: the runner prints a *Could not find* line and no

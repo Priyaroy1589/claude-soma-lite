@@ -1053,6 +1053,35 @@ test('a checkpoint that will not take the tasks is a refusal that names no file'
   assert.ok(!/[/\\]/.test(r.error), r.error);
 });
 
+test('intake reports the first check a row fails, cuts a refused id to 64, and sends each hint only beside its own refusal', async () => {
+  // Called directly, because both enqueue doors print what it returns: `soma_enqueue` as its
+  // reply, `soma enqueue --file` as its skipped list and hint lines.
+  const bt = await load();
+  const cfg = { repos: { r: { path: '/r' } }, budgets: { standard: { tokens_cap: 1000 } } };
+  // Rows that fail several checks each get the first in the documented order.
+  const brief = 'x'.repeat(20_000);
+  const order = bt.intake([
+    { id: 'orch', repo: 'nope', budget_class: 'premium', brief },
+    { id: 'cr-1', repo: 'nope', budget_class: 'premium', brief },
+    { id: 'cr-2', repo: 'nope', budget_class: 'premium' },
+  ], cfg);
+  assert.deepEqual(order.rejected, [
+    { id: 'orch', reason: 'reserved-id' },
+    { id: 'cr-1', reason: 'brief-too-long' },
+    { id: 'cr-2', reason: 'unknown-repo' },
+  ]);
+  // A refused row's id came from the caller and is quoted back, so it is cut to 64 characters.
+  const long = bt.intake([{ id: 'q'.repeat(100), repo: 'nope' }], cfg);
+  assert.deepEqual(long.rejected, [{ id: 'q'.repeat(64), reason: 'unknown-repo' }]);
+  // Each hint goes out only beside a refusal of its own kind.
+  const classOnly = bt.intake([{ id: 'cr-3', repo: 'r', budget_class: 'premium' }], cfg);
+  assert.deepEqual(classOnly.known_budget_classes, ['standard']);
+  assert.equal(classOnly.known_repos, null, 'no repo was refused, so no repo list');
+  const repoOnly = bt.intake([{ id: 'cr-4', repo: 'nope' }], cfg);
+  assert.deepEqual(repoOnly.known_repos, ['r']);
+  assert.equal(repoOnly.known_budget_classes, null, 'no class was refused, so no class list');
+});
+
 test('a config-loading failure warns that repo and budget-class checks were skipped without leaking paths', async () => {
   const bt = await load();
   const c = orch({
@@ -1209,6 +1238,37 @@ test('the spawn records the session uuid and tmux session — nothing else in v1
   const st = await bt.orchTools(c).get('soma_status')({ lead: 'cr-1' });
   assert.equal(st.leads[0].est_tokens, 500);
   assert.equal(st.leads[0].model, 'claude-fable-5');
+});
+
+test('the spawn puts the base the spawner reports on the row, a null one included, and leaves the row alone only when no base is reported', async () => {
+  const bt = await load();
+  /** The fixture's spawner, reporting `base_sha` as the real one does: the commit the worktree was cut from, or null. */
+  const reporting = (base_sha) => (t) => ({ lead: t.id, session_uuid: `u-${t.id}`, tmux_target: `lead-${t.id}`, cwd: `/w/${t.id}`, base_sha });
+  const c = orch({ tasks: [{ id: 'cr-1' }], deps: { spawnLead: reporting('abc123') } });
+  const r = await bt.orchTools(c).get('soma_spawn')({ task_id: 'cr-1' });
+  assert.equal(r.recorded, true);
+  // `fleet.enqueue` writes `base_sha: null` and, before this, nothing ever replaced it.
+  assert.equal(c.s.fleet.tasks[0].base_sha, 'abc123');
+
+  // A null, or an empty base, is the spawner's ANSWER: `spawnLead` always reports the base of the
+  // checkout it launched in, and says null when it cannot vouch for one (a reused checkout whose
+  // meta.json names another branch). The row's sha is then an older cut's, and keeping it would
+  // name a commit this checkout was not cut from, while meta.json says null.
+  for (const reported of [null, '']) {
+    const cleared = orch({ tasks: [{ id: 'cr-2', base_sha: 'older-cut' }], deps: { spawnLead: reporting(reported) } });
+    await bt.orchTools(cleared).get('soma_spawn')({ task_id: 'cr-2' });
+    assert.equal(cleared.s.fleet.tasks[0].status, 'spawned');
+    assert.equal(cleared.s.fleet.tasks[0].base_sha, null, `a spawner reporting ${JSON.stringify(reported)}`);
+  }
+
+  // No `base_sha` at all, or an undefined one, says nothing about the base: the row keeps its own.
+  const silent = (t) => ({ lead: t.id, session_uuid: `u-${t.id}`, tmux_target: `lead-${t.id}`, cwd: `/w/${t.id}` });
+  for (const [what, spawnLead] of [['no base_sha', silent], ['base_sha: undefined', reporting(undefined)]]) {
+    const kept = orch({ tasks: [{ id: 'cr-3', base_sha: 'orig' }], deps: { spawnLead } });
+    await bt.orchTools(kept).get('soma_spawn')({ task_id: 'cr-3' });
+    assert.equal(kept.s.fleet.tasks[0].status, 'spawned');
+    assert.equal(kept.s.fleet.tasks[0].base_sha, 'orig', `a spawner reporting ${what}`);
+  }
 });
 
 /**
@@ -1736,7 +1796,9 @@ test('a pinned lead shows its pin whatever harness it declares; a pin soma.json 
     config: structuredClone(CLASSES),
     tasks: [
       { id: 'cr-1', status: 'spawned', harness: 'H4', budget_class: 'babysit', budget_override: 'babysit', lead_session_uuid: 'u1' },
-      // `soma enqueue --file` stores what the file says; the breaker passes this pin over.
+      // Both enqueue doors refuse a class soma.json does not define, so this pin came from a
+      // hand-edited checkpoint, an enqueue with no class to check it against, or a class removed
+      // from soma.json later. The breaker passes it over.
       { id: 'cr-2', status: 'spawned', harness: 'H4', budget_class: 'premium', budget_override: 'premium', lead_session_uuid: 'u2' },
     ],
     events: [{ type: 'HARNESS', lead: 'cr-1', payload: { harness_id: 'H4' } }, { type: 'HARNESS', lead: 'cr-2', payload: { harness_id: 'H4' } }],

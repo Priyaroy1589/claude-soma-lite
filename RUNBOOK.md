@@ -117,11 +117,14 @@ $SOMA_HOME/
   state/                 fleet.json, fleet.lock, orch.lease, QUEUE_PAUSED, seats.json, backpressure.json (written on an org spend cap or a rate-limit storm)
   events/                <stream>.ndjson — one per lead, plus orch.ndjson
   heartbeats/            <lead> — touched by the lead's PostToolUse hook
-  leads/<id>/            brief.md, mcp.json, settings.json, settings.launch.json,
+  leads/<id>/            meta.json, brief.md, mcp.json, settings.json, settings.launch.json,
                          BUDGET_TRIPPED, BUDGET_WARNED (BUDGET_WARNED.delivered once
-                         the gate has handed the lead its 80% note)
-                         (meta.json is in the design and in
-                         docs/ROADMAP.md, and NOTHING WRITES IT — see §9)
+                         the gate has handed the lead its 80% note).
+                         meta.json is written by each spawn, before the launch: id, repo,
+                         base_branch, base_sha (the commit the worktree was cut from;
+                         null if a reused one's cut was never recorded), branch, worktree,
+                         reused, session_uuid, tmux_target, spawned_at. A resume leaves it
+                         alone. It has no RC URL (§9)
   logs/                  watchdog.log, <lead>.log (tmux pipe-pane transcripts)
   worktrees/<repo>/<id>/ the lead's checkout, on branch soma/<id>
   digests/               (v1.x composer not built — directory exists, stays empty)
@@ -607,10 +610,10 @@ soma enqueue --file tasks.json
 name). Each row needs at least `id`, matching `^[a-z][a-z0-9-]{0,63}$` — it becomes a directory
 name, a tmux target and an event stream, so nothing else is admitted. Fields that survive into the
 fleet row: `id`, `title`, `repo`, `source`, `brief`, `base_branch`, `budget_class`, `verify_hint`,
-and `budget_override`, a copy of `budget_class` that pins the breaker to it. This verb stores the
-class as the file gives it and does not check that soma.json defines it (`soma_enqueue` does). One it
-does not define is passed over and `HARNESS_DEFAULTED` says so once: the lead is priced by its
-harness, or at `standard` before it declares one.
+and `budget_override`, a copy of `budget_class` that pins the breaker to it. A class soma.json does
+not define is refused at intake (below). One that reaches a row anyway, because soma.json could not
+be read at enqueue or the class was removed from it since, is passed over and `HARNESS_DEFAULTED`
+says so once: the lead is priced by its harness, or at `standard` before it declares one.
 
 ```json
 [
@@ -620,10 +623,18 @@ harness, or at `standard` before it declares one.
 ]
 ```
 
-Invalid and duplicate ids are **skipped rather than fatal** — one bad row should not cost the other
-twenty-nine — and every drop is printed. If rows were offered and **none** was taken, `enqueue`
-exits **3**, because `queued 0` beside a zero exit is how a plan of thirty duplicate ids reads as a
-success.
+A bad row is **skipped rather than fatal** — one bad row should not cost the other twenty-nine — and
+every drop is printed with its reason. This verb and `soma_enqueue` run one intake check,
+`bus-tools.intake`, so a file loses exactly the rows the tool would refuse: the reserved id `orch`,
+the orchestrator's own stream (`reserved-id`); a `brief` over 16,384 characters (`brief-too-long`);
+a `repo` not in soma.json's `repos`, while it names any (`unknown-repo`); a `budget_class`
+soma.json's `budgets` does not define (`unknown-budget-class`); a row that is not an object
+(`not-an-object`). Then `fleet.enqueue` skips an invalid id (`invalid-id`) and one already in the
+fleet or earlier in the file (`duplicate`). After an `unknown-repo` or `unknown-budget-class` the CLI
+prints the names soma.json does define, one line each. If soma.json cannot be read it says so, and
+the repo and class checks check nothing; the other three still hold. If rows were offered and
+**none** was taken, `enqueue` exits **3**, because `queued 0` beside a zero exit is how a plan of
+thirty duplicate ids reads as a success.
 
 A task keeps its `verify_hint`, the command its lead's independent verifier runs. A task without one
 takes `repos.<name>.verify_hint` from `soma.json` at enqueue, so a hint added there later does not
@@ -767,7 +778,7 @@ Confirmed against the `switch` in `bin/soma.mjs`. Nothing below is aspirational.
 | `soma retry <lead>` | re-queue a `failed` or `skipped` row |
 | `soma clear-trip <lead>` | clear a budget trip by granting one more allowance of the lead's class (§4, *Budget classes*), and log `TRIP_CLEARED`; **refuses a lead that is not tripped or not metered, exit 3** |
 | `soma digest [--lines N]` | recent events, oldest first, **consuming nothing** |
-| `soma enqueue --file <f>` | add tasks from a JSON array |
+| `soma enqueue --file <f>` | add tasks from a JSON array, refusing what `soma_enqueue` refuses (§6.2) |
 | `soma thaw` | clear an org spend-cap freeze (`state/backpressure.json`) and print the record cleared; **refuses a live storm and an unreadable record, exit 3** — see §9 |
 | `soma hold` / `release` / `gc` | **refuse with a reason, exit 3** — see §9 |
 
@@ -1021,9 +1032,9 @@ skill all say exists.
 
 Also declared and not built: the **digest composer** (`digests/` stays empty; `soma digest` is the
 raw log), the **H5 babysitter teardown handoff**, the **Jira/GitHub writeback ledger** (writeback is
-prompt discipline, not a tracked ledger), **RC URL capture on spawn** — and with it
-**`leads/<id>/meta.json`, which nothing writes at all**, so the per-lead forensic record and the
-`base_sha` of every task row are permanently absent — and **watchdog episode semantics /
+prompt discipline, not a tracked ledger), **RC URL capture on spawn** (each spawn does write
+`leads/<id>/meta.json`, with the commit the worktree was cut from, and puts that `base_sha` on the
+task row; the RC URL is the one field it lacks), and **watchdog episode semantics /
 notification coalescing** (notifications are per-event and chatty at ten leads). The **Claude Code
 version gate** is no longer on this list: it is wired and enforced, see §4.
 

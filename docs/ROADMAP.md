@@ -129,18 +129,15 @@ already due on arrival, and no other spawn in that repo can proceed for the dura
 v1.x should capture it **outside** the repo lock, driven by the CLI on demand rather than by the
 spawner.
 
-**And `meta.json` is not written either — this paragraph used to assert that it was.** It said
-"`meta.json` itself is still written on spawn — it is the per-lead forensic record", and named two
-other parts of the v1 build as its intended readers. Grep `bin/` for a writer: there is none.
-`paths.mjs` and the runbook's directory listing both describe it as part of `leads/<id>/`, and
-nothing creates it. So the RC URL is not the only thing missing from that file; **the file is
-missing**, and with it the whole per-lead forensic record.
-
-The concrete loss beyond the RC URL is `base_sha`. `worktree.mjs` computes it and returns it on
-every path, `spawn.mjs` discards it, and `fleet.mjs` writes `base_sha: null` into the task row — so
-every task permanently records `null` for the commit its worktree was cut from, which is the one
-field a post-mortem needs to reproduce what a lead saw. v1.x: write `meta.json` on spawn with
-`base_sha` from the value `ensureWorktree` already returns, and thread the same value onto the row.
+`meta.json` itself is written on spawn; only the RC URL is missing from it. `spawnLead` writes
+`leads/<id>/meta.json` inside the repo lock and before the launch, holding what the spawn fixed:
+the task and repo, the base branch, `base_sha` (the commit the worktree was cut from), the branch,
+the worktree, whether it was reused, the session uuid, the tmux target and the time. The same
+`base_sha` goes onto the task row, which `fleet.enqueue` creates with `base_sha: null`; that is the
+field a post-mortem needs to reproduce what a lead saw. On a reused worktree `ensureWorktree` can
+report only the remote's current tip, so the spawner takes the base from `meta.json` when it
+records the same branch, and from the row only when there is no `meta.json` to read; otherwise it
+records null rather than that tip. A resume leaves the file alone.
 
 ## Declared out of scope by the account-rotation design (2026-09-15)
 

@@ -445,6 +445,60 @@ function writeLaunchSettings(what, id, leadSettingsPath) {
   return fp;
 }
 
+/** A string with something in it: the only shape a sha or a branch name may have here. */
+const nonEmpty = (v) => typeof v === 'string' && v !== '';
+
+/**
+ * `leads/<id>/meta.json`: the spawner's record of one launch, the per-lead forensic record the
+ * design names.
+ *
+ * Only what the spawn fixed goes in it: the task and repo, the base branch and the commit the
+ * worktree was cut from, the branch and the checkout, whether it was reused, the session uuid,
+ * the tmux target, and when. Not the seat or its config dir, which a rotation changes (the row
+ * tracks `seat`), and not the Remote Control URL, which nothing captures yet (ROADMAP).
+ *
+ * Written inside the repo lock and BEFORE the launch, in the order the design's spawn recipe
+ * gives. A launch that throws after a fresh cut leaves a clean checkout, the next attempt reuses
+ * it, and `ensureWorktree` can then report only the remote's tip: this file is where that attempt
+ * finds the commit the checkout was really cut from. A write that fails throws, because nothing
+ * has launched yet and both callers roll the row back. tmp+rename, as `writeLaunchSettings`.
+ */
+function writeMeta(id, meta) {
+  const dir = leadDir(id);
+  mkdirSync(dir, { recursive: true });
+  const fp = join(dir, 'meta.json');
+  const tmp = `${fp}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(meta, null, 2)}\n`);
+  renameSync(tmp, fp);
+}
+
+/**
+ * The commit a REUSED checkout on `branch` was cut from, as recorded, or null when nothing says.
+ *
+ * `leads/<id>/meta.json` decides whenever it can be read. The spawner writes it, naming its
+ * branch, before the launch; the row only gets the same value after the launch, through a write
+ * that can fail on its own. So a readable record is never older than the row, and it is the only
+ * one that says which branch its base belongs to. Its base counts when the branch is this one.
+ * A record of another branch says nothing about this checkout: after a retry suffix the checkout
+ * here is on `soma/<id>-r2`, cut later, and a `soma/<id>` record is what a failed write on that cut
+ * left behind. That record, or one with no usable base, means the base is unknown: null, even
+ * when the row has one, since the row's may be from that same stale cut.
+ *
+ * `rowBase`, the row's own `base_sha`, is the fallback only when there is no record to read: no
+ * file, or one that does not parse to an object, which is a lead spawned before this record
+ * existed or a lead dir someone wiped. The remote's current tip is never the answer.
+ */
+function recordedBase(id, branch, rowBase) {
+  let meta = null;
+  try {
+    meta = JSON.parse(readFileSync(join(leadDir(id), 'meta.json'), 'utf8'));
+  } catch {
+    // No file, or no JSON in it: no record.
+  }
+  if (!isObject(meta)) return nonEmpty(rowBase) ? rowBase : null;
+  return nonEmpty(branch) && meta.branch === branch && nonEmpty(meta.base_sha) ? meta.base_sha : null;
+}
+
 /**
  * What a resumed lead is told, as its first user message.
  *
@@ -921,7 +975,12 @@ function launch({ id, cwd, sessionUuid, resume, task, cfg, deps, configDir }) {
 }
 
 /**
- * Start a lead for `task`. Returns `{lead, session_uuid, tmux_target, cwd}`.
+ * Start a lead for `task`. Returns `{lead, session_uuid, tmux_target, cwd, base_sha}`.
+ *
+ * `base_sha` is the commit the lead's worktree was cut from, or null when that is not known (a
+ * reused checkout with no record of its own cut: see `recordedBase`). It is also written to
+ * `leads/<id>/meta.json` before the launch (see `writeMeta`), and the callers put it on the task
+ * row, which `fleet.enqueue` creates with `base_sha: null`.
  *
  * Synchronous from end to end, because `withRepoLock` is: it releases on the synchronous
  * return, so an async body would run the rest of its "protected" work with the mutex gone —
@@ -981,6 +1040,26 @@ export function spawnLead(task, deps = SPAWN_DEPS, opts) {
     }
 
     const sessionUuid = deps.uuid();
+    // The commit this checkout was cut from. On a fresh cut that is the tip `ensureWorktree` just
+    // fetched. A reused checkout was cut by an earlier attempt, and the tip reported now is only
+    // where the remote has got to since, so the base is what that attempt recorded: meta.json's
+    // for this same branch when there is a meta.json to read, the row's only when there is none,
+    // else unknown (see `recordedBase`). Never the tip: a wrong base is worse than an absent one.
+    const baseSha = wt.reused === true
+      ? recordedBase(id, wt.branch, task.base_sha)
+      : (nonEmpty(wt.base_sha) ? wt.base_sha : null);
+    writeMeta(id, {
+      id,
+      repo,
+      base_branch: base,
+      base_sha: baseSha,
+      branch: nonEmpty(wt.branch) ? wt.branch : null,
+      worktree: wt.dir,
+      reused: wt.reused === true,
+      session_uuid: sessionUuid,
+      tmux_target: name,
+      spawned_at: new Date().toISOString(),
+    });
     launch({
       id,
       cwd: wt.dir,
@@ -993,12 +1072,13 @@ export function spawnLead(task, deps = SPAWN_DEPS, opts) {
       deps,
       configDir,
     });
-    return { lead: id, session_uuid: sessionUuid, tmux_target: name, cwd: wt.dir };
+    return { lead: id, session_uuid: sessionUuid, tmux_target: name, cwd: wt.dir, base_sha: baseSha };
   });
 }
 
 /**
- * Restart a lead on its recorded session. Returns `{lead, session_uuid}`.
+ * Restart a lead on its recorded session. Returns `{lead, session_uuid}`: no `base_sha`, and
+ * `leads/<id>/meta.json` is left alone, because a resume cuts nothing and the record is the spawn's.
  *
  * Deliberately does **not** call `ensureWorktree`: the worktree is the one holding the work
  * being resumed, and a reuse judged unclean would be removed and re-cut on a fresh branch,

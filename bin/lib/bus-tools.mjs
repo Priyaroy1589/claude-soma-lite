@@ -861,6 +861,94 @@ export function leadTools(ctx) {
   return tools;
 }
 
+/** Repo names soma.json configures, or null when it configures none. */
+const knownRepos = (repos) => {
+  if (!isRecord(repos)) return null;
+  const names = Object.keys(repos);
+  // An unconfigured fleet validates nothing: refusing every task on a fresh
+  // install would make the first enqueue impossible, and the spawner
+  // reports an unknown repo with a real diagnosis anyway.
+  return names.length ? new Set(names) : null;
+};
+
+/**
+ * The budget classes soma.json defines, or null when there is nothing to check a pin against.
+ *
+ * A class counts only as an own key whose value is a record of caps: the rule the watchdog binds
+ * a pinned class by and `harness.readBudgets` prices a harness by, so a class this check admits is
+ * one the breaker can bind. Null, validating nothing, for the reason `knownRepos` gives.
+ */
+const knownBudgetClasses = (budgets) => {
+  if (!isRecord(budgets)) return null;
+  const names = Object.keys(budgets).filter((name) => isRecord(budgets[name]));
+  return names.length ? new Set(names) : null;
+};
+
+/**
+ * The intake check: which of `tasks` may go on to `fleet.enqueue`, and why each of the others may not.
+ *
+ * ONE function for both doors into the queue, `soma_enqueue` below and `soma enqueue --file` in
+ * `soma.mjs`, which imports it. While the check lived inside `soma_enqueue`, the CLI queued every
+ * row the bus refused: the reserved id `orch`, a 40,000-character brief, a repo typo, a class typo.
+ * It is here, pure, because this module imports nothing, so the CLI takes the bus's rule without
+ * taking the bus's deps.
+ *
+ * `cfg` is soma.json as read, or null when it could not be read. Its `repos` and `budgets` are what
+ * a repo and a class are judged against, and when either is missing that check validates nothing;
+ * the other three need no config. The first failure wins, in this order, and the reasons are the
+ * reply's: `not-an-object`, `reserved-id`, `brief-too-long`, `unknown-repo`,
+ * `unknown-budget-class`. A refused row's id is cut to `MAX_ECHO`: it came from the caller and is
+ * about to be quoted back. `known_repos` and `known_budget_classes` are the hint that goes with a
+ * refusal of that kind (soma.json's names, the first 50), and null when no row was refused for it.
+ *
+ * Not checked here: the id rule and duplicates, which are `fleet.enqueue`'s own, and the batch
+ * size, which bounds one model's payload and stays in `soma_enqueue`.
+ */
+export function intake(tasks, cfg) {
+  const known = knownRepos(cfg?.repos);
+  const classes = knownBudgetClasses(cfg?.budgets);
+  const accepted = [];
+  const rejected = [];
+  for (const task of tasks) {
+    if (!isRecord(task)) {
+      rejected.push({ id: null, reason: 'not-an-object' });
+      continue;
+    }
+    const id = cut(task.id, MAX_ECHO);
+    // `fleet`'s id regex permits `orch`, which is the orchestrator's own event
+    // stream — a task by that name would file its reports into the inbox's own
+    // file. Refused at both doors into the fleet.
+    if (RESERVED_STREAMS.has(task.id)) {
+      rejected.push({ id, reason: 'reserved-id' });
+      continue;
+    }
+    if (typeof task.brief === 'string' && task.brief.length > MAX_BRIEF) {
+      rejected.push({ id, reason: 'brief-too-long' });
+      continue;
+    }
+    if (known && !known.has(task.repo)) {
+      rejected.push({ id, reason: 'unknown-repo' });
+      continue;
+    }
+    // The watchdog prices a lead at its pinned class from the first tick, and passes over a pin
+    // it cannot bind without a word whenever the lead's harness prices it. A typo has to be
+    // caught here, or the pin is simply never applied. `classes` holds only names, so a pin
+    // that is not a string at all fails the same `has`.
+    if (classes && task.budget_class !== undefined && task.budget_class !== null && !classes.has(task.budget_class)) {
+      rejected.push({ id, reason: 'unknown-budget-class' });
+      continue;
+    }
+    accepted.push(task);
+  }
+  const refusedFor = (reason) => rejected.some((row) => row.reason === reason);
+  return {
+    accepted,
+    rejected,
+    known_repos: known && refusedFor('unknown-repo') ? [...known].slice(0, 50) : null,
+    known_budget_classes: classes && refusedFor('unknown-budget-class') ? [...classes].slice(0, 50) : null,
+  };
+}
+
 /**
  * ===========================================================================
  * Part 2 — the control plane: what an orchestrator may do, and what a session
@@ -1553,29 +1641,6 @@ export function orchTools(ctx) {
   // soma_enqueue / soma_queue — the backlog
   // -------------------------------------------------------------------------
 
-  /** Repo names the operator has configured, or null when nothing is configured. */
-  const knownRepos = (repos) => {
-    if (!isRecord(repos)) return null;
-    const names = Object.keys(repos);
-    // An unconfigured fleet validates nothing: refusing every task on a fresh
-    // install would make the first `soma_enqueue` impossible, and the spawner
-    // reports an unknown repo with a real diagnosis anyway.
-    return names.length ? new Set(names) : null;
-  };
-
-  /**
-   * The budget classes soma.json defines, or null when there is nothing to check a pin against.
-   *
-   * A class counts only as an own key whose value is a record of caps: the rule the watchdog binds
-   * a pinned class by and `harness.readBudgets` prices a harness by, so a class this door admits is
-   * one the breaker can bind. Null, validating nothing, for the reason `knownRepos` gives.
-   */
-  const knownBudgetClasses = (budgets) => {
-    if (!isRecord(budgets)) return null;
-    const names = Object.keys(budgets).filter((name) => isRecord(budgets[name]));
-    return names.length ? new Set(names) : null;
-  };
-
   const configForEnqueue = async () => {
     if (!has('loadConfig')) return { cfg: null, unreadable: false };
     try {
@@ -1590,6 +1655,7 @@ export function orchTools(ctx) {
     if (!Array.isArray(tasks)) {
       return refuse('tasks must be an array of task objects, e.g. [{"id":"task-42","title":"…","repo":"…","brief":"…"}]');
     }
+    // A bound on one model's payload, not a row check, so it stays here rather than in `intake`.
     if (tasks.length > MAX_ENQUEUE) {
       return refuse(`${tasks.length} tasks in one call is more than a backlog; send at most ${MAX_ENQUEUE} per call`);
     }
@@ -1597,47 +1663,12 @@ export function orchTools(ctx) {
     // and the repo map itself goes to `enqueue`, which never reads the config and needs it for a
     // repo's `verify_hint`.
     const { cfg, unreadable } = await configForEnqueue();
-    const repos = cfg?.repos;
-    const known = knownRepos(repos);
-    const classes = knownBudgetClasses(cfg?.budgets);
-    const rejected = [];
-    const accepted = [];
-    for (const task of tasks) {
-      if (!isRecord(task)) {
-        rejected.push({ id: null, reason: 'not-an-object' });
-        continue;
-      }
-      const id = cut(task.id, MAX_ECHO);
-      // `fleet`'s id regex permits `orch`, which is the orchestrator's own event
-      // stream — a task by that name would file its reports into the inbox's own
-      // file. Refused at the only door into the fleet.
-      if (RESERVED_STREAMS.has(task.id)) {
-        rejected.push({ id, reason: 'reserved-id' });
-        continue;
-      }
-      if (typeof task.brief === 'string' && task.brief.length > MAX_BRIEF) {
-        rejected.push({ id, reason: 'brief-too-long' });
-        continue;
-      }
-      if (known && !known.has(task.repo)) {
-        rejected.push({ id, reason: 'unknown-repo' });
-        continue;
-      }
-      // The watchdog prices a lead at its pinned class from the first tick, and passes over a pin
-      // it cannot bind without a word whenever the lead's harness prices it. A typo has to be
-      // caught here, or the pin is simply never applied. `classes` holds only names, so a pin
-      // that is not a string at all fails the same `has`.
-      if (classes && task.budget_class !== undefined && task.budget_class !== null && !classes.has(task.budget_class)) {
-        rejected.push({ id, reason: 'unknown-budget-class' });
-        continue;
-      }
-      accepted.push(task);
-    }
+    const checked = intake(tasks, cfg);
 
     let result = { queued: [], skipped: [] };
-    if (accepted.length) {
+    if (checked.accepted.length) {
       try {
-        result = (await deps.enqueue(accepted, { repos })) ?? result;
+        result = (await deps.enqueue(checked.accepted, { repos: cfg?.repos })) ?? result;
       } catch (e) {
         return refuse(`the fleet checkpoint could not be updated${codeOf(e)}`);
       }
@@ -1649,13 +1680,13 @@ export function orchTools(ctx) {
       : [];
     const out = {
       queued: Array.isArray(result.queued) ? result.queued : [],
-      skipped: [...fromFleet, ...rejected],
+      skipped: [...fromFleet, ...checked.rejected],
       ...(unreadable
         ? { warning: 'soma.json could not be read, so repository and budget-class checks were skipped and no repo verify_hint was applied' }
         : {}),
     };
-    if (known && rejected.some((row) => row.reason === 'unknown-repo')) out.known_repos = [...known].slice(0, 50);
-    if (classes && rejected.some((row) => row.reason === 'unknown-budget-class')) out.known_budget_classes = [...classes].slice(0, 50);
+    if (checked.known_repos) out.known_repos = checked.known_repos;
+    if (checked.known_budget_classes) out.known_budget_classes = checked.known_budget_classes;
     return out;
   });
 
@@ -1803,12 +1834,21 @@ export function orchTools(ctx) {
      */
     const uuid = cut(spawn?.session_uuid, MAX_ECHO);
     const target = cut(spawn?.tmux_target, MAX_ECHO) ?? `lead-${task_id}`;
+    // The commit the worktree was cut from, which `fleet.enqueue` leaves null. NOT guarded like the
+    // uuid: a spawn always answers for the checkout it launched in, and its null means it no longer
+    // vouches for the base an earlier cut put on the row (a reused checkout whose meta.json names
+    // another branch, or no base). The row is never newer than that meta.json, so the null
+    // replaces the sha. Only a result that reports no base leaves the row's alone: no `base_sha`,
+    // as `resumeLead` returns because a resume cuts nothing, or an undefined one.
+    const reportsBase = isRecord(spawn) && Object.hasOwn(spawn, 'base_sha') && spawn.base_sha !== undefined;
+    const baseSha = cut(spawn?.base_sha, MAX_ECHO);
     let recorded = false;
     try {
       recorded = (await deps.updateFleet((fleet) => {
         const task = (Array.isArray(fleet?.tasks) ? fleet.tasks : []).find((t) => t?.id === task_id);
         if (!task) return false;
         if (uuid) task.lead_session_uuid = uuid;
+        if (reportsBase) task.base_sha = baseSha;
         task.tmux_session = target;
         // The seat this launch went onto (its soma.json label, or null for the spawner's own
         // env): what the watchdog's limits phase closes on this lead's next limit hit. Same write
