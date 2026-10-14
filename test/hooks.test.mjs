@@ -156,6 +156,25 @@ test('the breaker denies every tool but the bus, and only for a real lead id', a
   }
 });
 
+test('the trip\'s deny tells the lead how to ask for more, and who can clear it', async () => {
+  const { evaluateGate } = await gate();
+  const reason = evaluateGate(bash('ls'), LEAD_ENV, () => true).permissionDecisionReason;
+  // What `soma doctor` and the process test below match on, and the allowance the wind-down needs.
+  assert.match(reason, /BUDGET_TRIPPED/);
+  assert.match(reason, /soma_report/);
+  // The ask is a report the lead can still file, sized: how much more, and why.
+  assert.match(reason, /NEEDS_INPUT saying how much and why/);
+  // Who can act on it, and what a clear gives. `soma clear-trip` and `soma_clear_trip` both grant one
+  // more allowance of the class, because removing the flag alone is undone by the next tick.
+  assert.match(reason, /the orchestrator or the operator can clear the trip/);
+  assert.match(reason, /one more allowance of this task's budget class/);
+  // The old ask named no report and no allowance: a lead could only hope someone noticed.
+  assert.doesNotMatch(reason, /Ask the orchestrator to clear the trip/);
+  assert.ok(!/[/\\]|leads/.test(reason), `the deny names a path: ${reason}`);
+  // A teammate is stopped by the same trip, with the same words.
+  assert.equal(evaluateGate(mateBash('ls'), LEAD_ENV, () => true).permissionDecisionReason, reason);
+});
+
 test('bash classification: reads pass, writes do not', async (t) => {
   const { evaluateGate } = await gate();
   // A cwd of this test's own, pinned EMPTY. `git clean -fdx`'s verdict is (correctly) a
@@ -1919,7 +1938,8 @@ test('the session discriminator is teammate-safe, and needs both ids to bite', a
   // consequence: a tripped budget outranks the discriminator and stops teammates too.
   // A lead's two or three teammates are most of what the budget was spent on, so a
   // breaker that stopped only the lead would leave the spend running and the flag
-  // would mean nothing. The orchestrator clears the trip; nobody else can.
+  // would mean nothing. The orchestrator or the operator clears the trip; no session
+  // in the worktree can.
   const trippedLead = { ...env, SOMA_LEAD_NAME: 'cr-1', SOMA_HOME: '/state' };
   assert.equal(evaluateGate({ tool_name: 'Edit', session_id: 'TEAMMATE' }, trippedLead, () => true).permissionDecision, 'deny');
   assert.equal(evaluateGate(bash('npm test'), trippedLead, () => true).permissionDecision, 'deny');

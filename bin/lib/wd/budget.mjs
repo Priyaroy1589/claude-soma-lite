@@ -12,16 +12,26 @@
  * the session's settings — and that is deliberate: teammates are where most of a lead's
  * spend goes, so a lead-only trip would be a breaker with no teeth. Presence is the
  * whole protocol; the contents are a debugging courtesy. Clearing a trip is an explicit
- * operator/orchestrator action (unlink), never a tick's decision.
+ * operator or orchestrator action, never a tick's decision: `clearTrip` below, the one
+ * function `soma clear-trip` and `soma_clear_trip` both call. An unlink alone is not a
+ * clear, because the lead is still over its cap and the next tick trips it again. So
+ * `clearTrip` removes the flag and raises the row's `budget_grants` in one fleet
+ * transaction, and the meter judges every cap at (1 + grants) times the class's.
  *
  * **Who writes and who consumes `warnPath`.** The BUDGET event at 80% lands on the
  * orchestrator's stream, which the lead never reads; `leads/<id>/BUDGET_WARNED` is how the
- * lead hears. The watchdog writes it once, at the 80% verdict, and BEFORE it logs that
- * BUDGET event, because the logged event is the once-per-lead dedupe: a write that failed
- * after the event landed would never be retried. The same gate hook consumes it: the first
- * time the LEAD itself makes a tool call the gate allows, the gate renames the flag to
- * `BUDGET_WARNED.delivered` and hands the lead a short wind-down note as context. Teammates
- * never see or consume it, and neither does a tripped lead, which the trip already told.
+ * lead hears. The watchdog writes it once per lead SESSION and ALLOWANCE, at the 80% verdict,
+ * and BEFORE it logs that BUDGET event, because the logged event is the dedupe, keyed by
+ * (lead, session, grants): a write that failed after the event landed would never be retried.
+ * Per session, not per lead, because the spend judged here is the worktree directory's and
+ * carries across a revival, while a lead revived `fresh` is a new session with none of the old
+ * context: it starts past 80% and has to be told again. A `resume` keeps its session, and the
+ * note it already had. Per allowance, because a clear grants a new allowance (the row's
+ * `budget_grants`) with an 80% of its own, so the clear re-arms the note. The same gate hook
+ * consumes it: the first time the LEAD itself makes a tool call the gate allows, the gate
+ * renames the flag to `BUDGET_WARNED.delivered` and hands the lead a short wind-down note as
+ * context. Teammates never see or consume it, and neither does a tripped lead, which the trip
+ * already told.
  * Presence is the protocol here too: the rename is the claim, so one flag is one note even
  * when two registrations of the gate race on the same call, and `.delivered` is a record
  * that nothing reads.
@@ -71,8 +81,17 @@
  * closes that gap is the refusal below: a class with no enforceable cap at all is an
  * error, so "all three keys went missing" can never read as "unlimited".
  */
+import { existsSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { leadDir } from '../paths.mjs';
+
+/**
+ * The statuses the meter judges: the rows the breaker owns. ONE set: the watchdog's meter imports
+ * it (where its long rationale lives), and `clearTrip` refuses every other row, because a trip
+ * there has no allowance to grant. `bus-tools` keeps a copy, being import-free, and a test holds
+ * the copy equal to this.
+ */
+export const METERED = new Set(['spawned', 'blocked']);
 
 /** Design §11: BUDGET warning at 80% of the token estimate, hard trip at 100%. */
 const WARN_FRAC = 0.8;
@@ -113,6 +132,96 @@ export function tripPath(id) {
 /** The BUDGET_WARNED flag file for lead `id`: `<SOMA_HOME>/leads/<id>/BUDGET_WARNED`. */
 export function warnPath(id) {
   return flagPath('warnPath', id, 'BUDGET_WARNED');
+}
+
+/**
+ * How many extra allowances a row has been granted: its own `budget_grants`, or 0.
+ *
+ * Absent or garbage reads as 0, the strict direction: the meter asks this on every tick, and a
+ * throw there is a WATCHDOG_ERROR and no verdict, which is a lead with no breaker at all.
+ * `clearTrip` is where garbage is refused by name.
+ */
+export function grantsOf(row) {
+  if (row === null || typeof row !== 'object' || !Object.hasOwn(row, 'budget_grants')) return 0;
+  return grantCount(row.budget_grants);
+}
+
+/**
+ * A grant count, read with `grantsOf`'s rule: a non-negative safe integer is itself, anything else
+ * is 0. The watchdog reads a BUDGET event's `grants` back with it, so a row and the event written
+ * off it can never disagree about which allowance is meant.
+ */
+export const grantCount = (g) => (Number.isSafeInteger(g) && g >= 0 ? g : 0);
+
+/**
+ * `cls` with every cap it carries itself scaled by `1 + grants`, as a new object.
+ *
+ * Only own caps, read with `capOf`'s tolerance for a numeric string, so a cap `checkBudget` honours
+ * is the cap that grows. A 0 cap stays 0 (not enforced). A class that cannot be priced (not an
+ * object, or a cap that is not a number) is handed through untouched, so `checkBudget` still
+ * refuses it by name rather than judging a NaN.
+ */
+export function grantedClass(cls, grants) {
+  if (!Number.isSafeInteger(grants) || grants < 0) {
+    throw new TypeError(`grantedClass: grants must be a non-negative safe integer, got ${show(grants)}`);
+  }
+  if (cls === null || typeof cls !== 'object' || Array.isArray(cls) || grants === 0) return cls;
+  const out = { ...cls };
+  for (const key of CAPS) {
+    if (!Object.hasOwn(cls, key)) continue;
+    const raw = cls[key];
+    const n = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+    if (typeof n === 'number' && Number.isFinite(n) && n >= 0) out[key] = n * (1 + grants);
+  }
+  return out;
+}
+
+/**
+ * Clear lead `id`'s trip by granting it one more allowance of its class. Returns `{lead, grants}`.
+ *
+ * `rm BUDGET_TRIPPED` alone does not clear a trip: the lead is still over its cap, and the next
+ * tick trips it again. So the flag goes in the same transaction that raises `budget_grants`, and
+ * every cap becomes (1 + grants) times the class's (`grantedClass`). The one guarded function the
+ * CLI's `soma clear-trip` and the bus's `soma_clear_trip` both call.
+ *
+ * Everything happens inside ONE `updateFleet` mutation, the unlinks included, so a tick's meter
+ * cannot interleave. Refused, publishing nothing: an illegal id (by `tripPath`, before the store
+ * or the disk), an unknown lead, a row the meter does not judge, a lead that is not tripped, and a
+ * `budget_grants` that is neither absent nor a non-negative safe integer, where a null reads as
+ * absent, as a null `attempts` does. The leftover 80% note is removed BEFORE the trip: it belongs
+ * to the old allowance, and if it will not go the lead stays tripped, rather than being freed with
+ * no grant beside it. A trip flag that will not go throws, and the throw publishes nothing. The
+ * unlinks come before the publish on purpose: if the publish itself fails, the flag is gone with
+ * no grant, and the next tick trips the lead again, loudly, which corrects itself, while
+ * unlinking after the publish risks a retried clear granting twice.
+ */
+export function clearTrip(id, { updateFleet, unlink = unlinkSync } = {}) {
+  const trip = tripPath(id);
+  const warn = warnPath(id);
+  if (typeof updateFleet !== 'function') {
+    throw new TypeError(`clearTrip: updateFleet must be the fleet store's transaction, got ${show(updateFleet)}`);
+  }
+  return updateFleet((live) => {
+    const row = (Array.isArray(live?.tasks) ? live.tasks : []).find((r) => r?.id === id);
+    if (!row) throw new Error(`clearTrip: no task ${JSON.stringify(id)} in the fleet`);
+    if (!METERED.has(row.status)) {
+      throw new Error(`clearTrip: ${id} is ${typeof row.status === 'string' ? row.status : 'in no recorded state'}, and only a spawned or blocked lead is metered, so there is no allowance to grant`);
+    }
+    if (!existsSync(trip)) throw new Error(`clearTrip: ${id} is not tripped (no BUDGET_TRIPPED), so there is nothing to clear`);
+    const was = row.budget_grants;
+    if (was != null && !(Number.isSafeInteger(was) && was >= 0)) {
+      throw new Error(`clearTrip: ${id}'s budget_grants is ${show(was)}, not a non-negative safe integer; fix the row before clearing`);
+    }
+    const grants = (was == null ? 0 : was) + 1;
+    try {
+      unlink(warn);
+    } catch (e) {
+      if (e?.code !== 'ENOENT') throw e;
+    }
+    unlink(trip);
+    row.budget_grants = grants;
+    return { lead: id, grants };
+  });
 }
 
 /**

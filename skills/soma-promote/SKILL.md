@@ -121,6 +121,7 @@ cat "${SOMA_HOME:-$HOME/.soma}/state/orch.lease"   # your session_id, for --as
 | `soma_enqueue` | `soma enqueue --file tasks.json` |
 | `soma_send` | `soma send <lead> "<message>" --as <session_id>` |
 | `soma_kill` / `soma_resume` | `soma kill <lead> "<reason>"` / `soma resume <lead>` |
+| `soma_clear_trip` | `soma clear-trip <lead> --as <session_id>` |
 | `soma_transcript` | `soma peek <lead>` |
 | `soma_digest` | `soma digest` |
 | `soma_release` | nothing — v1 has no CLI handback (below) |

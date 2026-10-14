@@ -184,14 +184,33 @@ task naming an unconfigured repo cannot spawn:
 
 `tokens_cap` meters **the lead and its whole team** (teammate turns go to their own transcripts).
 `turn_cap` is calibrated per lead and is a backstop, not a budget. Warn at 80 %, hard trip at 100 %.
-A warning logs `BUDGET` on the orchestrator's stream and writes `leads/<id>/BUDGET_WARNED`; the
-PreToolUse gate attaches a one-time `soma:` note to the lead's next allowed tool call and renames the
-flag to `BUDGET_WARNED.delivered`, and teammates never get it. A trip writes
+A warning logs `BUDGET` on the orchestrator's stream and writes `leads/<id>/BUDGET_WARNED`, once per
+lead session and allowance; the PreToolUse gate attaches a one-time `soma:` note to the lead's next
+allowed tool call and renames the flag to `BUDGET_WARNED.delivered`, and teammates never get it. Per
+session, not per lead: the spend is the worktree's and carries across a revival, so a lead revived
+onto a fresh session (a new session uuid, none of the old context) is warned again on the tick it
+relaunches, while a resumed lead keeps its session and its note. Per allowance, because a cleared
+trip is a new one (below). Every `BUDGET` names both: `session_uuid` and `grants`. A trip writes
 `leads/<id>/BUDGET_TRIPPED`, which the PreToolUse gate reads to deny every tool except the soma bus —
-so a tripped lead can still file `COMPLETED` or `ERROR`, and nothing else.
+so a tripped lead can still file `COMPLETED`, `ERROR` or a `NEEDS_INPUT` saying how much more it
+needs and why, and nothing else.
+
+**Clearing a trip: `soma clear-trip <lead>`**, or the orchestrator's `soma_clear_trip(lead)`. Both
+go through one function (`wd/budget.clearTrip`), which removes the flag and raises the row's
+`budget_grants` in one fleet transaction: each clear grants one more allowance of the lead's class,
+and the meter judges every cap at (1 + grants) times the class's from its next tick. Each clear is
+logged as `TRIP_CLEARED`, and the lead is told again at 80% of the new allowance. Both refuse a lead
+that is not tripped, and a row the breaker does not meter (anything but `spawned` and `blocked`).
+**`rm leads/<id>/BUDGET_TRIPPED` alone is not a clear**: the lead is still over its cap, so the next
+tick trips it again, with a second `BUDGET` at 100 % and a second toast. One limit, stated plainly:
+a wall-clock trip cleared long after it fired can still be past (1 + grants) × `wall_ms`, so the
+next tick trips it again, and another clear adds another allowance.
 A lead is priced at the class pinned at enqueue when soma.json defines it, else at the class its
 newest `HARNESS` report reserves, else at `standard`; README's budget section has the exact rule
-and when `HARNESS_DEFAULTED` fires.
+and when `HARNESS_DEFAULTED` fires. `soma_status` shows that class as `budget_class`, the clears as
+`budget_grants`, and as `budget_pct` the share of the allowance, (1 + `budget_grants`) × its
+`tokens_cap`, the lead and its team have spent (`budget_est_tokens`), for a spawned or blocked lead,
+the only rows the breaker meters.
 
 ### Config keys that are declared and read by nothing
 
@@ -703,6 +722,16 @@ The watchdog tick (default 30 s) does seven things:
 1. **Liveness, reconcile, revival.** Reads panes, not session names — `remain-on-exit` keeps a dead
    lead's session alive on purpose, because that pane *is* the death scene. A dead lead gets its
    final screen captured, a `LEAD_DEAD` event, then resume-or-fresh-respawn, up to 3 attempts.
+   The attempts are spaced out, so that you can read a death screen before the next attempt
+   replaces it: the first revival is immediate, the second comes no sooner than 15 minutes after
+   the first, and the third no sooner than an hour after the second, timed from the previous
+   relaunch (the row's `revived_at`, written in the same transaction as `attempts`). While a lead
+   waits, its row stays `spawned` and keeps its slot, nothing is logged, and `soma peek <lead>`
+   shows the death screen; `LEAD_DEAD` and `REVIVED` come at the relaunch, as before. `GAVE_UP`
+   after the third attempt is not delayed. A row last revived before `revived_at` existed is not
+   held, and the revival it gets stamps it. A `revived_at` in the future (the clock stepped back)
+   holds nothing: the lead is revived at once and stamped again from the corrected clock, so no
+   dead lead waits longer than its step (15 minutes or an hour) from the tick that finds it dead.
    A `spawned` row whose pane the census read as a bare shell is dead here too (its `LEAD_DEAD`
    carries `pane_state: dead_shell`); a shell on any other row is surfaced and left standing —
    killing a finished lead's pane is the unbuilt `linger_minutes` reaper's job.
@@ -719,11 +748,13 @@ The watchdog tick (default 30 s) does seven things:
    minute for everything else). That is not the longest launch possible, because every git call in a
    launch gets its own two minutes. Past it the row is treated as dead, as every starting row was
    before the mark: usually a spawner that died, revived like any dead lead. A launch that is only
-   slower than the bound is revived under its spawner: a `LEAD_DEAD` and a charged revival attempt
-   every tick until its session appears (`GAVE_UP` after three), and if its session appears between
-   a tick's read and the revival's kill, that new session is killed and replaced. Two sessions never
-   run at once: the spawner holds the repo lock across the launch and checks for the session again
-   under it. Recording the session clears the mark, and so does a failed spawn's rollback.
+   slower than the bound is revived under its spawner, with its attempts spaced out like any dead
+   lead's (above): the first revival is immediate, and each later one waits out its step. A
+   `LEAD_DEAD` and a charged attempt come with each revival, none on a tick spent waiting, and
+   `GAVE_UP` comes after the third. If its session appears between a tick's read and the revival's
+   kill, that new session is killed and replaced. Two sessions never run at once: the spawner holds
+   the repo lock across the launch and checks for the session again under it. Recording the session
+   clears the mark, and so does a failed spawn's rollback.
    Meanwhile `soma status` shows the lead as LIVE `starting`, PANE `-`, and `soma_status` as
    `liveness: starting`.
 2. **Budget breakers and model deviation**, over every `spawned` *and* `blocked` row.
@@ -790,6 +821,7 @@ Confirmed against the `switch` in `bin/soma.mjs`. Nothing below is aspirational.
 | `soma kill <lead> ["reason"]` | kill the session, mark the row `failed` |
 | `soma resume <lead> [--force]` | restart a dead lead from its recorded claude session, on the seat `pick()` chooses — written to the row's `seat`; with no pool configured, this process's own `CLAUDE_CONFIG_DIR` and `seat: null`. The seat is picked **before** the kill, and every seat closed or unverified is a refusal (exit 3), not a launch on this shell's own account. A `soma.json` that `loadConfig()` refuses (§4) is refused before the kill too, with the loader's reason (exit 2) |
 | `soma retry <lead>` | re-queue a `failed` or `skipped` row |
+| `soma clear-trip <lead>` | clear a budget trip by granting one more allowance of the lead's class (§4, *Budget classes*), and log `TRIP_CLEARED`; **refuses a lead that is not tripped or not metered, exit 3** |
 | `soma digest [--lines N]` | recent events, oldest first, **consuming nothing** |
 | `soma watch [--interval N] [--all]` | the poller for Claude Code's Monitor tool: every N s (default 5, 1–300), one stdout line per event that needs the orchestrator (`--all`: every event) plus health lines; banner on stderr; reads the `orch` cursor and **writes nothing**. Runs until SIGINT/SIGTERM, then exit 0; a bad argument is exit 1. §6.1 |
 | `soma enqueue --file <f>` | add tasks from a JSON array |
@@ -805,7 +837,8 @@ consulted)` and proceeds. There is no `inbox` subcommand.
 > that is not `failed`/`skipped`, kills the lingering session, sets the row `queued` and logs
 > `RETRIED`. What it does *not* do is force worktree recreation — the `-r2` path is the worktree
 > layer's own behaviour on a dirty reuse. Same for **reconcile-driven revival**, which the ROADMAP
-> lists as v1.x and which the shipped tick fully wires (`resumeLead`/`spawnLead`, 3 attempts).
+> once listed as v1.x and which the shipped tick fully wires (`resumeLead`/`spawnLead`, 3 attempts
+> spaced out as §6.3 says).
 >
 > And **`thaw` is built**: the shipped arm lifts an org spend-cap freeze (it clears
 > `state/backpressure.json`) and refuses a live storm — §9. `docs/ROADMAP.md` now records only the half
@@ -1058,16 +1091,14 @@ prompt discipline, not a tracked ledger), **RC URL capture on spawn** — and wi
 notification coalescing** (notifications are per-event and chatty at ten leads). The **Claude Code
 version gate** is no longer on this list: it is wired and enforced, see §4.
 
-### Four more gaps, declared here because this is where you would meet them
+### Two more gaps, declared here because this is where you would meet them
 
 Found by the final whole-branch review and **declared rather than fixed** on this branch. Each is
 recorded in `docs/ROADMAP.md` as v1.x.
 
 | gap | what you actually see | what to do |
 |---|---|---|
-| **A tripped budget cannot be cleared.** Nothing unlinks `leads/<id>/BUDGET_TRIPPED` — no CLI verb, no MCP tool — and the deny message tells the lead *"Ask the orchestrator to clear the trip"*, which the orchestrator has no way to do. | A tripped lead is alive, holding its slot, and able to call nothing but the bus. It will ask, and nothing can answer. | Delete the file by hand (`rm "$SOMA_HOME/leads/<id>/BUDGET_TRIPPED"`) or `soma kill` the lead. There is no third option. |
 | **`serialize_with` does not exist.** The orchestrator prompt used to instruct it; `soma_enqueue`'s schema sets `additionalProperties:false` and omits it, and admission is pure FIFO. The instruction is removed as of this branch. | Two tickets touching one module get two leads and two draft PRs that fight. | Enqueue same-module tickets one at a time — the second after the first reports `COMPLETED`. The orchestrator prompt now says so. |
-| **No revival cooldown.** The 1-hour backoff the design pairs with the 3-attempt limit is not implemented. | A lead that dies for a persistent reason (bad credential, wedged repo) burns **all three revival attempts in about 90 seconds** of consecutive ticks and lands on `GAVE_UP` before you can look at it. | Read the `LEAD_DEAD` payload's captured death screen rather than the `GAVE_UP`. `soma peek` still has the pane. |
 | **A Claude Code build that prompts under bypass** (the stalled-lead incident). Claude Code 2.1.259 raised a bypass-immune permission prompt on `cd <dir> && grep <relative file>` whenever a `Read()` deny existed — leads carry 13 — and `tested_claude` admits patch releases by design. 2.1.263 fixed it; the fleet cannot tell which build a lead runs from inside a hook. | A lead or teammate sits on `Do you want to proceed?` with nobody at the pane: measured 79 stalls summing 214 hours, the worst 40 hours, all on 2.1.259. `soma doctor`'s `claude cd-compound read runs` check is **FAIL** on such a build. | Cycle the leads onto a fixed build (`soma kill` + `soma_resume` relaunches `claude` from PATH). If the fleet must keep running on the asking build, arm the gate's emergency lever **per lead**: `touch "$SOMA_HOME/leads/<id>/CD_COMPOUND_ASKS"` — the PreToolUse gate then denies the asking shape with a reason that says what to type instead (one retry turn per matching call, ~14% of Bash calls on a 2.1.259-class build) — and `rm` the flag once the lead is on a fixed build. Unarmed it costs nothing and does nothing; never leave it armed on a build that does not ask. |
 
 The `PostCompact` installer that headed this table has shipped, though not on `PostCompact`: every
@@ -1081,6 +1112,9 @@ stdin carries `source: "compact"` and the unchanged `session_id`, and its `addit
 the model as a system reminder, the only channel that delivered in both modes. It speaks only to the
 lead's own session id, because every teammate inherits the lead's `--settings`. A lead spawned or resumed before this change keeps its old settings
 until its next spawn or resume: `soma_send` such a lead a pointer to `soma_task()`.
+
+The **revival cooldown** is no longer on this list: it ships, and §6.3 gives the schedule. Nor is
+**clearing a tripped budget**: `soma clear-trip` ships (§4, *Budget classes*).
 
 ---
 
