@@ -10,10 +10,10 @@ import { fileURLToPath } from 'node:url';
 import { SOCKET_PATH_MAX, startSkip, tmuxSandbox } from './tmux-sandbox.mjs';
 
 /**
- * `test/tmux-sandbox.mjs`, the short private TMUX_TMPDIR every real-tmux test file starts its
- * servers in, and issue #46's regression: those files, run under a long TMPDIR and a long
- * TMUX_TMPDIR. A Unix socket path is capped (104 bytes on macOS, 108 on Linux), so there one real-
- * tmux test failed on "File name too long", and six skipped as if the host had run out of ptys.
+ * `test/tmux-sandbox.mjs`, the short private TMUX_TMPDIR for real-tmux tests, and issue #46's
+ * regression: the three files that use it, run under a long TMPDIR and a long TMUX_TMPDIR. A Unix
+ * socket path is capped (104 bytes on macOS, 108 on Linux), so there one real-tmux test failed on
+ * "File name too long", and six skipped as if the host had run out of ptys.
  */
 
 const tmuxInstalled = spawnSync('tmux', ['-V']).status === 0;
@@ -107,7 +107,11 @@ test('startSkip names a socket path too long to bind, with its length, and keeps
   assert.equal(startSkip(undefined, sock), 'tmux could not start a session here');
 });
 
-/** The three files that start real tmux servers, by absolute path, and the repository they run from. */
+/**
+ * The three files that use tmux-sandbox.mjs, by absolute path, and the repository they run from.
+ * `cli.test.mjs` starts real tmux servers too (since #71), but each in a sandbox of its own under
+ * /tmp, short on every platform, so a long TMPDIR or TMUX_TMPDIR cannot reach them.
+ */
 const REAL_TMUX_FILES = ['soma-bus.smoke.test.mjs', 'tmux.test.mjs', 'wake-sockets.test.mjs']
   .map((f) => fileURLToPath(new URL(f, import.meta.url)));
 const REPO = fileURLToPath(new URL('..', import.meta.url));
