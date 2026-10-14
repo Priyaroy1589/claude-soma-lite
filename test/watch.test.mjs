@@ -380,8 +380,9 @@ test('the cap: 25 unread ring events are 20 wake lines and one "…and 5 more" l
   seed('cr-1', 'cr-2');
   const { watcher } = await mod();
   const sent = [];
-  // Every ring type but BACKPRESSURE, which rings once per freeze (its own tests, below): two of
-  // them in this fleet would be one freeze, and one wake line.
+  // Every ring type but BACKPRESSURE, so this test is about the cap alone: whether a BACKPRESSURE
+  // rings depends on the ones before it (its own tests, below). Reasoned ones of one freeze fold
+  // into one line; a reasonless one, which is what emit() writes here, always rings.
   const EACH = RING.filter((type) => type !== 'BACKPRESSURE');
   for (let i = 0; i < 25; i++) {
     const lead = i % 2 ? 'cr-2' : 'cr-1';
