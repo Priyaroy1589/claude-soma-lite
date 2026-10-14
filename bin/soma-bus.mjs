@@ -8,7 +8,7 @@
  * grows a candidate into the orchestrator when it takes the lease. Four jobs, in
  * the order they matter:
  *
- *   1. `realDeps()` — the seam. `bus-tools` reaches for 35 named deps and touches
+ *   1. `realDeps()` — the seam. `bus-tools` reaches for 44 named deps and touches
  *      no module itself (it has zero imports, deliberately), so every one of them
  *      is named here or the handler that needs it degrades. Some degradations are
  *      honest refusals; two are silent, and both are guarded below.

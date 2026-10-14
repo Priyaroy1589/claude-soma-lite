@@ -2722,7 +2722,7 @@ export function orchTools(ctx) {
  * This is the surface every interactive Claude Code session on the machine carries,
  * because `soma init` registers the bus at user scope in candidate role — which is
  * what makes promotion need no restart and no mid-session MCP mounting. The other
- * ten tools are absent rather than refusing, so an unpromoted session's tool list
+ * eleven tools are absent rather than refusing, so an unpromoted session's tool list
  * does not advertise a control plane it may not touch.
  *
  * Built by *selecting* from `orchTools`, never by re-implementing: the two handlers
