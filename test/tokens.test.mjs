@@ -1367,14 +1367,35 @@ test('projectFleetSpend reports the worst case across budget classes', async () 
   assert.match(p.message, /iterate/);
 });
 
-test('projectFleetSpend degrades on junk config rather than throwing at startup', async () => {
+test('projectFleetSpend refuses a max_leads admission would refuse, rather than projecting 0 (#21)', async () => {
+  // This used to read every one of these as 0 and print "0 leads × … = 0" — the warning that
+  // lies. `soma up` now refuses on the throw; `fleet.admit` refuses the same values.
   const { projectFleetSpend } = await load('proj2');
-  for (const junk of [null, undefined, 42, 'nope', {}, { budgets: null }, { max_leads: 'x', budgets: {} }]) {
-    assert.doesNotThrow(() => projectFleetSpend(junk), JSON.stringify(junk));
-    const p = projectFleetSpend(junk);
-    assert.equal(p.worst.fleet_total, 0);
-    assert.equal(typeof p.message, 'string');
+  for (const junk of [null, undefined, 42, 'nope', {}, { budgets: null }]) {
+    assert.throws(() => projectFleetSpend(junk), { name: 'TypeError', message: /max_leads/ }, String(junk));
   }
+  for (const bad of ['ten', '', '  ', 2.5, '2.5', -1, null, [], {}, true, Infinity, NaN]) {
+    assert.throws(() => projectFleetSpend({ max_leads: bad, budgets: {} }),
+      { name: 'TypeError', message: /max_leads must be a non-negative integer/ }, `max_leads ${String(bad)} was accepted`);
+  }
+  assert.throws(() => projectFleetSpend({ max_leads: 'ten', budgets: {} }), { message: /got "ten"$/ });
+  // The value is shown without JSON.stringify, which throws on a BigInt while explaining itself.
+  assert.throws(() => projectFleetSpend({ max_leads: 5n, budgets: {} }), { message: /got 5$/ });
+  // A budgets that is not an object of classes projects no classes; the lead count is still real.
+  const p = projectFleetSpend({ max_leads: 3, budgets: null });
+  assert.equal(p.max_leads, 3);
+  assert.deepEqual(p.classes, []);
+  assert.equal(p.worst.fleet_total, 0);
+});
+
+test('projectFleetSpend reads a numeric-string max_leads as admission does (#21)', async () => {
+  const { projectFleetSpend } = await load('proj3');
+  const p = projectFleetSpend({ max_leads: '10', budgets: { heavy: { tokens_cap: 5000 }, standard: { tokens_cap: 1000 } } });
+  assert.equal(p.max_leads, 10);
+  assert.equal(p.worst.name, 'heavy');
+  assert.equal(p.worst.fleet_total, 50000);
+  assert.match(p.message, /10 leads × 5,000 est_tokens \(heavy, the largest budget class\) = 50,000/);
+  assert.equal(projectFleetSpend({ max_leads: ' 4 ', budgets: {} }).max_leads, 4);
 });
 
 // ---------------------------------------------------------------------------
