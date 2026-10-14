@@ -570,6 +570,33 @@ test('BACKPRESSURE once per freeze: one with no reason always rings, and leaves 
   assert.deepEqual(said, [[BP], [BP], [BP], [BP], [BP], []]);
 });
 
+test('BACKPRESSURE once per freeze: one with no numeric since is judged by the ten-minute window alone', async (t) => {
+  const home = stateRoot(t);
+  seed('cr-1', 'cr-2');
+  const { watcher } = await mod();
+  // The watchdog's builder always writes a finite since; one written by hand or by another writer
+  // may not. A since that is missing, null or not a number names no freeze, so two of them are never
+  // "the same since", and only the window can join them: nine minutes apart is one freeze, eleven
+  // is two.
+  let at = T0;
+  for (const [what, since] of [['no since', undefined], ['a null since', null], ['a since that is not a number', 'soon']]) {
+    const payload = since === undefined ? { reason: STORM_REASON } : { reason: STORM_REASON, since };
+    for (const [gap, want] of [[9 * MIN, [[BP], []]], [11 * MIN, [[BP], [BP]]]]) {
+      const w = watcher({});
+      const said = [];
+      let last = null;
+      for (const ts of [at, at + gap]) {
+        last = put(home, 'orch', ts, 'BACKPRESSURE', payload);
+        said.push(w.events());
+      }
+      assert.deepEqual(said, want, `${what}, ${gap / MIN} minutes apart`);
+      // soma_inbox drains the pair, so the next watcher starts on the next pair alone.
+      writeCursor('orch', last);
+      at += 60 * MIN;
+    }
+  }
+});
+
 test('BACKPRESSURE once per freeze: --all is the raw stream and prints every re-emit', async (t) => {
   const home = stateRoot(t);
   seed('cr-1', 'cr-2');
