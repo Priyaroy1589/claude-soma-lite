@@ -745,7 +745,7 @@ test('a demoted session cannot unmount the orchestrator that replaced it', async
  * `current.session_id !== sid` and used it only to decide whether to stamp a heartbeat,
  * then `def` went on to `await handler(...)`. And `soma-bus.main` upgrades the tool Map in
  * place on a successful adopt with no downgrade path, so a demoted session keeps all
- * twelve tools for the life of its process — which is why the gate has to live in the
+ * thirteen tools for the life of its process — which is why the gate has to live in the
  * handler and cannot live in the Map.
  *
  * This is not a small residual. The single-holder lease is what the entire promotion
