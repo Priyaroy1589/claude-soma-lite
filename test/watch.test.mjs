@@ -1118,7 +1118,9 @@ test('soma watch reads the watchdog the way status does: unreadable is down only
   ]) {
     const h = watchDeps({ liveSessions, serverAbsent });
     assert.equal(await dispatch(['watch'], h.deps), 0, `${what}: ${h.err.join(' | ')}`);
-    assert.deepEqual(kinds(h.out), want, what);
+    // The watchdog's lines only: with no server, the lease's pane is gone too, and its line has a test
+    // of its own (below).
+    assert.deepEqual(kinds(h.out).filter((k) => k === 'down' || k === 'back'), want, what);
   }
 });
 
@@ -1141,6 +1143,32 @@ test('soma watch asks paneStates for the lease\'s pane: no listing is a present 
     const h = watchDeps({ paneStates });
     assert.equal(await dispatch(['watch'], h.deps), 0, `${what}: ${h.err.join(' | ')}`);
     assert.deepEqual(kinds(h.out), want, what);
+  }
+});
+
+test('soma watch reads the lease\'s pane the way status does: no listing is a gone pane only when tmux says no server answers', async (t) => {
+  stateRoot(t);
+  seed('cr-1');
+  // Another session's lease with a fresh heartbeat, so the pane alone decides whether it is stale.
+  acquireLease({ session_id: OTHER, tmux_socket: SOCK, tmux_pane: '%9', wake: 'tmux' }, { force: true });
+  const rec = (...ids) => ({
+    dead: false, cmd: '2.1.263', pid: 1, title: 't', pane_id: ids[0], active: true,
+    panes: ids.map((pane_id, i) => ({ pane_id, dead: false, cmd: '2.1.263', pid: 1, title: 't', active: i === 0 })),
+  });
+  const listed = () => new Set(['soma-watchdog']);
+  for (const [what, liveSessions, serverAbsent, paneStates, want] of [
+    // No server: nothing runs there, the lease's pane included. (The watchdog reads as down too.)
+    ['no listing, no server', () => null, () => true, () => null, ['stale']],
+    // Unreadable is not dead: a server that did not answer is no evidence the pane is gone.
+    ['no listing, a server that did not answer', () => null, () => false, () => null, []],
+    ['no listing, and only true counts as no server', () => null, () => 'true', () => null, []],
+    ['a listing without the pane', listed, () => false, () => new Map([['orch', rec('%3')]]), ['stale']],
+    ['a listing with the pane', listed, () => false, () => new Map([['orch', rec('%9')]]), []],
+    ['a listing with the pane, whatever serverAbsent says', listed, () => true, () => new Map([['orch', rec('%9')]]), []],
+  ]) {
+    const h = watchDeps({ liveSessions, serverAbsent, paneStates });
+    assert.equal(await dispatch(['watch'], h.deps), 0, `${what}: ${h.err.join(' | ')}`);
+    assert.deepEqual(kinds(h.out).filter((k) => k !== 'down'), want, what);
   }
 });
 
