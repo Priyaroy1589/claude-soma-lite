@@ -54,6 +54,23 @@ It returns unread events and advances your cursor, so treat them as work, not ne
 operator instead. Then `ERROR` / `GAVE_UP`, then `COMPLETED` (writeback), then `HARNESS` (veto
 within one turn if the budget class is wrong). Everything else is context.
 
+**Then arm the watcher, so the next event wakes you** with no keystroke and no pane. Your Bash
+environment carries none of the fleet's pins, so read them off the bus registration:
+
+1. Run `claude mcp get soma`. Its `Command` is `<node>`, its `Args` is `<soma>/bin/soma-bus.mjs`,
+   and its two `Environment` lines are `SOMA_HOME=<root>` and `SOMA_TMUX_SOCKET=<socket>`.
+2. Fill all four into this call (`soma.mjs` sits beside `soma-bus.mjs`):
+
+```
+Monitor({ command: "SOMA_HOME=<root> SOMA_TMUX_SOCKET=<socket> <node> <soma>/bin/soma.mjs watch", description: "soma fleet events", timeout_ms: 1800000 })
+```
+
+Not `soma watch`: a `soma` wrapper function sets its own `SOMA_HOME`, which wins over a prefix, and
+your Bash and Monitor shells load the operator's shell functions, so that watcher would silently
+follow another root. A Monitor expires after 30 minutes at most: **re-arm it on every expiry.** Each
+`[soma] …` line names who and what, never the payload, so a wake still means `soma_inbox`. The
+watcher consumes nothing.
+
 ## 4. Run the orchestrator loop — `prompts/orchestrator.md`
 
 That prompt is the contract; this skill is only the on-ramp. Read it before dispatching:

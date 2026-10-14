@@ -295,12 +295,12 @@ one of three things:
 `--inject-hook` with `--seat` is refused (exit 1) before anything is touched: a seat runs leads,
 and the hook never injects into a lead.
 
-**Without the hook, an orchestrator that is not polling is blind to a blocked lead.** A lead that
-asked a question sits there holding its slot for `blocked_slot_minutes` (120 by default) and then
-goes `blocked`. If you walk away, nothing is going to tap you on the shoulder except the desktop
-toast the watchdog and the bus fire on the events they do emit. Register the hook, or plan to come
-back and run `soma status` / `soma digest`, or keep a promoted session and open every turn with
-`soma_inbox`.
+**Without the hook or the `soma watch` Monitor (§6.1), an orchestrator that is not polling is blind
+to a blocked lead.** A lead that asked a question sits there holding its slot for
+`blocked_slot_minutes` (120 by default) and then goes `blocked`. If you walk away, nothing is going
+to tap you on the shoulder except the desktop toast the watchdog and the bus fire on the events they
+do emit. Arm the watcher, register the hook, or plan to come back and run `soma status` /
+`soma digest`, or keep a promoted session and open every turn with `soma_inbox`.
 
 ### 5.2 `soma doctor`
 
@@ -560,6 +560,34 @@ already running and keep running whoever holds it.
   your everyday one), so pushes arrive as desktop toasts and on your next turn rather than as a
   live keystroke wake. Only a pane on soma's own server gets keystroke wakes.
 
+**Arm the watcher.** Right after promotion the skill has the session arm `soma watch` under Claude
+Code's Monitor tool, which turns every stdout line of a command into a wake. The orchestrator then
+hears about a `NEEDS_INPUT`, a `COMPLETED`, a stopped watchdog or a lost lease with no keystroke and
+no pane: the wake comes from the Monitor, not from tmux, so this works in the `degraded_wake` case
+too:
+
+```
+Monitor({ command: "SOMA_HOME=<root> SOMA_TMUX_SOCKET=<socket> <node> <soma>/bin/soma.mjs watch", description: "soma fleet events", timeout_ms: 1800000 })
+```
+
+- **Take every value from the bus registration.** `claude mcp get soma` shows the entry
+  `soma init` wrote: `<node>` is its `Command`, `<soma>/bin/soma-bus.mjs` its `Args` (`soma.mjs`
+  sits beside it), and `<root>` and `<socket>` its two `Environment` lines. A session's Bash
+  environment carries none of them, and an unpinned watcher reads `~/.soma`, where an empty fleet
+  raises nothing. Not `SOMA_HOME=<root> soma watch`: a wrapper function such as the README's sets
+  its own `SOMA_HOME`, which wins over the prefix, and Claude Code's Bash and Monitor shells load
+  your shell functions, so that watcher would silently follow another root.
+- **Re-arm it on every expiry.** A Monitor lives 30 minutes at most, and when it expires the wakes
+  stop with nothing else to say so.
+- **What it says.** One line per event that asks the orchestrator for a move (the wake table in
+  `prompts/orchestrator.md`; `--all` for every event), in the bus's own words:
+  `[soma] cr-1 NEEDS_INPUT. Call soma_inbox.` Who and what, never a payload. At most 20 such lines
+  per poll, then one `…and N more` line. `[soma] health: …` lines report the watchdog going down or
+  coming back and the lease being lost, stale or held by nobody, once each time the state changes.
+- **What it never does.** It reads the `orch` cursor only to skip what `soma_inbox` already
+  consumed, and writes nothing: no cursor, no event, no keystroke, no toast. `soma_inbox` still
+  returns every event the watcher announced, and any number of watchers may run.
+
 **Keep the lease warm.** It reads **stale after 10 minutes** without a heartbeat, and a stale lease
 is adoptable by the next session *without* `force` — so a live-but-idle orchestrator loses the fleet
 silently. Every orchestrator tool call stamps the heartbeat; open each turn with `soma_inbox` or
@@ -697,6 +725,7 @@ Confirmed against the `switch` in `bin/soma.mjs`. Nothing below is aspirational.
 | `soma resume <lead> [--force]` | restart a dead lead from its recorded claude session, on the seat `pick()` chooses — written to the row's `seat`; with no pool configured, this process's own `CLAUDE_CONFIG_DIR` and `seat: null`. The seat is picked **before** the kill, and every seat closed or unverified is a refusal (exit 3), not a launch on this shell's own account. A `soma.json` that `loadConfig()` refuses (§4) is refused before the kill too, with the loader's reason (exit 2) |
 | `soma retry <lead>` | re-queue a `failed` or `skipped` row |
 | `soma digest [--lines N]` | recent events, oldest first, **consuming nothing** |
+| `soma watch [--interval N] [--all]` | the poller for Claude Code's Monitor tool: every N s (default 5, 1–300), one stdout line per event that needs the orchestrator (`--all`: every event) plus health lines; banner on stderr; reads the `orch` cursor and **writes nothing**. Runs until SIGINT/SIGTERM, then exit 0; a bad argument is exit 1. §6.1 |
 | `soma enqueue --file <f>` | add tasks from a JSON array |
 | `soma thaw` | clear an org spend-cap freeze (`state/backpressure.json`) and print the record cleared; **refuses a live storm and an unreadable record, exit 3** — see §9 |
 | `soma hold` / `release` / `gc` | **refuse with a reason, exit 3** — see §9 |
@@ -889,6 +918,7 @@ revival takes over.
 ```bash
 soma status                      # the one-shot table
 soma digest --lines 80           # recent events, cursor untouched
+soma watch                       # one line per event that needs the orchestrator, until Ctrl-C (§6.1)
 soma peek task-42 --lines 120    # what that lead's pane says right now
 soma send task-42 "use the staging bucket, not prod" --as $SID
 soma attach task-42              # last resort: your terminal, its pane
@@ -897,8 +927,14 @@ soma resume task-42              # after a kill, or after a reboot
 soma retry task-42               # put a failed/skipped row back on the queue
 ```
 
-Three things worth knowing before you use them:
+Four things worth knowing before you use them:
 
+- **`soma watch` is written for a Monitor, not for you.** Its stdout carries wake lines and nothing
+  else, and its banner goes to stderr. It reads the `orch` cursor and writes nothing, so it consumes
+  no event and any number of watchers may run; from a terminal it is a live tail of what would wake
+  the orchestrator. Its `[soma] health: …` lines read the watchdog the way `status` does: a
+  listing without the `soma-watchdog` session, or tmux's own "no server", is down, and a tmux that
+  cannot be read says nothing at all.
 - **`status` reports `?`, not `dead`, when tmux cannot be read.** A 5 s timeout on a wedged server
   is byte-identical to a healthy server with nothing on it. No tmux server answering on soma's
   socket at all is a different answer, because tmux says so, and it reads as an empty server:
@@ -1521,7 +1557,7 @@ lease at that server's pane id at once.
 | leads spawn but nothing is committed | `soma peek <lead>` first. If a teammate says it has no write tools, that is §11.9 and your tree is not the shipped one |
 | a teammate says `No such tool available: Write` | §11.9 — a `permissions.deny` in a settings file that propagates down `--settings`, **not** a model limitation. Fixed in the shipped tree: check `git diff bin/lib/settings-gen.mjs`, and run `soma doctor` for `no edit ban in settings files` |
 | a teammate's `git push` is refused | check the branch is `soma/<id>` — pushes to `main`/`develop` are denied by design, and so are force/delete on any branch |
-| orchestrator never hears about a blocked lead | the inject hook is not registered: `soma init --inject-hook`. Meanwhile poll with `soma digest` / `soma_inbox`. §5.1 |
+| orchestrator never hears about a blocked lead | nothing wakes it. Arm `soma watch` under the Monitor tool, pinned the way §6.1 says, and re-arm it on every expiry; register the inject hook with `soma init --inject-hook` (§5.1). Meanwhile poll with `soma digest` / `soma_inbox` |
 | `soma_spawn`/`soma_enqueue`/`soma_send` missing after promotion | mid-session role upgrade not honoured yet. Look again next turn; meanwhile drive the CLI with `--as`. Do **not** restart or re-register — the lease is already yours on disk. `SKILL.md` §6 |
 | the lease was taken from under you | it reads stale after 10 min without a heartbeat. Open every turn with `soma_inbox` or `soma_status`. §6.1 |
 

@@ -8,7 +8,7 @@ duplicate it, do not race it.
 
 On promotion: `soma_adopt` (with `{force: true}` only when the operator says to take a live fleet),
 then `soma_status` for the shape of the fleet, then `soma_inbox` to drain what arrived while nobody
-held the lease.
+held the lease, then arm the `soma watch` Monitor (*Every wake*, below).
 
 If the control tools did not surface, drive the same fleet through the `soma` CLI over Bash — it has
 parity on every verb that dispatches work, and the two that have no subcommand at all in v1 are
@@ -47,6 +47,21 @@ operator, or enqueue it explicitly as a research spike (H6) whose deliverable is
 specification.
 
 ## Every wake — triage, then stop
+
+A wake is a keystroke the bus typed into your pane, or a `[soma] …` line from the `soma watch`
+Monitor. Arm that Monitor on promotion with every value from `claude mcp get soma` (your Bash
+environment carries none of them): `<node>` is its `Command`, `<soma>/bin/soma-bus.mjs` its `Args`,
+`<root>` and `<socket>` its `Environment`.
+
+```
+Monitor({ command: "SOMA_HOME=<root> SOMA_TMUX_SOCKET=<socket> <node> <soma>/bin/soma.mjs watch", description: "soma fleet events", timeout_ms: 1800000 })
+```
+
+Not `soma watch`: a `soma` wrapper function pins its own state root, which wins over the prefix,
+and your shells load the operator's functions, so that watcher would silently follow another root.
+Keep it armed: a Monitor expires after 30 minutes at most, so re-arm it on every expiry. A
+`[soma] health: …` line reports the fleet itself and says what to do: a watchdog that is down is the
+operator's to restart with `soma up`, and a lost lease means you stop acting on the fleet.
 
 A wake means `soma_inbox`. Read it, mark it read, and act by type:
 

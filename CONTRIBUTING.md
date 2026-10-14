@@ -71,7 +71,7 @@ bin/
   lib/                  the modules: paths, config, fleet, events, lease, queue, filelock,
                         tmux, spawn, worktree, pretrust, settings-gen, tokens, notify,
                         doctor, canary, harness, standing, jsonrpc, bus-tools, seats,
-                        seats-summary, inject-hook
+                        seats-summary, inject-hook, watch
   lib/wd/               the watchdog's pure decision functions: reconcile, revive, budget,
                         backpressure, admission, settle, pane-state, limit-state,
                         rotation-events

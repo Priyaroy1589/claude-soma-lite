@@ -601,6 +601,7 @@ soma retry my-task-1            # put a failed or skipped row back on the queue
 | `soma resume <lead> [--force]` | Restart a dead lead from its recorded Claude Code session, on the seat soma picks. Refuses while the session may still be live, unless `--force`, and refuses a `soma.json` soma cannot load before it kills anything (exit 2). |
 | `soma retry <lead>` | Put a `failed` or `skipped` row back on the queue. A `done` row is refused: enqueue a new id instead. |
 | `soma digest [--lines N]` | The fleet's recent events across every stream, oldest first (default 40, at most 2000). Moves no cursor. |
+| `soma watch [--interval N] [--all]` | Poll every N seconds (default 5, 1 to 300) and print one stdout line per event that needs the orchestrator, plus a line when the watchdog goes down or comes back and when the lease is lost, stale or held by nobody. Written for Claude Code's Monitor tool, which turns each stdout line into a wake; the banner goes to stderr. `--all` prints every event. Reads the `orch` cursor and writes nothing, so `soma_inbox` still returns every event. Runs until Ctrl-C or SIGTERM, then exits 0. |
 | `soma thaw` | Lift an organisation spend-cap freeze by clearing `state/backpressure.json`. Refuses a live rate-limit storm and an unreadable record. |
 | `soma hold <lead>` | **Not implemented.** Refuses with a reason (exit 3). Use `soma_queue pause` for the fleet, or `soma kill` for one lead. |
 | `soma release <lead>` | **Not implemented**, the other half of `hold`. **It is not the `soma_release` MCP tool**, which hands back the orchestrator lease. |
@@ -657,6 +658,23 @@ The bus is already mounted in the read-only candidate role, so there is no resta
 reconnect. You are taking a **lease**, not starting a service: the watchdog and the leads keep
 running whoever holds it. The lease goes stale after 10 minutes without a heartbeat, and every
 orchestrator tool call is a heartbeat, so open each turn with `soma_inbox` or `soma_status`.
+
+**Then arm the watcher.** `soma watch` prints one line for each event that needs the orchestrator,
+and Claude Code's Monitor tool turns each line into a wake: no pane and no keystroke, so it works
+outside tmux too. The promote skill has the session arm it like this:
+
+```
+Monitor({ command: "SOMA_HOME=<root> SOMA_TMUX_SOCKET=<socket> <node> <soma>/bin/soma.mjs watch", description: "soma fleet events", timeout_ms: 1800000 })
+```
+
+All four values come from `claude mcp get soma`, the bus registration `soma init` wrote: `<node>`
+is its `Command`, `<soma>/bin/soma-bus.mjs` its `Args` (`soma.mjs` sits beside it), and `<root>`
+and `<socket>` its two `Environment` lines. The session's Bash environment carries none of them.
+Not `SOMA_HOME=<root> soma watch`: a wrapper function such as the one in [Quick start](#quick-start)
+sets its own `SOMA_HOME`, which wins over the prefix, and Claude Code's Bash and Monitor shells load
+your shell functions, so that watcher would silently follow another root. A Monitor expires after
+30 minutes at most, so the orchestrator re-arms it on every expiry. Each line names who and what,
+never the payload: a wake still means `soma_inbox`, and the watcher consumes nothing.
 
 > [!WARNING]
 > **Other places to run the orchestrator.** Outside tmux also works, but a lead's wake-up then
@@ -825,6 +843,7 @@ details.
 | `LEAD_DEAD_SHELL`, `PANE shell`, or `zsh: command not found: …` in a pane | the pane is a bare shell, not claude; tmux-resurrect restored it after a reboot (if `~/.tmux.conf` loads continuum, every tmux server sources it, `-L soma` included) | a `spawned` row is revived by the watchdog. For `done` or `blocked` rows, `soma kill <lead>`, then `soma retry` or re-enqueue if the work is unfinished |
 | `soma status` shows `PANE draft` | text is sitting unsent in the lead's composer, often after a long `soma send` | `soma attach <lead>` and press Enter, or send shorter messages |
 | a lead finished but the next task never starts | no orchestrator drained `soma_inbox`, so the row is still `spawned` and holds its slot | promote a session and call `soma_inbox` |
+| the orchestrator never hears about a blocked lead | nothing wakes it: its pane is not on soma's tmux server, no `soma watch` Monitor is armed, and the inject hook is not registered | arm `soma watch` under the Monitor tool and re-arm it on every expiry ([above](#driving-the-fleet-from-a-claude-code-session)); `soma init --inject-hook`; meanwhile open every turn with `soma_inbox` |
 | `soma status` header shows `seat-2 closed until …`, or a `SEAT_CLOSED` event | that seat's usage window closed (`closed_reason` says which) | usually nothing: leads on it rotate (`ROTATED`) or auto-continue at the reset. `unverified` means `CLAUDE_CONFIG_DIR=<dir> claude auth login` |
 | admission stopped after a Claude Code upgrade; `VERSION_GATE` event | the new version is outside `tested_claude` | re-prove the invariants on the new build, widen `tested_claude.max` in `soma.json`, then `soma down` and `soma up` |
 | `backpressure: FROZEN … org_level_disabled_until` | the organisation's spend cap was reached | once the cap is lifted, move or kill leads whose transcript still ends on the cap, then `soma thaw` |

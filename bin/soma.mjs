@@ -72,6 +72,7 @@ import { pick as pickSeat, resolveConfigDir } from './lib/seats.mjs';
 import { resumeLead } from './lib/spawn.mjs';
 import * as tmux from './lib/tmux.mjs';
 import { projectFleetSpend, readUsage } from './lib/tokens.mjs';
+import { INTERVAL_DEFAULT_S, INTERVAL_MAX_S, INTERVAL_MIN_S, runWatch } from './lib/watch.mjs';
 import { STORM_REASON, clearBackpressure, readBackpressure } from './lib/wd/backpressure.mjs';
 import { CENSUS_LINES, readPane, takeCensus } from './lib/wd/pane-state.mjs';
 
@@ -272,6 +273,7 @@ export const USAGE = `usage: soma <command> [args]
   retry <lead>                put a finished row back on the queue
   enqueue --file <tasks.json> add tasks from a JSON array
   digest [--lines N]          the fleet's recent events, oldest first, consuming nothing
+  watch [--interval N] [--all]   one stdout line per fleet event that needs the orchestrator (for Claude Code's Monitor tool); reads the orch cursor, consumes nothing
   thaw                        lift an org spend-cap freeze: clear state/backpressure.json (refuses a live rate-limit storm)
 
 Mutating commands take --as <session_id>: soma then re-checks the orchestrator lease and
@@ -1958,6 +1960,79 @@ export async function dispatch(argv, deps = {}) {
         + ' oldest first, cursor untouched (the v1.x digest composer is not built, so this is the raw log)');
       for (const e of tail) {
         d.print(`${iso(e.ts)}  ${String(e.type ?? '?').padEnd(18)} ${e.lead ?? '-'}  ${summarise(e.payload)}`);
+      }
+      return OK;
+    }
+
+    case 'watch': {
+      // The keystroke-free poller (`lib/watch.mjs`): one stdout line per event that needs the
+      // orchestrator, for Claude Code's Monitor tool. Like `digest`, it consumes nothing — no
+      // sendKeys, no notify, no appendEvent, no writeCursor — so any number may run.
+      let all = false;
+      let interval = INTERVAL_DEFAULT_S;
+      for (let i = 0; i < rest.length; i++) {
+        if (rest[i] === '--all') {
+          all = true;
+        } else if (rest[i] === '--interval') {
+          const v = rest[++i];
+          if (!/^\d+$/.test(v ?? '') || Number(v) < INTERVAL_MIN_S || Number(v) > INTERVAL_MAX_S) {
+            d.warn(`soma watch: --interval takes a whole number of seconds from ${INTERVAL_MIN_S} to ${INTERVAL_MAX_S}`
+              + ` (got ${v === undefined ? 'nothing' : JSON.stringify(v)}).`);
+            return USAGE_CODE;
+          }
+          interval = Number(v);
+        } else {
+          d.warn(`soma watch: ${JSON.stringify(rest[i])} is not an argument it takes — only --interval <seconds> and --all.`);
+          return USAGE_CODE;
+        }
+      }
+      // The watchdog read exactly as `status` reads it: a `null` listing is unmeasured unless tmux
+      // says, in its own words, that no server answers on the socket — then nothing runs there.
+      const liveSessions = N('liveSessions');
+      const serverAbsent = N('serverAbsent');
+      const paneStates = N('paneStates');
+      const watchdogState = () => {
+        const listed = liveSessions();
+        if (listed === null) return serverAbsent() === true ? 'absent' : 'unknown';
+        return listed.has(WATCHDOG) ? 'live' : 'absent';
+      };
+      // A listing tmux could not give is no evidence the lease's pane is gone.
+      const hasPane = (pane) => {
+        const panes = paneStates();
+        if (panes === null || panes === undefined) return true;
+        for (const rec of panes.values()) if (rec?.panes?.some((x) => x?.pane_id === pane)) return true;
+        return false;
+      };
+      // Monitor stops a command with SIGTERM when it expires, and Ctrl-C is SIGINT: either ends the
+      // loop and the arm exits 0. A reader that went away ends it too, rather than an EPIPE crash.
+      // The handlers come off afterwards, so nothing of this outlives the loop.
+      const ac = d.signal === undefined ? new AbortController() : null;
+      const stop = () => ac.abort();
+      if (ac !== null) {
+        process.on('SIGINT', stop);
+        process.on('SIGTERM', stop);
+        process.stdout.on('error', stop);
+      }
+      try {
+        await runWatch({
+          all,
+          intervalMs: interval * 1000,
+          env: d.env,
+          deps: {
+            readFleet: d.readFleet, readLease: d.readLease, readEvents: d.readEvents, readCursor: d.readCursor, now: d.now,
+            watchdogState, hasPane,
+          },
+          print: d.print,
+          warn: d.warn,
+          signal: ac === null ? d.signal : ac.signal,
+          sleep: d.sleep,
+        });
+      } finally {
+        if (ac !== null) {
+          process.off('SIGINT', stop);
+          process.off('SIGTERM', stop);
+          process.stdout.off('error', stop);
+        }
       }
       return OK;
     }

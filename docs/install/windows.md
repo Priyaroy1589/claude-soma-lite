@@ -423,7 +423,9 @@ Do all of it in a Windows Terminal Ubuntu tab, not over SSH (see [WSL caveats](#
    `tmux -L soma attach -t orchestrator`. Use the same Claude Code config that `soma init`
    registered the bus in (a session started before `soma init` will not have it). Promotion is
    one tool call, `soma_adopt`; there is no restart. The session then drains events with
-   `soma_inbox` and answers leads with `soma_send`.
+   `soma_inbox` and answers leads with `soma_send`. It also arms `soma watch` under Claude Code's
+   Monitor tool, which wakes it on every event that needs it without a keystroke, and re-arms the
+   watcher each time the Monitor expires (the README's *Driving the fleet* section says how).
 
    **A finished lead keeps its admission slot until the orchestrator drains its `COMPLETED` (or
    `ERROR`) report with `soma_inbox`.** Without a promoted session draining the inbox, finished
