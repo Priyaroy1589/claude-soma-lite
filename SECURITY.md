@@ -74,7 +74,8 @@ With the prompts gone, these guardrails do the job:
    - every personal MCP server configured on the machine, plus claude.ai connectors and plugin
      MCP servers by prefix.
 2. **A PreToolUse gate hook** (`bin/hooks/lead-gate.mjs`) that runs on every tool call in the
-   worktree. It enforces the budget breaker, keeps the soma bus for the lead alone, refuses
+   worktree. It enforces the budget breaker, keeps the soma bus for the lead alone, keeps the
+   lead's sequential-thinking server from teammates unless `teammate_mcp_allow` names it, refuses
    `git push` and `git merge` to the lead itself, and refuses writes into `.claude/` and under
    `$SOMA_HOME/leads/` from any session. The gate is also registered from a settings file outside
    the worktree, so emptying the guard file does not unregister it.

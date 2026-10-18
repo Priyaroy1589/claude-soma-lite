@@ -14,10 +14,15 @@
  *      and refused to everything else in the worktree: a teammate that mounted the
  *      user-scope bus would hold the role-less CANDIDATE surface, which carries
  *      `soma_adopt` — the orchestrator lease. Fails CLOSED on an unidentifiable
- *      session; arm (b2) below states why that is safe.
+ *      session; arm (b2) below states why that is safe. The lead's other server,
+ *      `sequential-thinking`, is held the same way (arm b3): the lead always, a teammate
+ *      only when `teammate_mcp_allow` names it.
  *   3. **The lead's push/merge ban** — all that remains of the old lead-only
  *      write-idiom arm, now that a lead's shell-write surface matches a teammate's:
  *      `git push` and `git merge`, in every global-option spelling, lead only.
+ *      "Lead" means the lead's session id, so the lead's in-process workers count as the
+ *      lead; that is why `spawn.buildLeadArgv` pins `--teammate-mode tmux`, which keeps
+ *      every teammate in its own session and lets it push `soma/<id>`.
  *      (Two retired arms once sat beside it: the session-discriminated edit ban,
  *      switched on by a `--session-guard` registration argument, and the full
  *      write-idiom ban whose `WRITE_IDIOMS`/`GIT_VERB` machinery stays below purely
@@ -109,6 +114,25 @@ const LEAD_RE = /^[a-z][a-z0-9-]{0,63}$/;
  * exactly like a lead that died. None of the three bus tools touch a repo.
  */
 const BUS_TOOL = /^mcp__soma__/;
+
+/**
+ * The lead's other MCP server, and its tools: `settings-gen.writeLeadMcpConfig` writes exactly two
+ * servers into a lead's mcp.json, `soma` and this one. Spelled here rather than imported, because
+ * this module stays dependency-free. Arm (b3) is its whole use.
+ */
+const REASONING_SERVER = 'sequential-thinking';
+const REASONING_TOOL = /^mcp__sequential-thinking__/;
+
+/**
+ * Has the operator handed `server` back to teammates? `SOMA_TEAMMATE_MCP_ALLOW` is soma.json's
+ * `teammate_mcp_allow`, comma-joined by `spawn.buildLeadEnv` and inherited by every teammate from
+ * its lead. Exact names only, so `sequential-thinking-x` does not name `sequential-thinking`;
+ * anything that is not a string names nothing.
+ */
+function teammateAllowed(env, server) {
+  const list = env?.SOMA_TEAMMATE_MCP_ALLOW;
+  return typeof list === 'string' && list.split(',').some((name) => name.trim() === server);
+}
 
 /**
  * Shell idioms that write without a redirect operator.
@@ -1777,7 +1801,7 @@ const CLAUDE_DENY = 'soma: .claude/ configures the agent harness itself — the 
 
 /**
  * Is this call the lead's own? The one discriminator between a lead and its teammates, asked by
- * `evaluateGate` (arms b2 and d) and by `budgetWarning` through this one function, so no two arms
+ * `evaluateGate` (arms b2, b3 and d) and by `budgetWarning` through this one function, so no two arms
  * can ever disagree about who the lead is. Its shape is argued in full by the comment inside, which
  * stays with the expression it explains.
  */
@@ -1940,6 +1964,30 @@ export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
         + ' work, and the lead files soma_report.');
   }
 
+  /**
+   * (b3) **The lead's reasoning server belongs to the lead, and to a teammate only when the
+   * operator hands it over.**
+   *
+   * MEASURED on a live fleet: the operator also had a `sequential-thinking` server at user
+   * scope, so `settings-gen` wrote a bare `mcp__sequential-thinking` deny into every worktree
+   * guard file, the lead loads that file, and a bare server deny matches by name — so every lead
+   * lost the tool its standing orders make mandatory before a hard call. Same mechanism as the
+   * bus in (b2), same fix: the enumeration no longer emits a deny for any server the lead's own
+   * mcp.json serves, and the teammate half moves here, where the session id tells them apart.
+   *
+   * A teammate does not inherit `--mcp-config`, so what it would call is the operator's own
+   * user-scope copy, which soma did not write and has not vetted. It gets it exactly when it got
+   * it before: when `teammate_mcp_allow` names the server. The spawner hands that list to every
+   * lead as `SOMA_TEAMMATE_MCP_ALLOW` (`spawn.buildLeadEnv`), and teammates inherit the lead's
+   * environment. Fails CLOSED on an unidentifiable session, as (b2) does, and never touches any
+   * other server: those stay the settings file's business.
+   */
+  if (REASONING_TOOL.test(tool) && !isLead && !teammateAllowed(env, REASONING_SERVER)) {
+    return deny('soma: the sequential-thinking server in this worktree belongs to the lead session.'
+      + ' A teammate gets it only when the operator lists sequential-thinking in teammate_mcp_allow.'
+      + ' Reason the step through in your own words instead, or ask the lead to take the hard call.');
+  }
+
   if (tool === 'Bash') {
     const cmd = typeof input?.tool_input?.command === 'string' ? input.tool_input.command : '';
 
@@ -1969,6 +2017,14 @@ export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
     // discriminator under BOTH registrations (a teammate is unaffected). Push/merge are also
     // denied fleet-wide by the worktree deny list (protected-branch push, `gh pr merge`), so
     // this is deliberately redundant defence on the one surface a lead keeps closed.
+    //
+    // "A teammate is unaffected" holds only for a teammate in its OWN session. MEASURED on
+    // Claude Code 2.1.299: an IN-PROCESS teammate's payload carries the lead's `session_id`
+    // (plus `agent_id`/`agent_type`, exactly like the lead's own subagents), so this arm refused
+    // its `git push -u origin soma/<id>` as the lead's. A lead launched under `env -i` has no
+    // `TMUX`, so the default teammate mode put every teammate in-process. `spawn.buildLeadArgv`
+    // pins `--teammate-mode tmux` for that reason; the payload cannot tell such a teammate from
+    // a subagent reliably, so the fix is to never have one rather than to guess here.
     if (isLead && LEAD_PUSH_MERGE.test(cmd)) {
       return deny('soma: leads may not push or merge through the shell. Hand it to a teammate.');
     }

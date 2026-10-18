@@ -1807,9 +1807,11 @@ const realpathOf = (fp) => {
 
 /**
  * One `.claude.json`'s own MCP server names — top-level `mcpServers` plus every
- * `projects[*].mcpServers`, the two scopes `enumerateUserMcpServers` reads — minus `soma`.
- * ENOENT is a live reading (the file defines nothing) and is marked `absent`; any other
- * failure is `{error}`, because a file that exists and will not open is not "defines nothing".
+ * `projects[*].mcpServers`, the two scopes `enumerateUserMcpServers` reads — minus the two
+ * servers the lead itself serves (LEAD_MCP_SERVERS), which the enumeration drops for the same
+ * reason: a bare deny in the guard file would take them off the lead. ENOENT is a live reading
+ * (the file defines nothing) and is marked `absent`; any other failure is `{error}`, because a
+ * file that exists and will not open is not "defines nothing".
  *
  * WHEN THE `{error}` ARMS ARE REACHED, measured. For a seat `soma.json` lists they are dead:
  * `seatMcpCoverage` evaluates `union: allPersonalServers()` first, `configFiles` joins
@@ -1841,7 +1843,7 @@ const ownMcpServers = (fp) => {
   const names = new Set();
   const add = (servers) => {
     if (servers === null || typeof servers !== 'object' || Array.isArray(servers)) return;
-    for (const name of Object.keys(servers)) if (name && name !== '__proto__' && name !== 'soma') names.add(name);
+    for (const name of Object.keys(servers)) if (name && name !== '__proto__' && !LEAD_MCP_SERVERS.includes(name)) names.add(name);
   };
   add(parsed.mcpServers);
   if (parsed.projects !== null && typeof parsed.projects === 'object' && !Array.isArray(parsed.projects)) {
@@ -2234,8 +2236,9 @@ export function defaultProbes(env = process.env) {
      * OWN servers read straight from its `.claude.json`. One enumeration, deliberately not a
      * second one built here from `seats`: this check exists to catch production reading fewer
      * roots than the pool has, and a union computed from this probe's own argument would pass
-     * while production's did not. `soma` is dropped from `own` for the reason the enumeration
-     * drops it: `soma init --seat` registers the bus in every seat and it must never be denied.
+     * while production's did not. `soma` and `sequential-thinking` are dropped from `own` for the
+     * reason the enumeration drops them: they are the lead's own servers, so the guard file must
+     * never deny them (and `soma init --seat` registers the bus in every seat).
      */
     seatMcpCoverage: (seats) => ({
       union: allPersonalServers(),

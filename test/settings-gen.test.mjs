@@ -210,6 +210,66 @@ test('enumerateUserMcpServers never returns soma — the bus must not be denied 
     'a generated `mcp__soma` deny rule takes soma_task/soma_report/soma_checkpoint off the lead');
 });
 
+/**
+ * The same defect again, one server along: `sequential-thinking`.
+ *
+ * MEASURED on a live fleet: every lead's worktree guard file carried a bare
+ * `mcp__sequential-thinking` deny, because the operator also has a server of that name at user
+ * scope, and every lead reported the tool missing although its standing orders make it
+ * mandatory before a hard call. A bare `mcp__<server>` deny matches by server NAME, so it takes
+ * the lead's own `--mcp-config` server of that name too, and the lead loads the guard file
+ * (`--setting-sources user,project,local`). `soma` is one name the lead's mcp.json carries; this
+ * is the rule for all of them, so the expected set is read from `writeLeadMcpConfig` itself and
+ * a third lead server cannot be added without this test covering it.
+ *
+ * Teammates still do not get the operator's copy by default. The gate refuses it to every
+ * session but the lead's (`lead-gate.mjs` arm b3) unless `teammate_mcp_allow` names it.
+ */
+test('enumerateUserMcpServers never returns a server the lead\'s own mcp.json serves', async (t) => {
+  somaHome(t);
+  const home = tmp(t, 'home-');
+  writeFileSync(join(home, '.claude.json'), JSON.stringify({
+    mcpServers: { 'sequential-thinking': { command: 'npx' }, soma: {}, kite: {} },
+    projects: { '/repo': { mcpServers: { 'sequential-thinking': {}, mysql_write: {} } } },
+  }));
+  const third = seat(t, { mcpServers: { 'sequential-thinking': {}, seat_c_user: {} } });
+  const s = await load('lead-servers');
+  const leadServers = Object.keys(JSON.parse(readFileSync(s.writeLeadMcpConfig('cr-1'), 'utf8')).mcpServers);
+  assert.ok(leadServers.includes('sequential-thinking') && leadServers.includes('soma'), `fixture premise: ${leadServers}`);
+  const got = s.enumerateUserMcpServers(home, {}, { roots: [third] }).sort();
+  assert.deepEqual(got, ['kite', 'mysql_write', 'seat_c_user'],
+    'every lead server is dropped from both scopes and from a seat; every other server is still enumerated');
+  for (const name of leadServers) {
+    assert.ok(!got.includes(name), `a bare mcp__${name} deny in the guard file takes the lead's own ${name} server away`);
+  }
+});
+
+/**
+ * The property the lead actually needs, read off the file it loads: no deny rule in the guard
+ * file matches a tool the lead's mcp.json serves. A bare `mcp__<server>` rule matches every tool
+ * of that server, an `mcp__<server>__<tool>` rule matches one, and a trailing `*` matches by
+ * prefix (`mcp__claude_ai_*`). The rest of the MCP boundary is asserted in the same breath, so
+ * this cannot pass by emptying the deny list.
+ */
+test('the guard file denies no tool the lead\'s own mcp.json serves, and still denies the rest', async (t) => {
+  somaHome(t);
+  const home = tmp(t, 'home-');
+  writeFileSync(join(home, '.claude.json'), JSON.stringify({
+    mcpServers: { 'sequential-thinking': {}, soma: {}, kite: {} },
+  }));
+  const s = await load('lead-tools');
+  const fp = s.writeWorktreeGuardrails(worktree(t), { home, env: {}, teammateAllow: [] });
+  const { deny } = JSON.parse(readFileSync(fp, 'utf8')).permissions;
+  const takes = (tool) => deny.filter((d) => d.startsWith('mcp__')
+    && (tool === d || tool.startsWith(`${d}__`) || (d.endsWith('*') && tool.startsWith(d.slice(0, -1)))));
+  for (const tool of ['mcp__sequential-thinking__sequentialthinking', 'mcp__soma__soma_task',
+    'mcp__soma__soma_report', 'mcp__soma__soma_checkpoint']) {
+    assert.deepEqual(takes(tool), [], `the lead loads this file, so ${tool} is gone for the lead`);
+  }
+  assert.ok(deny.includes('mcp__kite'), 'every other personal server is still denied');
+  for (const rule of ['mcp__claude_ai_*', 'mcp__plugin_*']) assert.ok(deny.includes(rule), `${rule} is gone`);
+});
+
 test('enumerateUserMcpServers also finds LOCAL-scope servers under projects[*].mcpServers', async (t) => {
   // Measured on the operator's own machine: `~/.claude.json` top-level `mcpServers`
   // holds two innocuous servers, while `kite` (brokerage orders) and

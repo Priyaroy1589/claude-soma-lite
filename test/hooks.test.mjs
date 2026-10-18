@@ -2136,6 +2136,83 @@ test('arm (b2): the lead may reach its bus, a teammate may not, under both regis
   }
 });
 
+/**
+ * Arm (b3): the lead's reasoning server belongs to the lead, and to teammates only when the
+ * operator says so.
+ *
+ * MEASURED on a live fleet: every lead's worktree guard file carried a bare
+ * `mcp__sequential-thinking` deny (the operator has a server of that name at user scope), the
+ * lead loads that file, and a bare server deny matches by name, so every lead lost the tool its
+ * standing orders make mandatory. The static deny is gone for the reason `soma`'s went (see
+ * `settings-gen.enumerateUserMcpServers`), and this arm keeps the teammate half of it: a teammate
+ * does not inherit `--mcp-config`, mounts the operator's own user-scope copy, and gets it only
+ * when `teammate_mcp_allow` names it, which reaches the gate as `SOMA_TEAMMATE_MCP_ALLOW`.
+ */
+test('arm (b3): the lead may reach sequential-thinking, a teammate only when teammate_mcp_allow names it', async () => {
+  const { evaluateGate } = await gate();
+  const never = () => false;
+  const TOOL = 'mcp__sequential-thinking__sequentialthinking';
+  const call = (session_id, extra = {}) => ({ tool_name: TOOL, session_id, tool_input: { thought: 't' }, ...extra });
+
+  // The lead: allowed, by silence. This is the half that was broken.
+  assert.deepEqual(evaluateGate(call('LEAD'), LEAD_ENV, never), {},
+    'the lead was refused its own reasoning server — the defect this arm exists to fix');
+  // The lead's own in-process workers share its session id and its MCP connection.
+  assert.deepEqual(evaluateGate(call('LEAD', { agent_id: 'a1b2c3d4e5f60718', agent_type: 'general-purpose' }), LEAD_ENV, never), {});
+
+  // A teammate, with no allowlist: denied, with a reason that names the dial.
+  const d = evaluateGate(call('TEAMMATE'), LEAD_ENV, never);
+  assert.equal(d.permissionDecision, 'deny', 'a teammate reached the operator\'s user-scope sequential-thinking undenied');
+  assert.match(d.permissionDecisionReason, /teammate_mcp_allow/, 'the refusal must name the dial that hands it back');
+  assert.ok(!d.permissionDecisionReason.includes('/'), 'reasons never carry a path');
+
+  // …and with one: allowed, by exact name in a comma list.
+  for (const allow of ['sequential-thinking', 'playwright,sequential-thinking', ' playwright , sequential-thinking ']) {
+    assert.deepEqual(evaluateGate(call('TEAMMATE'), { ...LEAD_ENV, SOMA_TEAMMATE_MCP_ALLOW: allow }, never), {},
+      `teammate_mcp_allow ${JSON.stringify(allow)} names the server, so the teammate keeps it`);
+  }
+  for (const allow of ['', 'playwright', 'sequential-thinking-x', 'sequential', 'sequential-thinkingx,kite', 42, null]) {
+    assert.equal(evaluateGate(call('TEAMMATE'), { ...LEAD_ENV, SOMA_TEAMMATE_MCP_ALLOW: allow }, never).permissionDecision, 'deny',
+      `SOMA_TEAMMATE_MCP_ALLOW ${JSON.stringify(allow)} does not name the server`);
+  }
+
+  // Fails CLOSED on an unidentifiable caller, like the bus arm: a real lead's uuid cannot be missing.
+  for (const bad of [undefined, '', null, 42, {}]) {
+    assert.equal(evaluateGate(call(bad), LEAD_ENV, never).permissionDecision, 'deny',
+      `an unidentifiable caller got the server with session_id ${JSON.stringify(bad)}`);
+  }
+
+  // The breaker still comes first, for the lead too: this is not a bus tool.
+  assert.equal(evaluateGate(call('LEAD'), LEAD_ENV, () => true).permissionDecision, 'deny');
+
+  // Every other MCP server is untouched: still the settings file's business, never this arm's.
+  for (const tool of ['mcp__kite__place_order', 'mcp__sequential-thinking-pro__think', 'mcp__sequentialthinking__x']) {
+    assert.deepEqual(evaluateGate({ tool_name: tool, session_id: 'TEAMMATE', tool_input: {} }, LEAD_ENV, never), {},
+      `${tool} is settings' business — this arm must neither allow nor deny it`);
+  }
+});
+
+/**
+ * Why `spawn.buildLeadArgv` pins `--teammate-mode tmux`, stated as what the gate can and cannot
+ * see. MEASURED on Claude Code 2.1.299, a real lead launched the way the spawner launches one
+ * (inside tmux, under `env -i`, so `TMUX` is gone): with the default teammate mode the teammate
+ * runs IN-PROCESS, and its PreToolUse payload carries the LEAD's `session_id`, with
+ * `agent_id: "a<name>-<hex>"` and `agent_type: "<name>"`. Its `git push -u origin soma/<id>` was
+ * refused with arm (d)'s "leads may not push or merge" — the gate cannot tell that teammate from
+ * the lead or from the lead's own subagents. With `--teammate-mode tmux` the teammate is its own
+ * `claude` process with its own session id, and the same push went through.
+ */
+test('arm (d): a split-pane teammate may push the lead\'s branch; the lead and its in-process workers may not', async () => {
+  const { evaluateGate } = await gate();
+  const never = () => false;
+  const push = 'git push -u origin soma/cr-1';
+  assert.deepEqual(evaluateGate(mateBash(push), LEAD_ENV, never), {}, 'a teammate in its own session must be able to push soma/<id>');
+  assert.match(evaluateGate(bash(push), LEAD_ENV, never).permissionDecisionReason ?? '', /push or merge/);
+  const inProcess = { ...bash(push), agent_id: 'apusher-0123456789abcdef', agent_type: 'pusher' };
+  assert.equal(evaluateGate(inProcess, LEAD_ENV, never).permissionDecision, 'deny',
+    'an in-process worker carries the lead\'s session id, so it IS the lead to this gate — which is why teammates must run in their own process');
+});
+
 test('lead-gate the process: deny is the documented envelope, everything else is silence', async () => {
   // The lead's own environment, and `bash()` carries the matching session id: a real
   // `node lead-gate.mjs` with no `--session-guard`, denying the lead by identity rather
@@ -2599,6 +2676,7 @@ test('lead-gate the process: no deny, from any arm, carries the note or consumes
   const env = { SOMA_HOME: home, SOMA_LEAD_NAME: 'cr-1', SOMA_LEAD_SESSION_UUID: 'LEAD' };
   const denies = [
     ["arm (b2): a teammate's bus call", { tool_name: 'mcp__soma__soma_report', session_id: 'TEAMMATE', tool_input: {} }, /bus belongs to the lead/],
+    ["arm (b3): a teammate's sequential-thinking call", { tool_name: 'mcp__sequential-thinking__sequentialthinking', session_id: 'TEAMMATE', tool_input: {} }, /teammate_mcp_allow/],
     ['arm (c): the lead writing .claude/', { tool_name: 'Bash', session_id: 'LEAD', cwd: fx.wt, tool_input: { command: `tee ${fx.G}` } }, /credentials/],
     ['arm (c): the lead deleting the warning itself', bash(`rm ${flag}`), /per-lead control directory/],
     ['arm (d): the lead pushing', bash('git push'), /push or merge/],

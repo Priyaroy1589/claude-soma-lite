@@ -194,6 +194,7 @@ test('every pin is its own argv element, so no pin can be one joined word', () =
     ['--mcp-config', '/m.json'],
     ['--append-system-prompt-file', '/std.md'],
     ['--session-id', 'u1'],
+    ['--teammate-mode', 'tmux'],
   ]) {
     assert.equal(countOf(argv, flag), 1, `${flag} must appear exactly once as its own element`);
     assert.equal(argAfter(argv, flag), value, `${flag} must be followed by ${value}`);
@@ -239,6 +240,28 @@ test('the launch token and the watchdog pin agree on the id claude really resolv
   // someone sharpened the pin (`LEAD_MODEL = 'claude-opus-5'`) — update the comment, not this.
   assert.equal(modelDeviation({ last_model: 'claude-opus-4-5', models: ['claude-opus-4-5'] }, s.LEAD_MODEL).deviated, false,
     'the within-family blind spot documented on LEAD_MODEL has changed');
+});
+
+/**
+ * Teammates run in their own process, on a fresh spawn and on a resume alike.
+ *
+ * MEASURED on Claude Code 2.1.299, with a lead launched the way `launch` launches one (inside
+ * tmux, under `env -i`, so `TMUX` is gone): under the default teammate mode the lead's teammates
+ * ran IN-PROCESS, and an in-process teammate's PreToolUse payload carries the LEAD's session id.
+ * `lead-gate.mjs` tells the lead from a teammate by session id alone, so it read every teammate
+ * as the lead and refused its `git push -u origin soma/<id>` with "leads may not push or merge".
+ * With `--teammate-mode tmux` each teammate is its own `claude` process with its own session id,
+ * and the same push went through. The flag also beat a settings file saying
+ * `"teammateMode": "in-process"`, which is what makes it a pin rather than a default.
+ */
+test('buildLeadArgv pins --teammate-mode tmux, so a teammate is never the lead to the gate', () => {
+  const base = { id: 'cr-1', sessionUuid: 'u1', brief: 'b', settingsPath: '/s.json', mcpPath: '/m.json', standingPath: '/std.md' };
+  for (const argv of [s.buildLeadArgv(base), s.buildLeadArgv({ ...base, resume: true })]) {
+    assert.equal(countOf(argv, '--teammate-mode'), 1);
+    assert.equal(argAfter(argv, '--teammate-mode'), 'tmux',
+      'an in-process teammate shares the lead\'s session id, so the gate refuses its push as the lead\'s');
+    assert.ok(argv.indexOf('--teammate-mode') < argv.indexOf('--'), 'a flag after -- is part of the brief, not a flag');
+  }
 });
 
 test('the -- guard closes the argv, so variadic --mcp-config cannot swallow the brief', () => {
@@ -431,6 +454,26 @@ test('buildLeadEnv sets SOMA_LEAD_SESSION_UUID, which is what tells a lead from 
     + 'so the lead\'s push/merge denies never fire (fails open) and the bus arm refuses everyone (fails closed)');
   const without = s.buildLeadEnv({ id: 'cr-1', env: SPAWNER_ENV });
   assert.ok(!('SOMA_LEAD_SESSION_UUID' in without), 'absent rather than the string "undefined", which would match a session id never minted');
+});
+
+/**
+ * `teammate_mcp_allow` reaches the gate. The lead's reasoning server is no longer denied in the
+ * worktree guard file (the lead loads that file, and a bare server deny would take its own server
+ * away), so `lead-gate.mjs` refuses it to teammates unless the operator's allowlist names it. The
+ * gate reads the list from the environment every teammate inherits from its lead.
+ */
+test('buildLeadEnv carries teammate_mcp_allow as SOMA_TEAMMATE_MCP_ALLOW, and nothing when it is empty', () => {
+  const env = s.buildLeadEnv({ id: 'cr-1', env: SPAWNER_ENV, teammateMcpAllow: ['playwright', 'sequential-thinking'] });
+  assert.equal(env.SOMA_TEAMMATE_MCP_ALLOW, 'playwright,sequential-thinking');
+  for (const empty of [undefined, null, [], 'sequential-thinking', {}, ['', 42, null]]) {
+    const none = s.buildLeadEnv({ id: 'cr-1', env: SPAWNER_ENV, teammateMcpAllow: empty });
+    assert.ok(!('SOMA_TEAMMATE_MCP_ALLOW' in none), `${JSON.stringify(empty)} names no server, so the variable is absent`);
+  }
+  // A name that cannot be told apart inside a comma list is dropped rather than split in two.
+  assert.equal(s.buildLeadEnv({ id: 'cr-1', env: SPAWNER_ENV, teammateMcpAllow: ['a,b', 'kite'] }).SOMA_TEAMMATE_MCP_ALLOW, 'kite');
+  // Injected, never copied: a value in the spawner's own environment does not reach the lead.
+  const copied = s.buildLeadEnv({ id: 'cr-1', env: { ...SPAWNER_ENV, SOMA_TEAMMATE_MCP_ALLOW: 'sequential-thinking' } });
+  assert.ok(!('SOMA_TEAMMATE_MCP_ALLOW' in copied), 'the allowlist comes from soma.json, not from whoever ran the spawner');
 });
 
 test('SOMA_HOME reaches the lead resolved and identical to what the bus config records', () => {
@@ -716,6 +759,20 @@ test('spawnLead forwards the configured teammate_effort rather than assuming inh
   assert.ok(!('CLAUDE_CODE_EFFORT_LEVEL' in calls.newSession[0].env),
     'a spawner that hard-codes inherit makes soma.json teammate_effort dead config');
   assert.equal(argAfter(calls.newSession[0].argv, '--effort'), 'max', 'and the lead itself is still pinned');
+});
+
+test('spawnLead and resumeLead hand the configured teammate_mcp_allow to the gate through the lead env', () => {
+  const allow = () => ({ ...CFG, teammate_mcp_allow: ['sequential-thinking'] });
+  const fresh = harness({ loadConfig: allow });
+  s.spawnLead({ id: 'cr-1', repo: 'r', brief: 'do x' }, fresh.deps);
+  assert.equal(fresh.calls.newSession[0].env.SOMA_TEAMMATE_MCP_ALLOW, 'sequential-thinking',
+    'a spawner that drops the allowlist takes the reasoning server off every teammate the operator handed it to');
+  const again = harness({ loadConfig: allow });
+  s.resumeLead(RESUMABLE, again.deps);
+  assert.equal(again.calls.newSession[0].env.SOMA_TEAMMATE_MCP_ALLOW, 'sequential-thinking', 'a resume must carry it too');
+  const none = harness();
+  s.spawnLead({ id: 'cr-1', repo: 'r', brief: 'do x' }, none.deps);
+  assert.ok(!('SOMA_TEAMMATE_MCP_ALLOW' in none.calls.newSession[0].env), 'an empty allowlist hands nothing back');
 });
 
 test('a bad task id is refused before a worktree, a trust mark or a session exists', () => {
