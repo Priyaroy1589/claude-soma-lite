@@ -97,7 +97,11 @@ const PROMPT_RULES = {
       // pins are "enforced outside your goodwill". A lead read that and believed it. The title is
       // what a compacted session still has, so it now carries what is actually enforced.
       headPins: [
-        ['what is actually denied', /never\s+push\s+or\s+merge/i],
+        // The push half changed by ruling: the lead pushes its own branch and nothing else, so
+        // the title carries both halves, the ban and the one exception, where a compacted
+        // session still reads them.
+        ['what is actually denied', /never\s+merge/i],
+        ['and the one push a lead makes', /push\s+only\s+your\s+own\s+branch/i],
         ['the model', /\bopus\b/],
         ['the effort', /effort[\s`]*max/i],
         ['and that none of it is negotiable', /non-negotiable/i],
@@ -164,6 +168,12 @@ const PROMPT_RULES = {
           ['that nothing else is', /[Nn]othing\s+else/],
           ['the tools that DO work, named so a lead stops rationing them', /NotebookEdit/],
           ['and that the surfaces are equal', /same/i],
+          // The one push the gate lets the lead make, in the exact spelling it accepts, and the
+          // switch that takes it away. A lead that is not told the spelling tries `git push`
+          // bare, or chained behind a commit, and reads the refusal as "leads never push".
+          ['the one push the lead makes, spelled as the gate accepts it', /git\s+push\s+-u\s+origin\s+soma\/<id>/],
+          ['that it must be a command of its own', /command\s+of\s+its\s+own|own\s+command/i],
+          ['and the switch that turns it off', /lead_branch_push/],
         ] },
         { at: /workflow\s+agents/, why: 'workflow agents can now write, and that is a hazard', pins: [
           ['that they inherit this session', /(inherit|allowlist)/i],

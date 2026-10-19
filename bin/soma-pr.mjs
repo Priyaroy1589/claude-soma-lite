@@ -23,6 +23,12 @@
  * supported with `--web`" — so an injected `--draft` turns every browser-form
  * attempt into an error. The browser route that did work was the shorthand
  * cluster `-wd=false`, and that is what the filter below is for.
+ *
+ * **It never pushes.** It hands `gh pr create` the caller's arguments and nothing else, and gh
+ * run from a non-interactive shell will not push an unpushed branch: it stops with "you must
+ * first push the current branch to a remote, or use the --head flag". So the branch is already on
+ * `origin` before this runs — the lead pushes `soma/<id>` with `git push -u origin soma/<id>`
+ * (the one push the gate lets a lead make), or a teammate does.
  */
 import { execFileSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
@@ -133,9 +139,8 @@ if (isMain) {
   try {
     // No `stdio` option, deliberately: execFileSync forwards the child's stderr
     // to ours whenever the caller passes none, so gh's own diagnostics reach the
-    // operator on the success path (branch pushes, "Creating draft pull
-    // request…") and the failure path alike, without this file reformatting any
-    // of it.
+    // operator on the success path ("Creating draft pull request…") and the
+    // failure path alike, without this file reformatting any of it.
     process.stdout.write(execFileSync('gh', buildPrArgs(process.argv.slice(2)), { encoding: 'utf8' }));
   } catch (e) {
     // gh's stderr was written by that same forwarding before execFileSync threw,

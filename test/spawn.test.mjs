@@ -718,6 +718,37 @@ test('spawnLead forwards the configured teammate_effort rather than assuming inh
   assert.equal(argAfter(calls.newSession[0].argv, '--effort'), 'max', 'and the lead itself is still pinned');
 });
 
+/**
+ * `lead_branch_push` reaches the gate as a flag file the spawner owns. The gate allows the lead
+ * one push, its own branch to origin, unless `leads/<id>/LEAD_PUSH_OFF` exists; the spawner
+ * writes that file on every launch unless the switch is exactly `true` (the default), and removes
+ * it when it is. A flag whose PRESENCE refuses is one a lead cannot forge open: the gate refuses
+ * every Bash write under `leads/`, and the Write tool can create a file but not delete one.
+ * Anything but `true` keeps the old rule, so a typo leaves the fleet stricter, never looser.
+ */
+test('every launch writes leads/<id>/LEAD_PUSH_OFF unless lead_branch_push is exactly true, and removes it when it is', async () => {
+  const flag = join(leadDir('cr-1'), 'LEAD_PUSH_OFF');
+  const launchWith = (value, resume = false) => {
+    const { deps } = harness({ loadConfig: () => ({ ...CFG, lead_branch_push: value }) });
+    if (resume) s.resumeLead(RESUMABLE, deps);
+    else s.spawnLead({ id: 'cr-1', repo: 'r', brief: 'do x' }, deps);
+  };
+  rmSync(flag, { force: true });
+  launchWith(true);
+  assert.equal(existsSync(flag), false, 'the default lets the lead push its own branch');
+  for (const resume of [false, true]) {
+    for (const off of [false, undefined, null, 'true', 'false', 1, 0, {}]) {
+      launchWith(off, resume);
+      assert.equal(existsSync(flag), true, `lead_branch_push ${JSON.stringify(off)} must keep the old rule (resume=${resume})`);
+      launchWith(true, resume);
+      assert.equal(existsSync(flag), false, `switching back to true must reopen it (resume=${resume})`);
+    }
+  }
+  const { LEAD_PUSH_OFF_FLAG } = await import('../bin/hooks/lead-gate.mjs');
+  assert.equal(s.LEAD_PUSH_OFF_FLAG, 'LEAD_PUSH_OFF');
+  assert.equal(LEAD_PUSH_OFF_FLAG, s.LEAD_PUSH_OFF_FLAG, 'the spawner and the gate must spell the flag the same way');
+});
+
 test('a bad task id is refused before a worktree, a trust mark or a session exists', () => {
   for (const id of [undefined, '', 'cr 1', '../evil', 'CR-1']) {
     const { deps, order } = harness();

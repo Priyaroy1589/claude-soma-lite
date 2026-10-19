@@ -17,6 +17,18 @@ Work tracked as GitHub issues, newest first.
 
 #### Added
 
+- **A lead may push its own branch.** The gate used to refuse every `git push` from the lead and
+  tell it to hand the push to a teammate. `soma-pr` needs `soma/<id>` on `origin` and does not
+  push it, and in practice leads handed that push to the operator. The lead may now run exactly
+  `git push -u origin soma/<id>` (also `--set-upstream`, `HEAD:soma/<id>` and
+  `refs/heads/soma/<id>`) as a command of its own. Every other push is still refused to the lead:
+  another branch or remote, a bare push, `--all`, `--mirror`, tags, any force or delete, and every
+  chained, wrapped or global-option spelling. `git merge` stays refused, and the worktree deny
+  list still binds everyone. The branch comes from `SOMA_LEAD_NAME`, which the breaker already
+  trusts, and only for the lead's own session. A new `soma.json` key, `lead_branch_push` (default
+  `true`), keeps the old rule when set to `false` or to anything other than `true`: the spawner
+  then writes `leads/<id>/LEAD_PUSH_OFF` on every launch and the gate refuses that push too. The
+  lead prompt says to push before running `soma-pr`.
 - **`soma watch`**, a keystroke-free event poller for the orchestrator (#35). It prints one stdout
   line per fleet event that asks the orchestrator for a move (`--all`: every event) in the bus's own
   wake-line words, at most 20 per poll and a freeze's `BACKPRESSURE` once rather than on every

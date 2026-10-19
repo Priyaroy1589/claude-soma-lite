@@ -41,7 +41,7 @@
  * `claude` reads either, and the whole sequence runs inside the per-repo mutex.
  */
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -443,6 +443,43 @@ function writeLaunchSettings(what, id, leadSettingsPath) {
   }
   renameSync(tmp, fp);
   return fp;
+}
+
+/**
+ * The gate's flag for soma.json's `lead_branch_push`, spelled as `lead-gate.mjs` spells it (a test
+ * pins the two equal; the gate imports nothing, so it cannot read this constant).
+ */
+export const LEAD_PUSH_OFF_FLAG = 'LEAD_PUSH_OFF';
+
+/**
+ * Hand soma.json's `lead_branch_push` to the gate: remove `leads/<id>/LEAD_PUSH_OFF` when the
+ * switch is exactly `true`, write it otherwise. Returns whether the flag is now there.
+ *
+ * The gate lets a lead push its own branch, `git push -u origin soma/<id>`, unless this flag
+ * exists. Its presence refuses, so a lead cannot forge the push open with the Write tool, and
+ * the gate refuses every Bash write under `leads/`, so it cannot delete the flag either.
+ * Anything but `true` writes it: `false`, a missing key (only a stubbed config has one, since
+ * DEFAULTS carries `true`), and a value that is not a boolean, such as the string `"true"`. A typo
+ * leaves the fleet on the old, stricter rule rather than the looser one.
+ *
+ * Run on every launch, fresh spawn and resume alike, so the file follows soma.json as of the
+ * lead's latest start; an edit takes effect at the next spawn or resume, like the guard file.
+ * A failure throws, as `writeMeta`'s does: nothing has launched yet, and a lead started with the
+ * wrong switch is the one outcome worth refusing a spawn over.
+ */
+export function applyLeadPushSwitch(id, enabled) {
+  const fp = join(leadDir(id), LEAD_PUSH_OFF_FLAG);
+  if (enabled === true) {
+    try {
+      unlinkSync(fp);
+    } catch (e) {
+      if (e?.code !== 'ENOENT') throw e;
+    }
+    return false;
+  }
+  mkdirSync(dirname(fp), { recursive: true });
+  writeFileSync(fp, 'lead_branch_push is not true in soma.json, so the gate refuses every git push from this lead.\n');
+  return true;
 }
 
 /** A string with something in it: the only shape a sha or a branch name may have here. */
@@ -956,6 +993,8 @@ function launch({ id, cwd, sessionUuid, resume, task, cfg, deps, configDir }) {
   // guard is composed onto it here, outside the worktree, because the only other registration
   // lives inside the file it defends. See `teammateGuardHook`.
   const settingsPath = writeLaunchSettings(resume ? 'resumeLead' : 'spawnLead', id, deps.writeLeadSettings(id));
+  // The lead's one push, its own branch to origin, follows soma.json as of this launch.
+  applyLeadPushSwitch(id, cfg.lead_branch_push);
   // The cwd travels with the facts: the standing brief states it so the lead can hand it to a
   // teammate as "your cwd is <path>" instead of `cd`-ing to it in every command (the cd-compound
   // fix — a `cd` in a compound was the shape Claude Code 2.1.259 stopped 79 sessions on).

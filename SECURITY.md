@@ -75,7 +75,9 @@ With the prompts gone, these guardrails do the job:
      MCP servers by prefix.
 2. **A PreToolUse gate hook** (`bin/hooks/lead-gate.mjs`) that runs on every tool call in the
    worktree. It enforces the budget breaker, keeps the soma bus for the lead alone, refuses
-   `git push` and `git merge` to the lead itself, and refuses writes into `.claude/` and under
+   `git merge` and every `git push` to the lead itself except its own branch to `origin`
+   (`git push -u origin soma/<id>`, as a command of its own; `lead_branch_push: false` in
+   `soma.json` takes that one away too), and refuses writes into `.claude/` and under
    `$SOMA_HOME/leads/` from any session. The gate is also registered from a settings file outside
    the worktree, so emptying the guard file does not unregister it.
 3. **A scrubbed environment.** Leads start under `env -i` with an allow-list of eight variables,
