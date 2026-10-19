@@ -17,6 +17,24 @@ Work tracked as GitHub issues, newest first.
 
 #### Added
 
+- **A lead may push its own branch.** The gate used to refuse every `git push` from the lead and
+  tell it to hand the push to a teammate. `soma-pr` needs `soma/<id>` on `origin` and does not
+  push it, and in practice leads handed that push to the operator. The lead may now run exactly
+  `git push -u origin soma/<id>` (also `--set-upstream`, `HEAD:soma/<id>` and
+  `refs/heads/soma/<id>`) as a command of its own, from the root of its own worktree. Every other
+  push is still refused to the lead: another branch or remote, a bare push, `--all`, `--mirror`,
+  `--tags` and tag refspecs, any force or delete, and every chained, wrapped or global-option
+  spelling. `git merge` stays refused, and the worktree deny list still binds everyone. The
+  branch comes from `SOMA_LEAD_NAME`, which the breaker already trusts, and only for the lead's
+  own session. A new `soma.json` key, `lead_branch_push` (default `true`), reaches the gate as
+  `SOMA_LEAD_BRANCH_PUSH=1` in the lead's environment, and its absence keeps the old rule:
+  `false`, any value other than `true`, and a lead started before this change are all refused.
+  The gate judges the command and the working directory, not git config: config set by an
+  earlier command (`push.followTags`, `remote.origin.pushurl`, `url.<x>.pushInsteadOf`) can still
+  widen what that push sends or where it goes. For a task id ending in `-d` or `-f`, the deny
+  list's force and delete rules refuse every spelling a lead may use, and the gate now says so; a
+  teammate can still push it with the refspec quoted. The lead prompt says to push before running
+  `soma-pr`.
 - **`soma watch`**, a keystroke-free event poller for the orchestrator (#35). It prints one stdout
   line per fleet event that asks the orchestrator for a move (`--all`: every event) in the bus's own
   wake-line words, at most 20 per poll and a freeze's `BACKPRESSURE` once rather than on every

@@ -2139,6 +2139,239 @@ test('arm (b2): the lead may reach its bus, a teammate may not, under both regis
 });
 
 /**
+ * Arm (d): the lead pushes its own branch, and nothing else.
+ *
+ * The operator's ruling: the lead may `git push` exactly one thing, its own branch `soma/<id>` to
+ * `origin`, spelled out in full as a command of its own, from the root of its own worktree.
+ * Everything the arm refused before is still refused — another branch, another remote, a bare
+ * push, `--all`/`--mirror`/`--tags`, any force or delete, every wrapped or chained spelling — and
+ * `git merge` always is. `soma.json`'s `lead_branch_push` reaches the gate as
+ * `SOMA_LEAD_BRANCH_PUSH=1` in the lead's environment, and its absence keeps the old rule. "The
+ * lead" is whatever carries the lead's session id, so the lead's own in-process workers get the
+ * same rule; a teammate in its own session is not this arm's business.
+ */
+const PUSH_ENV = { ...LEAD_ENV, SOMA_LEAD_BRANCH_PUSH: '1' };
+const WORKTREE = '/state/worktrees/r/cr-1';
+const same = (p) => p;                                       // a realpath with no symlinks anywhere
+const noTrip = () => false;
+/** The lead's Bash call, run from `cwd`. */
+const leadAt = (command, cwd = WORKTREE, extra = {}) => ({ tool_name: 'Bash', session_id: 'LEAD', cwd, tool_input: { command }, ...extra });
+
+const OWN_PUSHES = [
+  'git push origin soma/cr-1',
+  'git push -u origin soma/cr-1',
+  'git push --set-upstream origin soma/cr-1',
+  'git push origin HEAD:soma/cr-1',
+  'git push -u origin HEAD:soma/cr-1',
+  'git push origin refs/heads/soma/cr-1',
+  'git push origin HEAD:refs/heads/soma/cr-1',
+  'git push origin soma/cr-1:soma/cr-1',
+  'git push origin soma/cr-1:refs/heads/soma/cr-1',
+  '  git push  -u\torigin   soma/cr-1  ',
+  'git push -u origin soma/cr-1\n',
+];
+
+/**
+ * Whitespace the shell keeps inside a word but `String.prototype.trim` strips. With a plain
+ * `trim()`, `git push -u origin HEAD:soma/cr-1<U+00A0>` passed the shape check and git created
+ * `refs/heads/soma/cr-1<U+00A0>`, another branch (found in review, 36 spellings). Each one, at
+ * either end of the line and at the end of the refspec.
+ */
+const SHELL_KEEPS = [' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
+  ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', '　',
+  '﻿', '\r', '\v', '\f'];
+const UNICODE_SPELLINGS = SHELL_KEEPS.flatMap((c) => [
+  `git push -u origin soma/cr-1${c}`,
+  `git push -u origin HEAD:soma/cr-1${c}`,
+  `git push origin refs/heads/soma/cr-1${c}`,
+  `${c}git push -u origin soma/cr-1`,
+  `git push -u origin${c}soma/cr-1`,
+]);
+
+const REFUSED_PUSHES = [
+  // not its own branch
+  'git push origin soma/cr-2', 'git push origin soma/cr-10', 'git push origin soma/cr-1x',
+  'git push origin soma/cr-1-r2', 'git push origin soma/cr-1/x', 'git push origin soma/cr',
+  'git push origin main', 'git push origin develop', 'git push origin HEAD:main',
+  'git push origin HEAD:soma/cr-2', 'git push origin main:soma/cr-1', 'git push origin soma/cr-1:soma/cr-2',
+  'git push origin soma/cr-1:main', 'git push origin refs/heads/soma/cr-2', 'git push origin HEAD',
+  'git push origin soma/cr-1 main', 'git push origin soma/cr-1 soma/cr-1',
+  // no target, or every target
+  'git push', 'git push origin', 'git push -u', 'git push --all origin', 'git push --mirror origin',
+  'git push --tags origin', 'git push origin --tags', 'git push --follow-tags origin soma/cr-1',
+  'git push origin v1.0', 'git push origin refs/tags/v1.0', 'git push origin tag v1.0',
+  // force
+  'git push -f origin soma/cr-1', 'git push --force origin soma/cr-1', 'git push origin soma/cr-1 -f',
+  'git push origin soma/cr-1 --force', 'git push origin +soma/cr-1', 'git push origin +HEAD:soma/cr-1',
+  'git push --force-with-lease origin soma/cr-1', 'git push --force-with-lease=soma/cr-1 origin soma/cr-1',
+  'git push --force-if-includes origin soma/cr-1', 'git push -uf origin soma/cr-1',
+  // delete
+  'git push -d origin soma/cr-1', 'git push --delete origin soma/cr-1', 'git push origin :soma/cr-1',
+  'git push origin --delete soma/cr-1', 'git push origin soma/cr-1:',
+  // another remote, or a remote spelled another way
+  'git push upstream soma/cr-1', 'git push git@example.com:o/r.git soma/cr-1',
+  'git push https://example.com/o/r.git soma/cr-1', 'git push ../remote.git soma/cr-1',
+  'git push --repo=origin soma/cr-1', 'git push --repo origin soma/cr-1', 'git push Origin soma/cr-1',
+  // other options
+  'git push --no-verify origin soma/cr-1', 'git push -o ci.skip origin soma/cr-1',
+  'git push --push-option=x origin soma/cr-1', 'git push -n origin soma/cr-1', 'git push -q origin soma/cr-1',
+  'git push --atomic origin soma/cr-1', 'git push --receive-pack=x origin soma/cr-1',
+  'git push origin soma/cr-1 -u',
+  // every global-option spelling and wrapper the arm already caught
+  'git -C /w push origin soma/cr-1', 'git -c push.default=current push origin soma/cr-1',
+  'git -c push.followTags=false push -u origin soma/cr-1',
+  'git --git-dir=/w/.git push origin soma/cr-1', 'git --no-pager push origin soma/cr-1',
+  'env git push origin soma/cr-1', 'command git push origin soma/cr-1', '/usr/bin/git push origin soma/cr-1',
+  "bash -c 'git push origin soma/cr-1'", 'sh -c "git push origin soma/cr-1"', 'exec git push origin soma/cr-1',
+  'GIT_SSH_COMMAND=x git push origin soma/cr-1', 'nohup git push origin soma/cr-1',
+  // chained, piped, redirected, substituted, quoted, escaped
+  'git add -A && git push origin soma/cr-1', 'git push origin soma/cr-1 && echo done',
+  'git commit -m x; git push origin soma/cr-1', 'git push origin soma/cr-1 || true',
+  'git push origin soma/cr-1 | tail -1', 'git push origin soma/cr-1 2>&1', 'git push origin soma/cr-1 > log',
+  'git push origin soma/cr-1 &', 'echo x\ngit push origin soma/cr-1', 'git push origin soma/cr-1\ngit push origin main',
+  'cd /elsewhere && git push origin soma/cr-1', 'cd /elsewhere\ngit push origin soma/cr-1',
+  'git push origin $(git branch --show-current)', 'git push origin `echo soma/cr-1`',
+  "git push origin 'soma/cr-1'", 'git push origin "soma/cr-1"', 'git push origin soma/cr-1\\ ',
+  'git push origin soma/${X}cr-1', 'git push origin soma/cr-1#', 'git push origin soma/cr-?',
+  'git push origin soma/cr-*', 'git push origin {soma/cr-1,main}', 'git push origin ~/x',
+  // whitespace the shell keeps inside a word
+  ...UNICODE_SPELLINGS,
+];
+
+test('arm (d): the lead may push its own branch to origin, spelled out in full, and nothing else', async () => {
+  const { evaluateGate } = await gate();
+  for (const cmd of OWN_PUSHES) {
+    assert.deepEqual(evaluateGate(leadAt(cmd), PUSH_ENV, noTrip, same), {},
+      `the lead was refused its own branch: ${JSON.stringify(cmd)}`);
+    // The lead's own in-process workers carry its session id, so they get the lead's rule.
+    assert.deepEqual(evaluateGate(leadAt(cmd, WORKTREE, { agent_id: 'apusher-0123456789abcdef', agent_type: 'pusher' }), PUSH_ENV, noTrip, same), {},
+      `an in-process worker of the lead was refused the lead's own branch: ${JSON.stringify(cmd)}`);
+  }
+  assert.ok(UNICODE_SPELLINGS.length >= 36, 'every whitespace the review found, at every position');
+  for (const cmd of REFUSED_PUSHES) {
+    const d = evaluateGate(leadAt(cmd), PUSH_ENV, noTrip, same);
+    assert.equal(d.permissionDecision, 'deny', `the lead was let through: ${JSON.stringify(cmd)}`);
+    assert.match(d.permissionDecisionReason, /push or merge/, `a refusal that does not say why: ${JSON.stringify(cmd)}`);
+    assert.match(d.permissionDecisionReason, /git push -u origin soma\/cr-1/, 'the refusal must spell the one push that is allowed');
+  }
+  for (const cmd of ['git merge soma/cr-1', 'git merge --ff-only origin/soma/cr-1', 'git -C /w merge x']) {
+    assert.equal(evaluateGate(leadAt(cmd), PUSH_ENV, noTrip, same).permissionDecision, 'deny', `git merge reached: ${cmd}`);
+  }
+});
+
+test('arm (d): without SOMA_LEAD_BRANCH_PUSH=1 the lead may not push at all, exactly as before', async () => {
+  const { evaluateGate } = await gate();
+  // Absent is off: a lead spawned before the switch existed, `lead_branch_push: false`, a typo.
+  const offs = [LEAD_ENV, ...['', '0', 'true', 'yes', ' 1', '1 ', 'on', 1, true].map((v) => ({ ...LEAD_ENV, SOMA_LEAD_BRANCH_PUSH: v }))];
+  for (const env of offs) {
+    for (const cmd of [...OWN_PUSHES, ...REFUSED_PUSHES, 'git merge soma/cr-1']) {
+      const d = evaluateGate(leadAt(cmd), env, noTrip, same);
+      assert.equal(d.permissionDecision, 'deny', `SOMA_LEAD_BRANCH_PUSH ${JSON.stringify(env.SOMA_LEAD_BRANCH_PUSH)} let the lead push: ${JSON.stringify(cmd)}`);
+      assert.match(d.permissionDecisionReason, /push or merge/);
+    }
+    assert.match(evaluateGate(leadAt('git push -u origin soma/cr-1'), env, noTrip, same).permissionDecisionReason, /lead_branch_push/,
+      'the refusal of the allowed form must name the switch that turned it off, or the lead thinks it mistyped');
+  }
+});
+
+test('arm (d): the branch comes from the lead id the gate already trusts, or the push is refused', async () => {
+  const { evaluateGate } = await gate();
+  // No usable id: nothing to compare the branch with, so the one push is refused like the rest.
+  for (const id of [undefined, '', 'CR-1', 'cr 1', '../cr-1', 'soma/cr-1', 42]) {
+    const env = { ...PUSH_ENV, SOMA_LEAD_NAME: id };
+    if (id === undefined) delete env.SOMA_LEAD_NAME;
+    assert.equal(evaluateGate(leadAt('git push -u origin soma/cr-1'), env, noTrip, same).permissionDecision, 'deny',
+      `SOMA_LEAD_NAME ${JSON.stringify(id)} cannot name the lead's branch`);
+  }
+  // Another lead's id names another lead's branch, from that lead's worktree.
+  const other = { ...PUSH_ENV, SOMA_LEAD_NAME: 'cr-2' };
+  assert.deepEqual(evaluateGate(leadAt('git push -u origin soma/cr-2', '/state/worktrees/r/cr-2'), other, noTrip, same), {});
+  assert.equal(evaluateGate(leadAt('git push -u origin soma/cr-1', '/state/worktrees/r/cr-2'), other, noTrip, same).permissionDecision, 'deny');
+});
+
+/**
+ * `origin` is whatever repository the cwd belongs to, so the same words push `soma/<id>` to
+ * another repository from anywhere else (found in review). Measured on Claude Code 2.1.299: the
+ * hook's `cwd` follows a `cd` from an earlier call, and a `cd` out of the project is reset before
+ * the next one. The push is allowed only at the worktree root, compared by realpath.
+ */
+test('arm (d): the lead may push its own branch only from the root of its own worktree', async () => {
+  const { evaluateGate } = await gate();
+  const push = 'git push -u origin soma/cr-1';
+  for (const cwd of [`${WORKTREE}/src`, `${WORKTREE}/vendor/lib`, '/state/worktrees/r/cr-2', '/state/worktrees/cr-1',
+    '/state/worktrees/r/x/cr-1', '/state/cr-1', '/state', '/other/worktrees/r/cr-1', '/state/worktrees/r/cr-1x',
+    'worktrees/r/cr-1', '', undefined, null, 42]) {
+    const d = evaluateGate({ ...leadAt(push), cwd }, PUSH_ENV, noTrip, same);   // not leadAt(push, cwd): undefined would take the default
+    assert.equal(d.permissionDecision, 'deny', `the lead pushed from ${JSON.stringify(cwd)}`);
+    assert.match(d.permissionDecisionReason, /worktree/);
+  }
+  // Both sides by realpath: a symlinked spelling of the worktree is the worktree, and a state root
+  // under a symlink (stock macOS $TMPDIR) still finds its worktrees.
+  const links = (p) => ({ '/link/wt': WORKTREE, '/state': '/private/state', [WORKTREE]: `/private${WORKTREE}` }[p] ?? p);
+  assert.deepEqual(evaluateGate(leadAt(push, '/link/wt'), PUSH_ENV, noTrip, (p) => links(links(p))), {});
+  assert.deepEqual(evaluateGate(leadAt(push, WORKTREE), PUSH_ENV, noTrip, links), {});
+  // A symlink inside the worktree that points somewhere else is somewhere else.
+  assert.equal(evaluateGate(leadAt(push, `${WORKTREE}/to-other`), PUSH_ENV, noTrip,
+    (p) => (p === `${WORKTREE}/to-other` ? '/other/repo' : p)).permissionDecision, 'deny');
+  // A path that cannot be resolved is not the root.
+  assert.equal(evaluateGate(leadAt(push), PUSH_ENV, noTrip, () => { throw new Error('ENOENT'); }).permissionDecision, 'deny');
+});
+
+/**
+ * The deny list's force and delete rules (`Bash(git push*-d)`, `Bash(git push*-f)`) refuse every
+ * push whose command ends in `-d` or `-f`, for every session: a declared over-reach. So none of the
+ * spellings arm (d) allows a lead can pass it for a task id ending that way, and the gate says so
+ * instead of letting the command through to a bare "permission denied" (found in review). A
+ * teammate's quoted refspec does not end that way and still goes through.
+ */
+test('arm (d): an id ending in -d or -f is refused with the reason, since no spelling the lead may use passes the deny list', async () => {
+  const { evaluateGate } = await gate();
+  for (const id of ['cr-d', 'fix-f', 'a-d', 'docs-d']) {
+    const env = { ...PUSH_ENV, SOMA_LEAD_NAME: id };
+    const d = evaluateGate(leadAt(`git push -u origin soma/${id}`, `/state/worktrees/r/${id}`), env, noTrip, same);
+    assert.equal(d.permissionDecision, 'deny', `soma/${id} was let through to a deny rule that refuses it`);
+    assert.match(d.permissionDecisionReason, /ends in -[df]/);
+    assert.match(d.permissionDecisionReason, /NEEDS_INPUT/);
+  }
+  for (const id of ['cr-dx', 'fix-fd1', 'docs', 'fd']) {
+    const env = { ...PUSH_ENV, SOMA_LEAD_NAME: id };
+    assert.deepEqual(evaluateGate(leadAt(`git push -u origin soma/${id}`, `/state/worktrees/r/${id}`), env, noTrip, same), {},
+      `soma/${id} does not end in -d or -f`);
+  }
+});
+
+test('arm (d): a teammate in its own session is not this arm\'s business, whichever way the switch is', async () => {
+  const { evaluateGate } = await gate();
+  for (const env of [LEAD_ENV, PUSH_ENV]) {
+    for (const cmd of ['git push -u origin soma/cr-1', 'git push origin soma/cr-2', 'git merge x', 'git push --force origin soma/cr-1']) {
+      assert.deepEqual(evaluateGate({ ...mateBash(cmd), cwd: '/anywhere' }, env, noTrip, same), {},
+        `the gate took a view on a teammate's ${JSON.stringify(cmd)}; force and protected branches are the settings file's job`);
+    }
+  }
+});
+
+test('lead-gate the process: the lead\'s own-branch push is silence from its worktree, and a deny without the switch', async (t) => {
+  const home = await freshHome(t);
+  const wt = join(home, 'worktrees', 'r', 'cr-1');
+  mkdirSync(wt, { recursive: true });
+  const env = { SOMA_HOME: home, SOMA_LEAD_NAME: 'cr-1', SOMA_LEAD_SESSION_UUID: 'LEAD', SOMA_LEAD_BRANCH_PUSH: '1' };
+  const own = await runHook('lead-gate.mjs', { stdin: leadAt('git push -u origin soma/cr-1', wt), env });
+  assert.equal(own.code, 0);
+  assert.equal(own.out, '', `the lead's own push must pass by silence, never by an explicit allow: ${own.out}`);
+  const sub = join(wt, 'src');
+  mkdirSync(sub);
+  const fromSub = await runHook('lead-gate.mjs', { stdin: leadAt('git push -u origin soma/cr-1', sub), env });
+  assert.equal(fromSub.json?.hookSpecificOutput?.permissionDecision, 'deny');
+  const other = await runHook('lead-gate.mjs', { stdin: leadAt('git push origin soma/cr-2', wt), env });
+  assert.equal(other.json?.hookSpecificOutput?.permissionDecision, 'deny');
+  const { SOMA_LEAD_BRANCH_PUSH, ...without } = env;
+  const off = await runHook('lead-gate.mjs', { stdin: leadAt('git push -u origin soma/cr-1', wt), env: without });
+  assert.equal(off.json?.hookSpecificOutput?.permissionDecision, 'deny');
+  assert.match(off.json.hookSpecificOutput.permissionDecisionReason, /lead_branch_push/);
+  for (const r of [fromSub, other, off]) assert.ok(!r.out.includes(home), 'the deny leaked the state root');
+});
+
+/**
  * Arm (b3): the lead's reasoning server belongs to the lead, and to teammates only when the
  * operator says so.
  *

@@ -134,6 +134,7 @@ test('DEFAULTS carry the exact governance values the fleet is built around', asy
     repos: {},
     teammate_mcp_allow: [],
     env_allow: [],
+    lead_branch_push: true,
     seats: [],
   });
   // `harness.mjs` validates a lead's reported `budget_class` against exactly these

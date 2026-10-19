@@ -167,6 +167,13 @@ export const DEFAULTS = deepFreeze({
   repos: {},                   // { '<repo>': { path, base_branch, verify_hint } }
   teammate_mcp_allow: [],
   env_allow: [],
+  // Whether a lead may push its own branch, `git push -u origin soma/<id>`, as a command of its
+  // own. Every other push and every merge stays refused to the lead either way, and the
+  // protected-branch, force and delete rules bind everyone. `false` keeps the older rule, "the
+  // lead never pushes": the spawner then leaves `SOMA_LEAD_BRANCH_PUSH` out of the lead's
+  // environment and the gate refuses the one push too. Only exactly `true` allows it, so a value
+  // that is not a boolean is read as off. Takes effect at the lead's next spawn or resume.
+  lead_branch_push: true,
   // Account rotation (design 2026-09-15 §2): the seat pool. Each entry is a Claude Code config
   // dir — `{ config_dir: string /* absolute or ~-prefixed */, label: string }` — whose `projects/`
   // is a symlink into the fleet's shared transcript tree, so any seat can resume any lead. Empty

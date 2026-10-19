@@ -738,6 +738,39 @@ test('spawnLead forwards the configured teammate_effort rather than assuming inh
   assert.equal(argAfter(calls.newSession[0].argv, '--effort'), 'max', 'and the lead itself is still pinned');
 });
 
+/**
+ * `lead_branch_push` reaches the gate as `SOMA_LEAD_BRANCH_PUSH=1` in the lead's environment, the
+ * same place and trust level as `SOMA_LEAD_NAME` and `SOMA_HOME` (a settings file the lead writes
+ * with an `env` block can forge all three on Claude Code 2.1.303; not closed here). ABSENCE means
+ * off, so `false`, a missing key, any value that is not exactly `true`, and a lead spawned before
+ * the variable existed all keep "the lead never pushes". (A flag file under
+ * `leads/<id>/` was the first design; a subprocess could delete it, and a missing file read as on.)
+ */
+test('buildLeadEnv sets SOMA_LEAD_BRANCH_PUSH=1 only for lead_branch_push exactly true', () => {
+  assert.equal(s.buildLeadEnv({ id: 'cr-1', env: SPAWNER_ENV, leadBranchPush: true }).SOMA_LEAD_BRANCH_PUSH, '1');
+  for (const off of [false, undefined, null, 'true', 'false', 1, 0, {}, []]) {
+    const env = s.buildLeadEnv({ id: 'cr-1', env: SPAWNER_ENV, leadBranchPush: off });
+    assert.ok(!('SOMA_LEAD_BRANCH_PUSH' in env), `lead_branch_push ${JSON.stringify(off)} must keep the old rule`);
+  }
+  const copied = s.buildLeadEnv({ id: 'cr-1', env: { ...SPAWNER_ENV, SOMA_LEAD_BRANCH_PUSH: '1' } });
+  assert.ok(!('SOMA_LEAD_BRANCH_PUSH' in copied), 'the switch comes from soma.json, never from whoever ran the spawner');
+});
+
+test('spawnLead and resumeLead hand lead_branch_push to the gate through the lead env', () => {
+  const launch = (value, resume) => {
+    const { deps, calls } = harness({ loadConfig: () => ({ ...CFG, lead_branch_push: value }) });
+    if (resume) s.resumeLead(RESUMABLE, deps);
+    else s.spawnLead({ id: 'cr-1', repo: 'r', brief: 'do x' }, deps);
+    return calls.newSession[0].env;
+  };
+  for (const resume of [false, true]) {
+    assert.equal(launch(true, resume).SOMA_LEAD_BRANCH_PUSH, '1', `resume=${resume}: a spawner that drops the switch takes the lead's push away`);
+    for (const off of [false, undefined, 'true']) {
+      assert.ok(!('SOMA_LEAD_BRANCH_PUSH' in launch(off, resume)), `resume=${resume}: ${JSON.stringify(off)} must keep the old rule`);
+    }
+  }
+});
+
 test('spawnLead and resumeLead hand the configured teammate_mcp_allow to the gate through the lead env', () => {
   const allow = () => ({ ...CFG, teammate_mcp_allow: ['sequential-thinking'] });
   const fresh = harness({ loadConfig: allow });

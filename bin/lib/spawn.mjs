@@ -382,9 +382,9 @@ export function withTeammateGuard(settings) {
  *       --settings /private/tmp/…/fixed-settings.json --model claude-opus-5
  *
  * `--settings` inherited. `--disallowedTools`, `--mcp-config`, `--strict-mcp-config` and
- * `--setting-sources` **all dropped**, every one of which the parent had. That asymmetry is
- * the whole fix: the ban belongs on argv, which binds one process, not in a file, which binds
- * the fleet.
+ * `--setting-sources` **all dropped**, every one of which the parent had (on Claude Code 2.1.299
+ * `--mcp-config` and `--strict-mcp-config` are inherited too). That asymmetry is the whole fix:
+ * the ban belongs on argv, which binds one process, not in a file, which binds the fleet.
  *
  * **The fix was proven before it was applied.** With `permissions.deny` removed from the
  * settings file and only `--disallowedTools Edit,Write,NotebookEdit` left on the lead's argv,
@@ -769,12 +769,15 @@ export function buildLeadArgv({ id, sessionUuid, brief, settingsPath, mcpPath, s
  * **`teammateMcpAllow`** — soma.json's `teammate_mcp_allow`, set as `SOMA_TEAMMATE_MCP_ALLOW` for
  * the gate's arm (b3), which refuses the lead's reasoning server to teammates unless it is named.
  *
+ * **`leadBranchPush`** — soma.json's `lead_branch_push`, set as `SOMA_LEAD_BRANCH_PUSH=1` only when
+ * it is exactly `true`; see the line that sets it.
+ *
  * **`configDir`** — a seat for THIS launch (account rotation, spec §3.3). It replaces the copied
  * `CLAUDE_CONFIG_DIR` and nothing else; `undefined`, `null` and `''` all mean "the spawner's own",
  * which is exactly what every lead got before seats existed. `seatConfigDir` says why each of
  * those three reads that way and why a relative dir is refused.
  */
-export function buildLeadEnv({ id, sessionUuid, teammateEffort, teammateMcpAllow, env = process.env, configDir } = {}) {
+export function buildLeadEnv({ id, sessionUuid, teammateEffort, teammateMcpAllow, leadBranchPush, env = process.env, configDir } = {}) {
   leadId(id, 'buildLeadEnv');
   const seat = seatConfigDir(configDir, 'buildLeadEnv');
   const out = {};
@@ -814,6 +817,15 @@ export function buildLeadEnv({ id, sessionUuid, teammateEffort, teammateMcpAllow
     ? teammateMcpAllow.filter((name) => typeof name === 'string' && name !== '' && !name.includes(','))
     : [];
   if (handedBack.length) out.SOMA_TEAMMATE_MCP_ALLOW = handedBack.join(',');
+  // soma.json's `lead_branch_push`, for `lead-gate.mjs` arm (d): `'1'` lets the lead push its own
+  // branch, `git push -u origin soma/<id>`, and ABSENCE refuses it. Set only for exactly `true`, so
+  // `false`, a missing key and a value that is not a boolean all keep "the lead never pushes", and
+  // so does a lead spawned before this variable existed. Here, beside `SOMA_LEAD_NAME`, at the same
+  // trust level as it and `SOMA_HOME`: an `export` in the lead's Bash does not reach the gate, but
+  // on Claude Code 2.1.303 a settings file the lead writes with an `env` block does, and that route
+  // can already forge those two (see `lead-gate.mjs`, `ownBranchPush`). A flag file under
+  // `leads/<id>/` was tried first and was weaker: a subprocess could delete it.
+  if (leadBranchPush === true) out.SOMA_LEAD_BRANCH_PUSH = '1';
   out.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = '1';
   out.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION = '0';
   out.DISABLE_AUTOUPDATER = '1';
@@ -956,7 +968,7 @@ function launch({ id, cwd, sessionUuid, resume, task, cfg, deps, configDir }) {
   // then carries the seat into `preTrust` and `trustFileFor` below; that is what makes the three
   // agree by construction, and why neither of them takes the seat as a separate argument — a
   // second spelling would be a second place for them to disagree.
-  const env = buildLeadEnv({ id, sessionUuid, teammateEffort: cfg.teammate_effort, teammateMcpAllow: cfg.teammate_mcp_allow, env: deps.env ?? process.env, configDir });
+  const env = buildLeadEnv({ id, sessionUuid, teammateEffort: cfg.teammate_effort, teammateMcpAllow: cfg.teammate_mcp_allow, leadBranchPush: cfg.lead_branch_push, env: deps.env ?? process.env, configDir });
 
   // Immediately before this launch, never batched across launches: the file is
   // last-writer-wins against claude's own rewrites of it, so a mark made for an earlier
