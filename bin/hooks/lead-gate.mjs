@@ -264,8 +264,7 @@ function atWorktreeRoot(cwd, home, id, realpath) {
   } catch {
     return false;
   }
-  return typeof real === 'string' && basename(real) === id && dirname(dirname(real)) === worktrees
-    && basename(dirname(real)) !== '' && dirname(real) !== worktrees;
+  return typeof real === 'string' && basename(real) === id && dirname(dirname(real)) === worktrees;
 }
 
 /**
@@ -293,8 +292,13 @@ function atWorktreeRoot(cwd, home, id, realpath) {
  * `id` is `SOMA_LEAD_NAME`, the same value the breaker trusts, and this is only ever asked about
  * the lead's own session (`isLead`), whose environment is the one the spawner built under
  * `env -i`. Measured on Claude Code 2.1.299: a hook command runs under `/bin/sh -c` straight from
- * the `claude` process, so no shell startup file a teammate could write is read on the way, and
- * nothing the lead runs in its own Bash tool reaches this process's environment.
+ * the `claude` process, so no shell startup file a teammate could write is read on the way, and an
+ * `export` in the lead's Bash tool does not reach it. That is NOT "nothing the lead runs can change
+ * it": on Claude Code 2.1.303 a settings file the lead writes with an `env` block (for example
+ * `.claude/settings.local.json` through `node -e`, which this gate lets through) reaches the very
+ * next hook call. So this id, and `SOMA_LEAD_BRANCH_PUSH` beside it, sit at exactly the trust level
+ * of `SOMA_LEAD_NAME` and `SOMA_HOME`, which that same route can already forge; it is not closed
+ * here.
  *
  * What this judges is the COMMAND STRING. It cannot see git config set by an earlier command,
  * and that config widens what this exact command does: `push.followTags=true` also pushes the
@@ -2116,8 +2120,10 @@ export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
     //   - The switch is on: `SOMA_LEAD_BRANCH_PUSH` is exactly `'1'`. `spawn.buildLeadEnv` sets it
     //     only when soma.json's `lead_branch_push` is exactly `true`, so its ABSENCE means off: a
     //     lead spawned before this existed, a fleet that set the key to `false`, and a typo all
-    //     keep "the lead never pushes". It lives in the lead's environment, the same place and
-    //     trust as `SOMA_LEAD_NAME`: the lead's own Bash cannot change what this hook inherits.
+    //     keep "the lead never pushes". It lives in the lead's environment, at the same trust
+    //     level as `SOMA_LEAD_NAME` and `SOMA_HOME`: an `export` in the lead's Bash does not reach
+    //     this hook, but on Claude Code 2.1.303 a settings file the lead writes with an `env` block
+    //     does, and that route can already forge those two as well (see `ownBranchPush`).
     //     (A flag FILE was tried first and refused in review: a subprocess, a `cd` before an
     //     `rm`, or a `chmod` on the directory removed or hid it, and a missing file read as on.)
     //   - The session's cwd is the lead's worktree root, `$SOMA_HOME/worktrees/<repo>/<id>`,
@@ -2129,8 +2135,10 @@ export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
     //     subdirectory is refused too, since it may hold a repository of its own.
     //   - The id does not end in `-d` or `-f`. The worktree deny list's force and delete rules
     //     (`Bash(git push*-d)`, `Bash(git push*-f)`) refuse every push whose command ends that
-    //     way, for every session — a declared over-reach — so no spelling of such a branch gets
-    //     through, and saying so beats a bare "permission denied" after this gate let it pass.
+    //     way, for every session — a declared over-reach — so none of the spellings this arm
+    //     allows can pass it (each ends in the branch name). Saying so beats a bare "permission
+    //     denied" after this gate let it pass. A teammate's quoted `git push origin 'soma/<id>'`
+    //     does not end that way and still goes through.
     //
     // The settings deny list still binds this push like any other: protected branches, force and
     // delete stay refused for every session. What none of this sees is git config set by an
@@ -2145,7 +2153,7 @@ export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
           return deny(`soma: leads may not push or merge through the shell, except ${branch} from the root of the lead's own worktree, where origin is the task's repository. Run the same command again from there, with no cd in front of it.`);
         }
         if (/-[df]$/.test(id)) {
-          return deny(`soma: leads may not push or merge through the shell, and ${branch} cannot be pushed by anyone: the task id ends in -${id.slice(-1)}, and the worktree deny list refuses every git push whose command ends that way (its force and delete rules). File NEEDS_INPUT so the operator pushes it.`);
+          return deny(`soma: leads may not push or merge through the shell, and the one push a lead may make cannot pass for ${branch}: the task id ends in -${id.slice(-1)}, and the worktree deny list refuses every git push whose command ends that way (its force and delete rules). Hand it to a teammate, who can quote the refspec (git push origin '${branch}'), or file NEEDS_INPUT.`);
         }
         return {};
       }

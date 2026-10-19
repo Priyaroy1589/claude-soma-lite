@@ -2319,11 +2319,12 @@ test('arm (d): the lead may push its own branch only from the root of its own wo
 
 /**
  * The deny list's force and delete rules (`Bash(git push*-d)`, `Bash(git push*-f)`) refuse every
- * push whose command ends in `-d` or `-f`, for every session: a declared over-reach. So a task id
- * ending that way can never be pushed by name, and the gate says so instead of letting the
- * command through to a bare "permission denied" (found in review).
+ * push whose command ends in `-d` or `-f`, for every session: a declared over-reach. So none of the
+ * spellings arm (d) allows a lead can pass it for a task id ending that way, and the gate says so
+ * instead of letting the command through to a bare "permission denied" (found in review). A
+ * teammate's quoted refspec does not end that way and still goes through.
  */
-test('arm (d): an id ending in -d or -f is refused with the reason, since no spelling of it can pass the deny list', async () => {
+test('arm (d): an id ending in -d or -f is refused with the reason, since no spelling the lead may use passes the deny list', async () => {
   const { evaluateGate } = await gate();
   for (const id of ['cr-d', 'fix-f', 'a-d', 'docs-d']) {
     const env = { ...PUSH_ENV, SOMA_LEAD_NAME: id };

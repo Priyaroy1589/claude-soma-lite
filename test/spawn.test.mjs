@@ -740,9 +740,10 @@ test('spawnLead forwards the configured teammate_effort rather than assuming inh
 
 /**
  * `lead_branch_push` reaches the gate as `SOMA_LEAD_BRANCH_PUSH=1` in the lead's environment, the
- * same place and trust as `SOMA_LEAD_NAME`: nothing the lead runs can change what its hooks
- * inherit. ABSENCE means off, so `false`, a missing key, any value that is not exactly `true`, and a
- * lead spawned before the variable existed all keep "the lead never pushes". (A flag file under
+ * same place and trust level as `SOMA_LEAD_NAME` and `SOMA_HOME` (a settings file the lead writes
+ * with an `env` block can forge all three on Claude Code 2.1.303; not closed here). ABSENCE means
+ * off, so `false`, a missing key, any value that is not exactly `true`, and a lead spawned before
+ * the variable existed all keep "the lead never pushes". (A flag file under
  * `leads/<id>/` was the first design; a subprocess could delete it, and a missing file read as on.)
  */
 test('buildLeadEnv sets SOMA_LEAD_BRANCH_PUSH=1 only for lead_branch_push exactly true', () => {

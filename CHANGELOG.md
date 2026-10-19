@@ -31,9 +31,10 @@ Work tracked as GitHub issues, newest first.
   `false`, any value other than `true`, and a lead started before this change are all refused.
   The gate judges the command and the working directory, not git config: config set by an
   earlier command (`push.followTags`, `remote.origin.pushurl`, `url.<x>.pushInsteadOf`) can still
-  widen what that push sends or where it goes. A task id ending in `-d` or `-f` cannot be pushed
-  by anyone, because of the deny list's force and delete rules, and the gate now says so. The
-  lead prompt says to push before running `soma-pr`.
+  widen what that push sends or where it goes. For a task id ending in `-d` or `-f`, the deny
+  list's force and delete rules refuse every spelling a lead may use, and the gate now says so; a
+  teammate can still push it with the refspec quoted. The lead prompt says to push before running
+  `soma-pr`.
 - **`soma watch`**, a keystroke-free event poller for the orchestrator (#35). It prints one stdout
   line per fleet event that asks the orchestrator for a move (`--all`: every event) in the bus's own
   wake-line words, at most 20 per poll and a freeze's `BACKPRESSURE` once rather than on every
