@@ -19,8 +19,9 @@
  *      write-idiom arm, now that a lead's shell-write surface matches a teammate's:
  *      `git push` and `git merge`, in every global-option spelling, lead only. One
  *      exception: the lead may push its own branch, `git push -u origin soma/<id>`,
- *      as a command of its own, unless soma.json's `lead_branch_push` is off
- *      (`leads/<id>/LEAD_PUSH_OFF`). See `ownBranchPush` for exactly what that admits.
+ *      as a command of its own from its worktree root, when soma.json's
+ *      `lead_branch_push` is on (`SOMA_LEAD_BRANCH_PUSH=1` in the lead's environment).
+ *      See `ownBranchPush` and arm (d) for exactly what that admits, and what it cannot see.
  *      (Two retired arms once sat beside it: the session-discriminated edit ban,
  *      switched on by a `--session-guard` registration argument, and the full
  *      write-idiom ban whose `WRITE_IDIOMS`/`GIT_VERB` machinery stays below purely
@@ -84,7 +85,7 @@
  * shared module cannot disarm the breaker, and the process does no I/O beyond one
  * `existsSync` (a lead's own calls pay a second, for `BUDGET_WARNED`; while a warning
  * waits, a third re-checks the trip, the call that delivers it pays one `renameSync`, and
- * the lead's own-branch push pays one more `existsSync`, for `LEAD_PUSH_OFF`).
+ * the lead's own-branch push pays two `realpathSync`s, to find its worktree).
  */
 import { existsSync, realpathSync, renameSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -224,23 +225,37 @@ const WRITE_IDIOMS = [
 const LEAD_PUSH_MERGE = new RegExp(CMD + String.raw`git\s+(?:${GIT_OPT}){0,20}(?:merge|push)(?![-\w])`);
 
 /**
- * The flag that takes the lead's one push away: `leads/<id>/LEAD_PUSH_OFF`. The spawner
- * (`spawn.applyLeadPushSwitch`) writes it on every launch unless soma.json's `lead_branch_push`
- * is exactly `true`, and removes it when it is. Exported so a test pins the two spellings equal.
+ * Is `cwd` the lead's own worktree root, `$SOMA_HOME/worktrees/<repo>/<id>`?
  *
- * Its PRESENCE refuses, on purpose. A flag whose presence allowed would be one the lead could
- * forge: the Write tool creates files anywhere, and this gate only polices Bash. Deleting a file
- * is what reopening would take, and every Bash write under `leads/` is refused by arm (c), from
- * any session; the Write tool cannot delete.
+ * Shape, not a lookup: the gate does not know the repo key, but `paths.worktreeDir` makes it one
+ * path segment (`worktree.mjs` refuses anything else), so the root is any directory whose name is
+ * the lead's id and whose grandparent is the state root's `worktrees/`. Both sides go through
+ * `realpath`, because `$SOMA_HOME` may sit under a symlink (stock macOS `$TMPDIR` does) and the
+ * hook's `cwd` may be spelled either way. Anything that cannot be resolved is not the root.
  */
-export const LEAD_PUSH_OFF_FLAG = 'LEAD_PUSH_OFF';
+function atWorktreeRoot(cwd, home, id, realpath) {
+  if (typeof cwd !== 'string' || cwd === '' || !isAbsolute(cwd)) return false;
+  let real;
+  let worktrees;
+  try {
+    real = realpath(cwd);
+    worktrees = join(realpath(home), 'worktrees');
+  } catch {
+    return false;
+  }
+  return typeof real === 'string' && basename(real) === id && dirname(dirname(real)) === worktrees
+    && basename(dirname(real)) !== '' && dirname(real) !== worktrees;
+}
 
 /**
  * Is `cmd` the one push a lead may make: its own branch, `soma/<id>`, to `origin`, as a command
  * of its own?
  *
  * The shape is enumerated rather than parsed, because everything outside it stays refused and a
- * parser would have to be right about the shell to be safe. Accepted, after trimming:
+ * parser would have to be right about the shell to be safe. Accepted, after trimming ASCII
+ * spaces, tabs and newlines from both ends (and nothing else: `String.prototype.trim` also strips
+ * U+00A0, U+2028, U+3000 and the rest, which the shell keeps inside a word, so
+ * `soma/<id><U+00A0>` would pass the check and name another branch):
  *
  *     git push [-u | --set-upstream]... origin <refspec>
  *
@@ -251,17 +266,25 @@ export const LEAD_PUSH_OFF_FLAG = 'LEAD_PUSH_OFF';
  * so a chained, piped, wrapped, substituted or forced push never reaches the word checks. `git`
  * must be the first word: `git -C`, `-c`, `--git-dir`, `env git`, `command git`, `/usr/bin/git`
  * and `bash -c` all stay refused. So do `--force-with-lease`, `-d`, `--delete`, `:ref`, `--all`,
- * `--mirror`, `--tags`, a tag, any other option, any other remote spelling, and any other branch,
- * including `soma/<id>-r2` (a retry branch: hand that push to a teammate).
+ * `--mirror`, `--tags`, a tag refspec, any other option, any other remote spelling, and any other
+ * branch, including `soma/<id>-r2` (a retry branch: hand that push to a teammate).
  *
  * `id` is `SOMA_LEAD_NAME`, the same value the breaker trusts, and this is only ever asked about
  * the lead's own session (`isLead`), whose environment is the one the spawner built under
  * `env -i`. Measured on Claude Code 2.1.299: a hook command runs under `/bin/sh -c` straight from
- * the `claude` process, so no shell startup file a teammate could write is read on the way.
+ * the `claude` process, so no shell startup file a teammate could write is read on the way, and
+ * nothing the lead runs in its own Bash tool reaches this process's environment.
+ *
+ * What this judges is the COMMAND STRING. It cannot see git config set by an earlier command,
+ * and that config widens what this exact command does: `push.followTags=true` also pushes the
+ * annotated tags it reaches, and `remote.origin.pushurl` or `url.<x>.pushInsteadOf` send it to
+ * another repository (measured with real git). Nor can it see a `.git` pointer rewritten to
+ * another repository's git dir. Those are the subprocess residual in another form, declared
+ * rather than chased: the class is closed by OS sandboxing, not by more string rules.
  */
 function ownBranchPush(cmd, id) {
   if (typeof cmd !== 'string' || typeof id !== 'string' || !LEAD_RE.test(id)) return false;
-  const line = cmd.trim();
+  const line = cmd.replace(/^[ \t\n]+|[ \t\n]+$/g, '');
   if (!/^[A-Za-z0-9._/:\t -]+$/.test(line)) return false;
   const words = line.split(/[ \t]+/);
   if (words[0] !== 'git' || words[1] !== 'push') return false;
@@ -2031,26 +2054,47 @@ export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
     // ONE EXCEPTION, by the operator's ruling: the lead pushes its own branch. `soma-pr` needs
     // `soma/<id>` on `origin` and does not push it, and a lead that had to hand that one push to
     // a teammate mostly handed it to the operator instead. `ownBranchPush` is the whole of what
-    // is allowed — one spelling family, one branch, one remote, no options beyond setting the
-    // upstream — and `leads/<id>/LEAD_PUSH_OFF` takes even that away (soma.json's
-    // `lead_branch_push: false`). The flag is read only for a command that is already that push,
-    // so every other command costs nothing; a reading that is not a clean `false` (a throw, a
-    // truthy non-boolean) counts as the flag being there, which is the rule as it was before.
-    // The settings deny list still binds this push like any other: protected branches, force
-    // and delete stay refused for every session.
+    // the command may be — one spelling family, one branch, one remote, no options beyond setting
+    // the upstream — and three more conditions must hold, each checked only for a command that
+    // already has that shape, so every other command costs nothing:
+    //
+    //   - The switch is on: `SOMA_LEAD_BRANCH_PUSH` is exactly `'1'`. `spawn.buildLeadEnv` sets it
+    //     only when soma.json's `lead_branch_push` is exactly `true`, so its ABSENCE means off: a
+    //     lead spawned before this existed, a fleet that set the key to `false`, and a typo all
+    //     keep "the lead never pushes". It lives in the lead's environment, the same place and
+    //     trust as `SOMA_LEAD_NAME`: the lead's own Bash cannot change what this hook inherits.
+    //     (A flag FILE was tried first and refused in review: a subprocess, a `cd` before an
+    //     `rm`, or a `chmod` on the directory removed or hid it, and a missing file read as on.)
+    //   - The session's cwd is the lead's worktree root, `$SOMA_HOME/worktrees/<repo>/<id>`,
+    //     compared by realpath (`atWorktreeRoot`). The command names `origin`, and `origin` is
+    //     whatever repository the cwd belongs to: from a repository cloned inside the worktree,
+    //     or any other the shell reaches, the same words push `soma/<id>` somewhere else.
+    //     Measured on Claude Code 2.1.299: the hook's `cwd` follows a `cd` the lead ran in an
+    //     earlier call, and a `cd` out of the project is reset before the next call. A
+    //     subdirectory is refused too, since it may hold a repository of its own.
+    //   - The id does not end in `-d` or `-f`. The worktree deny list's force and delete rules
+    //     (`Bash(git push*-d)`, `Bash(git push*-f)`) refuse every push whose command ends that
+    //     way, for every session — a declared over-reach — so no spelling of such a branch gets
+    //     through, and saying so beats a bare "permission denied" after this gate let it pass.
+    //
+    // The settings deny list still binds this push like any other: protected branches, force and
+    // delete stay refused for every session. What none of this sees is git config set by an
+    // earlier command (`ownBranchPush` lists it): that is declared, not closed.
     if (isLead && LEAD_PUSH_MERGE.test(cmd)) {
       const branch = typeof id === 'string' && LEAD_RE.test(id) ? `soma/${id}` : 'soma/<id>';
       if (ownBranchPush(cmd, id)) {
-        let off;
-        try {
-          off = flagExists(join(home, 'leads', id, LEAD_PUSH_OFF_FLAG)) !== false;
-        } catch {
-          off = true;
+        if (env?.SOMA_LEAD_BRANCH_PUSH !== '1') {
+          return deny(`soma: leads may not push or merge through the shell, and this fleet has also turned off the lead's own-branch push (lead_branch_push is not true in soma.json, or this lead started before it was). Hand the push of ${branch} to a teammate.`);
         }
-        if (!off) return {};
-        return deny(`soma: leads may not push or merge through the shell, and this fleet has also turned off the lead's own-branch push (lead_branch_push is false in soma.json). Hand the push of ${branch} to a teammate.`);
+        if (!atWorktreeRoot(input?.cwd, home, id, realpath)) {
+          return deny(`soma: leads may not push or merge through the shell, except ${branch} from the root of the lead's own worktree, where origin is the task's repository. Run the same command again from there, with no cd in front of it.`);
+        }
+        if (/-[df]$/.test(id)) {
+          return deny(`soma: leads may not push or merge through the shell, and ${branch} cannot be pushed by anyone: the task id ends in -${id.slice(-1)}, and the worktree deny list refuses every git push whose command ends that way (its force and delete rules). File NEEDS_INPUT so the operator pushes it.`);
+        }
+        return {};
       }
-      return deny(`soma: leads may not push or merge through the shell, with one exception: your own branch to origin, as a command of its own, exactly \`git push -u origin ${branch}\`. Any other branch, remote, force, delete, tag or chained push is refused, and so is every merge. Hand those to a teammate.`);
+      return deny(`soma: leads may not push or merge through the shell, with one exception: your own branch to origin, as a command of its own, from your worktree root, exactly \`git push -u origin ${branch}\`. Any other branch, remote, force, delete, tag refspec or chained push is refused, and so is every merge. Hand those to a teammate.`);
     }
 
     // (e) The cd-compound liveness lever — see the block above `cdCompoundAsks` for the

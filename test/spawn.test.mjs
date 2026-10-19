@@ -719,34 +719,35 @@ test('spawnLead forwards the configured teammate_effort rather than assuming inh
 });
 
 /**
- * `lead_branch_push` reaches the gate as a flag file the spawner owns. The gate allows the lead
- * one push, its own branch to origin, unless `leads/<id>/LEAD_PUSH_OFF` exists; the spawner
- * writes that file on every launch unless the switch is exactly `true` (the default), and removes
- * it when it is. A flag whose PRESENCE refuses is one a lead cannot forge open: the gate refuses
- * every Bash write under `leads/`, and the Write tool can create a file but not delete one.
- * Anything but `true` keeps the old rule, so a typo leaves the fleet stricter, never looser.
+ * `lead_branch_push` reaches the gate as `SOMA_LEAD_BRANCH_PUSH=1` in the lead's environment, the
+ * same place and trust as `SOMA_LEAD_NAME`: nothing the lead runs can change what its hooks
+ * inherit. ABSENCE means off, so `false`, a missing key, any value that is not exactly `true`, and a
+ * lead spawned before the variable existed all keep "the lead never pushes". (A flag file under
+ * `leads/<id>/` was the first design; a subprocess could delete it, and a missing file read as on.)
  */
-test('every launch writes leads/<id>/LEAD_PUSH_OFF unless lead_branch_push is exactly true, and removes it when it is', async () => {
-  const flag = join(leadDir('cr-1'), 'LEAD_PUSH_OFF');
-  const launchWith = (value, resume = false) => {
-    const { deps } = harness({ loadConfig: () => ({ ...CFG, lead_branch_push: value }) });
+test('buildLeadEnv sets SOMA_LEAD_BRANCH_PUSH=1 only for lead_branch_push exactly true', () => {
+  assert.equal(s.buildLeadEnv({ id: 'cr-1', env: SPAWNER_ENV, leadBranchPush: true }).SOMA_LEAD_BRANCH_PUSH, '1');
+  for (const off of [false, undefined, null, 'true', 'false', 1, 0, {}, []]) {
+    const env = s.buildLeadEnv({ id: 'cr-1', env: SPAWNER_ENV, leadBranchPush: off });
+    assert.ok(!('SOMA_LEAD_BRANCH_PUSH' in env), `lead_branch_push ${JSON.stringify(off)} must keep the old rule`);
+  }
+  const copied = s.buildLeadEnv({ id: 'cr-1', env: { ...SPAWNER_ENV, SOMA_LEAD_BRANCH_PUSH: '1' } });
+  assert.ok(!('SOMA_LEAD_BRANCH_PUSH' in copied), 'the switch comes from soma.json, never from whoever ran the spawner');
+});
+
+test('spawnLead and resumeLead hand lead_branch_push to the gate through the lead env', () => {
+  const launch = (value, resume) => {
+    const { deps, calls } = harness({ loadConfig: () => ({ ...CFG, lead_branch_push: value }) });
     if (resume) s.resumeLead(RESUMABLE, deps);
     else s.spawnLead({ id: 'cr-1', repo: 'r', brief: 'do x' }, deps);
+    return calls.newSession[0].env;
   };
-  rmSync(flag, { force: true });
-  launchWith(true);
-  assert.equal(existsSync(flag), false, 'the default lets the lead push its own branch');
   for (const resume of [false, true]) {
-    for (const off of [false, undefined, null, 'true', 'false', 1, 0, {}]) {
-      launchWith(off, resume);
-      assert.equal(existsSync(flag), true, `lead_branch_push ${JSON.stringify(off)} must keep the old rule (resume=${resume})`);
-      launchWith(true, resume);
-      assert.equal(existsSync(flag), false, `switching back to true must reopen it (resume=${resume})`);
+    assert.equal(launch(true, resume).SOMA_LEAD_BRANCH_PUSH, '1', `resume=${resume}: a spawner that drops the switch takes the lead's push away`);
+    for (const off of [false, undefined, 'true']) {
+      assert.ok(!('SOMA_LEAD_BRANCH_PUSH' in launch(off, resume)), `resume=${resume}: ${JSON.stringify(off)} must keep the old rule`);
     }
   }
-  const { LEAD_PUSH_OFF_FLAG } = await import('../bin/hooks/lead-gate.mjs');
-  assert.equal(s.LEAD_PUSH_OFF_FLAG, 'LEAD_PUSH_OFF');
-  assert.equal(LEAD_PUSH_OFF_FLAG, s.LEAD_PUSH_OFF_FLAG, 'the spawner and the gate must spell the flag the same way');
 });
 
 test('a bad task id is refused before a worktree, a trust mark or a session exists', () => {

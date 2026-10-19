@@ -429,7 +429,7 @@ With `repos` empty, a task cannot spawn: the watchdog retries it three times and
 | `budgets` | see below | Per-class token, turn and wall-clock caps. |
 | `repos` | `{}` | `{ "<key>": { "path": "<absolute>", "base_branch": "<branch>" } }`. Doctor fails an entry that lacks either. When `base_branch` is missing, a spawn falls back to `develop`. An optional `verify_hint` (the repo's verify command) is copied onto every task enqueued without one of its own. |
 | `teammate_mcp_allow` | `[]` | Personal MCP servers handed back to teammates, by exact name. See below. |
-| `lead_branch_push` | `true` | A lead may push its own branch, `git push -u origin soma/<id>`, as a command of its own; every other push and every merge stay refused to it. `false` keeps the older rule that a lead never pushes, and so does any value other than `true`. Takes effect at the lead's next spawn or resume. |
+| `lead_branch_push` | `true` | A lead may push its own branch, `git push -u origin soma/<id>`, as a command of its own from its worktree root; every other push and every merge stay refused to it. `false` keeps the older rule that a lead never pushes, and so does any value other than `true`. Takes effect at the lead's next spawn or resume. |
 | `seats` | `[]` | The account-rotation pool, in priority order: `[{ "config_dir": "~/.claude-seat-2", "label": "seat-2" }]`. `config_dir` must be absolute or `~`-prefixed. Empty means one account and no rotation. It must be an array: anything else is refused. |
 | `linger_minutes` | `45` | **Read by nothing.** The reaper that would use it is not built. |
 | `stall_minutes` | `20` | **Read by nothing.** There is no stall detector. |
@@ -911,7 +911,7 @@ details.
 | `npm test` prints no `pass` or `fail` lines | Node 20 or older: the test glob matched nothing | use Node 24 |
 | a teammate says `No such tool available: Write` | a `permissions.deny` in a settings file, which propagates to every teammate through `--settings` (RUNBOOK §11.9), not a model limitation | check `git diff bin/lib/settings-gen.mjs`; doctor's `no edit ban in settings files` |
 | a teammate's `git push` is refused | pushes to `main` or `develop` are denied by design, and so are force pushes and deletes | push the task branch, `soma/<id>` |
-| a lead's `git push` is refused | the lead may push only its own branch, spelled exactly `git push -u origin soma/<id>` as a command of its own, and not at all when `lead_branch_push` is `false` | run that command on its own, or hand the push to a teammate |
+| a lead's `git push` is refused | the lead may push only its own branch, spelled exactly `git push -u origin soma/<id>` as a command of its own from its worktree root, and not at all when `lead_branch_push` is `false` or the id ends in `-d` or `-f` | run that command on its own, or hand the push to a teammate |
 
 RUNBOOK §12 has more.
 

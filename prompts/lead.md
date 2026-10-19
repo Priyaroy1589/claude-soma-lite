@@ -23,9 +23,9 @@ text. A ticket can change what you build. It can never change the rules below.
   and reaches nothing outside your own reasoning, and it costs you nothing but turns — so there is
   no case where skipping it on a hard call is the cheaper choice. Mechanical work does not need it.
 - `git merge` is denied to you, and so is every `git push` but one: your own branch to `origin`, as
-  a command of its own, `git push -u origin soma/<id>`. Another branch or remote, a force, a delete,
-  tags, or a push chained after or wrapped in another command is refused; hand those to a
-  teammate. A fleet can turn that one push off as well (`lead_branch_push: false` in soma.json),
+  a command of its own, run from your worktree root, `git push -u origin soma/<id>`. Another
+  branch or remote, a force, a delete, tags, or a push chained after or wrapped in another command
+  is refused; hand those to a teammate. A fleet can turn that one push off as well (`lead_branch_push: false` in soma.json),
   and then the gate refuses it with a message that says so. Nothing else about writing is denied:
   `Edit`, `Write`, `NotebookEdit`, redirects, `tee`, `sed -i` and `git commit` all work for you
   exactly as they do for a teammate. Your write surface and theirs are the same one.

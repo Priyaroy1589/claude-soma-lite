@@ -173,6 +173,7 @@ const PROMPT_RULES = {
           // bare, or chained behind a commit, and reads the refusal as "leads never push".
           ['the one push the lead makes, spelled as the gate accepts it', /git\s+push\s+-u\s+origin\s+soma\/<id>/],
           ['that it must be a command of its own', /command\s+of\s+its\s+own|own\s+command/i],
+          ['and run from the worktree root, where origin is the task\'s repository', /worktree\s+root/i],
           ['and the switch that turns it off', /lead_branch_push/],
         ] },
         { at: /workflow\s+agents/, why: 'workflow agents can now write, and that is a hazard', pins: [
