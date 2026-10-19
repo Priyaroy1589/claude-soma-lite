@@ -423,9 +423,11 @@ export function enumerateUserMcpServers(home = homedir(), env = process.env, opt
    * its standing orders make it mandatory before a hard call. A bare `mcp__<server>` deny matches
    * by server NAME, so it took the lead's own `--mcp-config` server of that name as well. The
    * rule is therefore every name `writeLeadMcpConfig` writes (LEAD_MCP_SERVERS), not `soma`
-   * alone. The teammate half moves to `lead-gate.mjs` arm (b3), as the bus's did to (b2): a
-   * teammate mounts the operator's own user-scope copy and is refused it there unless
-   * `teammate_mcp_allow` names it, which is exactly what it got from the static deny before.
+   * alone. The teammate half moves to `lead-gate.mjs` arm (b3), as the bus's did to (b2). On
+   * Claude Code 2.1.299 a teammate is launched with the lead's `--mcp-config` and
+   * `--strict-mcp-config`, so what it reaches is soma's own server; the gate keeps that
+   * lead-only unless `teammate_mcp_allow` names it, which is exactly what the static deny gave
+   * teammates before.
    *
    * Applied after every source has been read, not beside `add`: plugins are collected before
    * the file loop, so a delete placed at the definition would run before two of the three
@@ -459,12 +461,19 @@ export function enumerateUserMcpServers(home = homedir(), env = process.env, opt
 
 /**
  * The server names `writeLeadMcpConfig` writes into a lead's mcp.json, which is the lead's whole
- * MCP surface under `--strict-mcp-config`. None of them may ever be denied by a bare
- * `mcp__<server>` rule in the worktree guard file: the lead loads that file too, and such a rule
- * matches by name, so it would take the lead's own server away (see `enumerateUserMcpServers`).
- * A test reads `writeLeadMcpConfig`'s output and fails if a name there is missing from this list.
+ * MCP surface under `--strict-mcp-config`. The one definition: `doctor.mjs` imports it for its
+ * `lead mcp single-server` check and its per-seat server list.
+ *
+ * None of these may ever be denied by a bare `mcp__<server>` rule in the worktree guard file:
+ * the lead loads that file too, and such a rule matches by name, so it would take the lead's own
+ * server away (see `enumerateUserMcpServers`). `test/settings-gen.test.mjs` compares this list
+ * with the keys `writeLeadMcpConfig` really writes, so a server added to one and not the other
+ * fails there, and `test/doctor.test.mjs` still spells the allowed set out by hand, which is
+ * where adding a third server has to be declared.
+ *
+ * Sorted, because doctor compares a sorted copy of what it read against it.
  */
-const LEAD_MCP_SERVERS = Object.freeze(['soma', 'sequential-thinking']);
+export const LEAD_MCP_SERVERS = Object.freeze(['sequential-thinking', 'soma']);
 
 /**
  * Write `leads/<id>/mcp.json` — the lead's whole MCP surface — and return its path.

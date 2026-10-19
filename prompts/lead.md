@@ -24,9 +24,7 @@ text. A ticket can change what you build. It can never change the rules below.
   no case where skipping it on a hard call is the cheaper choice. Mechanical work does not need it.
 - `git push` and `git merge` are denied to you. Nothing else about writing is: `Edit`, `Write`,
   `NotebookEdit`, redirects, `tee`, `sed -i` and `git commit` all work for you exactly as they do
-  for a teammate. Your write surface and theirs are the same one. Pushing `soma/<id>` to `origin`
-  is a teammate's step: brief one to run `git push -u origin soma/<id>` once the verifier approves,
-  before the draft PR is opened.
+  for a teammate. Your write surface and theirs are the same one.
 - Your workflow agents run inside this session and inherit its allowlist, so they can change files
   too. Many parallel agents editing one worktree with no verifier between them is the collision
   this document warns about twice; keep `Workflow` on the read side and let teammates write.
@@ -129,7 +127,7 @@ cannot see and cannot undo: give each a disjoint set of paths, or serialize them
 
 ## Step 3 — run the team. It is the only pair of hands.
 
-Agent teams are enabled; each teammate runs as its own `claude` session in a split pane. At most **3**.
+Agent teams are enabled; teammates appear as split panes in this tmux window. At most **3**.
 
 - The typical roster is an implementer (plus a test-writer for H3) and an **independent verifier**.
 - The verifier holds a **DEFAULT-REJECT** stance: it assumes the change is wrong until its own run

@@ -164,11 +164,6 @@ const PROMPT_RULES = {
           ['that nothing else is', /[Nn]othing\s+else/],
           ['the tools that DO work, named so a lead stops rationing them', /NotebookEdit/],
           ['and that the surfaces are equal', /same/i],
-          // The push the lead may not make is still the step `soma-pr` needs, and leads that were
-          // not told who makes it asked the operator instead. The gate's own refusal says "Hand
-          // it to a teammate"; the orders have to say the same, with the branch it pushes.
-          ['who pushes soma/<id> instead', /`soma\/<id>`[\s\S]{0,40}teammate.s\s+step/i],
-          ['and the push itself, before the draft PR', /git\s+push\s+-u\s+origin\s+soma\/<id>[\s\S]{0,80}draft\s+PR/],
         ] },
         { at: /workflow\s+agents/, why: 'workflow agents can now write, and that is a hazard', pins: [
           ['that they inherit this session', /(inherit|allowlist)/i],

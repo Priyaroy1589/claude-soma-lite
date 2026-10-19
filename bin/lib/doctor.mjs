@@ -95,7 +95,7 @@ import { SOMA_HOME, claudeConfigRoot, leadDir, p } from './paths.mjs';
 import { loadConfig } from './config.mjs';
 import { loadSeats, loggedIn, readSeatState, seatsPath } from './seats.mjs';
 import { loadHarnesses } from './harness.mjs';
-import { enumerateUserMcpServers, writeLeadSettings, writeWorktreeGuardrails } from './settings-gen.mjs';
+import { LEAD_MCP_SERVERS, enumerateUserMcpServers, writeLeadSettings, writeWorktreeGuardrails } from './settings-gen.mjs';
 // `buildLeadArgv` and `seatRoots` only — the lead's no-code ban is on argv now, and a check
 // that cannot see the mechanism it names is the "reports health it never measured" shape; and
 // the drift probe must enumerate from the seat list the spawner writes guard files from. Both
@@ -379,17 +379,17 @@ export const PROTECTED_CONTROLS = Object.freeze([
 export const LEAD_BANNED_TOOLS = Object.freeze(['Edit', 'NotebookEdit', 'Write']);
 
 /**
- * The servers a lead's `mcp.json` may name — **doctor's own spelling of them**, for the
- * reason `LEAD_BANNED_TOOLS` is one: a re-export of what `settings-gen.writeLeadMcpConfig`
- * writes would let a third server join both sides of `lead mcp single-server` at once.
- * `test/doctor.test.mjs` pins this list equal to the servers the generator really writes,
- * which is where adding one is declared. `soma` is the lead's own bus; `sequential-thinking`
- * is stateless and carries no credential (`writeLeadMcpConfig` says why that clears the
- * recursion guard).
- *
- * Sorted, because the check compares a sorted copy of what it read against it.
+ * The servers a lead's `mcp.json` may name. Defined once, in `settings-gen.mjs`, which also uses
+ * it to keep those names out of the guard file's deny list; re-exported here because the check
+ * below and its tests read it from doctor. It used to be a second, independent spelling, so that
+ * a third server could not join both sides of `lead mcp single-server` in one edit. That job now
+ * sits in the tests: `test/doctor.test.mjs` spells the allowed set out by hand
+ * (`['soma', 'sequential-thinking']` passes, any third name fails), and
+ * `test/settings-gen.test.mjs` pins this list to what `writeLeadMcpConfig` writes. `soma` is the
+ * lead's own bus; `sequential-thinking` is stateless and carries no credential
+ * (`writeLeadMcpConfig` says why that clears the recursion guard).
  */
-export const LEAD_MCP_SERVERS = Object.freeze(['sequential-thinking', 'soma']);
+export { LEAD_MCP_SERVERS };
 
 /**
  * The published check names, in report order.

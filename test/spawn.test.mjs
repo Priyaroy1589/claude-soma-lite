@@ -194,7 +194,6 @@ test('every pin is its own argv element, so no pin can be one joined word', () =
     ['--mcp-config', '/m.json'],
     ['--append-system-prompt-file', '/std.md'],
     ['--session-id', 'u1'],
-    ['--teammate-mode', 'tmux'],
   ]) {
     assert.equal(countOf(argv, flag), 1, `${flag} must appear exactly once as its own element`);
     assert.equal(argAfter(argv, flag), value, `${flag} must be followed by ${value}`);
@@ -240,28 +239,6 @@ test('the launch token and the watchdog pin agree on the id claude really resolv
   // someone sharpened the pin (`LEAD_MODEL = 'claude-opus-5'`) — update the comment, not this.
   assert.equal(modelDeviation({ last_model: 'claude-opus-4-5', models: ['claude-opus-4-5'] }, s.LEAD_MODEL).deviated, false,
     'the within-family blind spot documented on LEAD_MODEL has changed');
-});
-
-/**
- * Teammates run in their own process, on a fresh spawn and on a resume alike.
- *
- * MEASURED on Claude Code 2.1.299, with a lead launched the way `launch` launches one (inside
- * tmux, under `env -i`, so `TMUX` is gone): under the default teammate mode the lead's teammates
- * ran IN-PROCESS, and an in-process teammate's PreToolUse payload carries the LEAD's session id.
- * `lead-gate.mjs` tells the lead from a teammate by session id alone, so it read every teammate
- * as the lead and refused its `git push -u origin soma/<id>` with "leads may not push or merge".
- * With `--teammate-mode tmux` each teammate is its own `claude` process with its own session id,
- * and the same push went through. The flag also beat a settings file saying
- * `"teammateMode": "in-process"`, which is what makes it a pin rather than a default.
- */
-test('buildLeadArgv pins --teammate-mode tmux, so a teammate is never the lead to the gate', () => {
-  const base = { id: 'cr-1', sessionUuid: 'u1', brief: 'b', settingsPath: '/s.json', mcpPath: '/m.json', standingPath: '/std.md' };
-  for (const argv of [s.buildLeadArgv(base), s.buildLeadArgv({ ...base, resume: true })]) {
-    assert.equal(countOf(argv, '--teammate-mode'), 1);
-    assert.equal(argAfter(argv, '--teammate-mode'), 'tmux',
-      'an in-process teammate shares the lead\'s session id, so the gate refuses its push as the lead\'s');
-    assert.ok(argv.indexOf('--teammate-mode') < argv.indexOf('--'), 'a flag after -- is part of the brief, not a flag');
-  }
 });
 
 test('the -- guard closes the argv, so variadic --mcp-config cannot swallow the brief', () => {

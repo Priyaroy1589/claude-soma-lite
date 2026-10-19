@@ -2144,9 +2144,11 @@ test('arm (b2): the lead may reach its bus, a teammate may not, under both regis
  * `mcp__sequential-thinking` deny (the operator has a server of that name at user scope), the
  * lead loads that file, and a bare server deny matches by name, so every lead lost the tool its
  * standing orders make mandatory. The static deny is gone for the reason `soma`'s went (see
- * `settings-gen.enumerateUserMcpServers`), and this arm keeps the teammate half of it: a teammate
- * does not inherit `--mcp-config`, mounts the operator's own user-scope copy, and gets it only
- * when `teammate_mcp_allow` names it, which reaches the gate as `SOMA_TEAMMATE_MCP_ALLOW`.
+ * `settings-gen.enumerateUserMcpServers`), and this arm keeps the teammate half of it. On Claude
+ * Code 2.1.299 a teammate is launched with the lead's `--mcp-config` and `--strict-mcp-config`,
+ * so it reaches soma's own server; it may call it only when `teammate_mcp_allow` names it, which
+ * reaches the gate as `SOMA_TEAMMATE_MCP_ALLOW`. An in-process teammate carries the lead's
+ * session id, so to this arm it is the lead, as the lead's own subagents are.
  */
 test('arm (b3): the lead may reach sequential-thinking, a teammate only when teammate_mcp_allow names it', async () => {
   const { evaluateGate } = await gate();
@@ -2190,27 +2192,6 @@ test('arm (b3): the lead may reach sequential-thinking, a teammate only when tea
     assert.deepEqual(evaluateGate({ tool_name: tool, session_id: 'TEAMMATE', tool_input: {} }, LEAD_ENV, never), {},
       `${tool} is settings' business — this arm must neither allow nor deny it`);
   }
-});
-
-/**
- * Why `spawn.buildLeadArgv` pins `--teammate-mode tmux`, stated as what the gate can and cannot
- * see. MEASURED on Claude Code 2.1.299, a real lead launched the way the spawner launches one
- * (inside tmux, under `env -i`, so `TMUX` is gone): with the default teammate mode the teammate
- * runs IN-PROCESS, and its PreToolUse payload carries the LEAD's `session_id`, with
- * `agent_id: "a<name>-<hex>"` and `agent_type: "<name>"`. Its `git push -u origin soma/<id>` was
- * refused with arm (d)'s "leads may not push or merge" — the gate cannot tell that teammate from
- * the lead or from the lead's own subagents. With `--teammate-mode tmux` the teammate is its own
- * `claude` process with its own session id, and the same push went through.
- */
-test('arm (d): a split-pane teammate may push the lead\'s branch; the lead and its in-process workers may not', async () => {
-  const { evaluateGate } = await gate();
-  const never = () => false;
-  const push = 'git push -u origin soma/cr-1';
-  assert.deepEqual(evaluateGate(mateBash(push), LEAD_ENV, never), {}, 'a teammate in its own session must be able to push soma/<id>');
-  assert.match(evaluateGate(bash(push), LEAD_ENV, never).permissionDecisionReason ?? '', /push or merge/);
-  const inProcess = { ...bash(push), agent_id: 'apusher-0123456789abcdef', agent_type: 'pusher' };
-  assert.equal(evaluateGate(inProcess, LEAD_ENV, never).permissionDecision, 'deny',
-    'an in-process worker carries the lead\'s session id, so it IS the lead to this gate — which is why teammates must run in their own process');
 });
 
 test('lead-gate the process: deny is the documented envelope, everything else is silence', async () => {

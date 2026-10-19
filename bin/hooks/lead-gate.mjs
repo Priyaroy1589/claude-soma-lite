@@ -20,9 +20,6 @@
  *   3. **The lead's push/merge ban** — all that remains of the old lead-only
  *      write-idiom arm, now that a lead's shell-write surface matches a teammate's:
  *      `git push` and `git merge`, in every global-option spelling, lead only.
- *      "Lead" means the lead's session id, so the lead's in-process workers count as the
- *      lead; that is why `spawn.buildLeadArgv` pins `--teammate-mode tmux`, which keeps
- *      every teammate in its own session and lets it push `soma/<id>`.
  *      (Two retired arms once sat beside it: the session-discriminated edit ban,
  *      switched on by a `--session-guard` registration argument, and the full
  *      write-idiom ban whose `WRITE_IDIOMS`/`GIT_VERB` machinery stays below purely
@@ -1975,12 +1972,19 @@ export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
    * bus in (b2), same fix: the enumeration no longer emits a deny for any server the lead's own
    * mcp.json serves, and the teammate half moves here, where the session id tells them apart.
    *
-   * A teammate does not inherit `--mcp-config`, so what it would call is the operator's own
-   * user-scope copy, which soma did not write and has not vetted. It gets it exactly when it got
-   * it before: when `teammate_mcp_allow` names the server. The spawner hands that list to every
-   * lead as `SOMA_TEAMMATE_MCP_ALLOW` (`spawn.buildLeadEnv`), and teammates inherit the lead's
+   * What a teammate would call is soma's own server: on Claude Code 2.1.299 a teammate is
+   * launched with every `--mcp-config` the lead has, plus `--strict-mcp-config`, and the lead's
+   * `--settings` (an in-process teammate shares the lead's connection outright). So this arm's
+   * job is to keep that server lead-only, as the static deny did for every teammate before, and
+   * to hand it to teammates exactly when it was handed before: when `teammate_mcp_allow` names
+   * `sequential-thinking`. The spawner passes that list to every lead as
+   * `SOMA_TEAMMATE_MCP_ALLOW` (`spawn.buildLeadEnv`), and teammates inherit the lead's
    * environment. Fails CLOSED on an unidentifiable session, as (b2) does, and never touches any
    * other server: those stay the settings file's business.
+   *
+   * "Teammate" here means a teammate in its own session. An in-process teammate (Claude Code's
+   * built-in default `teammateMode`) carries the lead's session id, as the lead's subagents do,
+   * so to this arm it is the lead and keeps the tool; the session id is all the gate can see.
    */
   if (REASONING_TOOL.test(tool) && !isLead && !teammateAllowed(env, REASONING_SERVER)) {
     return deny('soma: the sequential-thinking server in this worktree belongs to the lead session.'
@@ -2017,14 +2021,6 @@ export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
     // discriminator under BOTH registrations (a teammate is unaffected). Push/merge are also
     // denied fleet-wide by the worktree deny list (protected-branch push, `gh pr merge`), so
     // this is deliberately redundant defence on the one surface a lead keeps closed.
-    //
-    // "A teammate is unaffected" holds only for a teammate in its OWN session. MEASURED on
-    // Claude Code 2.1.299: an IN-PROCESS teammate's payload carries the lead's `session_id`
-    // (plus `agent_id`/`agent_type`, exactly like the lead's own subagents), so this arm refused
-    // its `git push -u origin soma/<id>` as the lead's. A lead launched under `env -i` has no
-    // `TMUX`, so the default teammate mode put every teammate in-process. `spawn.buildLeadArgv`
-    // pins `--teammate-mode tmux` for that reason; the payload cannot tell such a teammate from
-    // a subagent reliably, so the fix is to never have one rather than to guess here.
     if (isLead && LEAD_PUSH_MERGE.test(cmd)) {
       return deny('soma: leads may not push or merge through the shell. Hand it to a teammate.');
     }

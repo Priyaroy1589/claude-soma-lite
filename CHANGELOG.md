@@ -42,19 +42,11 @@ Work tracked as GitHub issues, newest first.
   The lead loads that file too, and a deny by server name matches the lead's own `--mcp-config`
   server of the same name, so the tool the lead prompt makes mandatory was gone. The guard file no
   longer denies any server the lead's `mcp.json` serves (`soma` was already left out for the same
-  reason). Teammates still get the operator's copy only when `teammate_mcp_allow` names it: the
-  PreToolUse gate now refuses it to every other session (arm b3), reading the list from
-  `SOMA_TEAMMATE_MCP_ALLOW`, which the spawner sets from `soma.json`. A lead spawned or resumed
-  before this change keeps its old guard file until its next spawn or resume.
-- **A teammate can push its lead's branch.** Leads start under `env -i`, so `TMUX` is gone, and
-  with Claude Code's default teammate mode their teammates ran in-process. An in-process
-  teammate's hook payload carries the lead's session id, so the gate took it for the lead and
-  refused `git push -u origin soma/<id>` with "leads may not push or merge". Leads now start with
-  `--teammate-mode tmux`, so every teammate is its own session; measured on Claude Code 2.1.299,
-  the same push then goes through, and the flag wins over a `teammateMode` setting. The lead and
-  its own subagents still may not push or merge, and protected-branch, force and delete pushes
-  stay denied for everyone. The lead prompt now says that a teammate pushes `soma/<id>` before
-  the draft PR is opened.
+  reason). A teammate in its own session still gets the server only when `teammate_mcp_allow`
+  names it: the PreToolUse gate now refuses it to every other session (arm b3), reading the list
+  from `SOMA_TEAMMATE_MCP_ALLOW`, which the spawner sets from `soma.json`. A worktree spawned or
+  resumed before this change keeps the old deny in its guard file until the lead's next spawn or
+  resume, and until then `soma doctor` reports it under `mcp deny drift`.
 - **A compacted lead is told how to re-orient again** (#13). `lead-postcompact.mjs` was written for
   `PostCompact` and nothing registered it, and registering it would not have helped: measured on
   Claude Code 2.1.296, `PostCompact` has no `additionalContext` channel. Its `hookSpecificOutput`

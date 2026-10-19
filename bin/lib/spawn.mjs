@@ -10,7 +10,7 @@
  * and looks exactly like a healthy one. That is why this module is composed of refusals
  * rather than best-effort steps, and why the comments record what was measured.
  *
- * The six properties, and what enforces each:
+ * The five properties, and what enforces each:
  *
  *   model + effort   `--model opus --effort max`, plus `CLAUDE_CODE_EFFORT_LEVEL=max`,
  *                    because effort `max` cannot persist in settings.json and the operator's
@@ -28,8 +28,6 @@
  *                    stateless `sequential-thinking` for the lead, and the worktree guard
  *                    file's deny list for its teammates. The guard file never denies those
  *                    two names (the lead loads it too); the gate holds them for the lead.
- *   own teammates    `--teammate-mode tmux`: each teammate is a `claude` process with its own
- *                    session id, which is what lets the gate tell it from the lead.
  *   scrubbed env     `env -i` plus ENV_ALLOW (applied by `tmux.newSession`). The operator's
  *                    exported API keys never reach a lead, a teammate, or a workflow agent.
  *   its own cwd      the lead's worktree, which is what keeps ten leads in ten
@@ -711,17 +709,6 @@ const trustFileFor = (env) => resolve(join(env?.CLAUDE_CONFIG_DIR || env?.HOME |
  * coexist: measured against real Claude Code with the bypass flag set, a `permissions.deny`
  * rule still returned `Permission to use Bash with command … has been denied.` The bypass
  * removes the *prompts* — which is the point, since nobody is attached — not the rules.
- *
- * `--teammate-mode tmux` keeps every teammate in its own `claude` process. MEASURED on Claude
- * Code 2.1.299 with a lead launched exactly this way (in tmux, under `env -i`, so `TMUX` is
- * gone): the default mode ran teammates IN-PROCESS, and an in-process teammate's PreToolUse
- * payload carries the LEAD's session id. `lead-gate.mjs` tells a lead from a teammate by session
- * id, so it refused such a teammate's `git push -u origin soma/<id>` as the lead's own; the
- * delivery path ("hand the push to a teammate") was closed for every operator who had not set
- * `teammateMode` themselves. With this flag the teammate gets its own session id and the same
- * push went through, and the flag also won over a settings file saying `"in-process"`. The
- * teammate appears in a tmux server of its own (`tmux -L claude-swarm-<pid>`), because the lead
- * has no `TMUX` to split.
  */
 export function buildLeadArgv({ id, sessionUuid, brief, settingsPath, mcpPath, standingPath, resume = false } = {}) {
   leadId(id, 'buildLeadArgv');
@@ -743,7 +730,6 @@ export function buildLeadArgv({ id, sessionUuid, brief, settingsPath, mcpPath, s
     '--settings', settingsPath,
     '--mcp-config', mcpPath,
     '--strict-mcp-config',
-    '--teammate-mode', 'tmux',
     '--append-system-prompt-file', standingPath,
     '--remote-control', name,
     '--', brief,
@@ -819,6 +805,11 @@ export function buildLeadEnv({ id, sessionUuid, teammateEffort, teammateMcpAllow
   // which is the only way a value set here reaches their hooks. Injected from the config, never
   // copied from the spawner's environment; a name with a comma in it cannot be told apart inside
   // the list, so it is dropped, and an empty list sets nothing.
+  //
+  // Not a secrets boundary, and not tamper-proof: a split-pane teammate (an operator's own
+  // `teammateMode: tmux`) is started through the login shell, so a shell startup file a teammate
+  // wrote can set this variable for later teammates. The most that buys them is soma's own
+  // stateless reasoning server, which is why a variable is good enough here.
   const handedBack = Array.isArray(teammateMcpAllow)
     ? teammateMcpAllow.filter((name) => typeof name === 'string' && name !== '' && !name.includes(','))
     : [];
