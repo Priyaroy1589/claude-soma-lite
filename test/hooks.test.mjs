@@ -2082,9 +2082,11 @@ test('evaluateGate is total over junk input and loud about a missing predicate',
  * The static deny cannot be the fix, because it cannot discriminate: lead and teammates share
  * one cwd, so one file binds both. Same wall the Bash arm hit, same answer — the session id.
  *
- * And the exposure is real, not theoretical: a teammate does not inherit `--mcp-config`, so it
- * falls back to discovery and mounts the user-scope bus as a CANDIDATE, which carries
- * `soma_adopt`. A teammate could take the orchestrator lease.
+ * And the exposure is real, not theoretical. On claude 2.1.220 a teammate did not inherit
+ * `--mcp-config`, fell back to discovery and mounted the user-scope bus as a CANDIDATE, which
+ * carries `soma_adopt`, so it could take the orchestrator lease. On Claude Code 2.1.299 a teammate
+ * is launched with the lead's `--mcp-config`, `--strict-mcp-config` and `--settings`, so it mounts
+ * the lead's own bus, in the lead role, and could report as the lead.
  */
 test('arm (b2): the lead may reach its bus, a teammate may not, under both registrations', async () => {
   const { evaluateGate } = await gate();

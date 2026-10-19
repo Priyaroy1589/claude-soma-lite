@@ -407,12 +407,14 @@ export function enumerateUserMcpServers(home = homedir(), env = process.env, opt
    * promoted; this list must read user scope or it misses the servers it exists to deny.
    * Nobody had connected them.
    *
-   * **The teammate exposure is real and is handled where it can be:** a teammate does not
-   * inherit `--mcp-config`, falls back to discovery, and mounts the user-scope bus as a
-   * CANDIDATE — `soma_adopt` and `soma_status`. It could take the orchestrator lease. A static
-   * deny cannot express "the lead may, a teammate may not", because they share one cwd and
-   * therefore one settings file. `bin/hooks/lead-gate.mjs` arm (b2) does express it, using the
-   * session id — the same discriminator, and the same reasoning, as the Bash arm.
+   * **The teammate exposure is real and is handled where it can be.** On claude 2.1.220 a
+   * teammate did not inherit `--mcp-config`, fell back to discovery, and mounted the user-scope
+   * bus as a CANDIDATE — `soma_adopt` and `soma_status` — so it could take the orchestrator
+   * lease. On Claude Code 2.1.299 a teammate is launched with the lead's `--mcp-config`,
+   * `--strict-mcp-config` and `--settings`, so it mounts the lead's own bus, in the lead role,
+   * instead. A static deny cannot express "the lead may, a teammate may not", because they share
+   * one cwd and therefore one settings file. `bin/hooks/lead-gate.mjs` arm (b2) does express it,
+   * using the session id — the same discriminator, and the same reasoning, as the Bash arm.
    *
    * So do not "tidy" this back in. A green suite would not tell you: the tests that would
    * redden are the gate's, not this file's.

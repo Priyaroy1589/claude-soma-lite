@@ -1929,11 +1929,14 @@ export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
    * Bash, and the same answer applies — the session id is the only discriminator, and this
    * hook is the only place that has it.
    *
-   * **And the exposure this replaces is real, not theoretical.** A teammate does not inherit
-   * `--mcp-config`/`--strict-mcp-config` (measured during the build), so it falls back to
-   * normal discovery and mounts the *user-scope* bus, which carries no `SOMA_ROLE` and is
-   * therefore a **candidate**: `soma_adopt` and `soma_status`. A teammate could take the
-   * orchestrator lease. So the deny stays; it just moves to where roles are distinguishable.
+   * **And the exposure this replaces is real, not theoretical.** Measured during the build on
+   * claude 2.1.220, a teammate did not inherit `--mcp-config`/`--strict-mcp-config`, fell back
+   * to normal discovery and mounted the *user-scope* bus, which carries no `SOMA_ROLE` and is
+   * therefore a **candidate**: `soma_adopt` and `soma_status`, so a teammate could take the
+   * orchestrator lease. On Claude Code 2.1.299 a teammate is launched with the lead's
+   * `--mcp-config`, `--strict-mcp-config` and `--settings` instead, so it mounts the lead's own
+   * bus, in the lead role, and could report as the lead. Either way the deny stays; it just
+   * moves to where roles are distinguishable.
    *
    * Placed AFTER arm (a), which deliberately carves bus tools OUT of the budget breaker so a
    * tripped lead can still file COMPLETED or ERROR. A tripped lead returns `{}` there and
