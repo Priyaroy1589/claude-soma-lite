@@ -2368,7 +2368,7 @@ test('the seat probes read the real filesystem: dir state, login, realpath, and 
   mkdirSync(join(seatB, 'projects'));
   writeFileSync(join(seatA, '.claude.json'), JSON.stringify({
     oauthAccount: { emailAddress: 'a@example.com' },
-    mcpServers: { soma: { command: 'node' }, 'seat-only-a': {} },
+    mcpServers: { soma: { command: 'node' }, 'sequential-thinking': { command: 'npx' }, 'seat-only-a': {} },
     projects: { '/w': { mcpServers: { 'seat-proj-a': {} } } },
   }));
   writeFileSync(join(seatB, '.claude.json'), JSON.stringify({ mcpServers: {} }));
@@ -2398,7 +2398,11 @@ test('the seat probes read the real filesystem: dir state, login, realpath, and 
   assert.ok(cov.union.includes('seat-proj-a'), 'per-project servers in a seat file are part of the union');
   assert.ok(cov.union.includes('extra_mcp'), 'the fixed pair is still read');
   assert.equal(cov.union.includes('soma'), false);
-  assert.deepEqual(cov.seats[0].own.servers.slice().sort(), ['seat-only-a', 'seat-proj-a'], 'own must drop soma — init registers the bus in every seat');
+  // `sequential-thinking` is the lead's other server: the enumeration drops it so the guard file
+  // cannot deny it to the lead, and `own` has to drop it too, or a seat that defines it reads as
+  // a server the enumeration missed and this check FAILs a healthy pool.
+  assert.equal(cov.union.includes('sequential-thinking'), false, 'the guard file would deny the lead its own reasoning server');
+  assert.deepEqual(cov.seats[0].own.servers.slice().sort(), ['seat-only-a', 'seat-proj-a'], 'own must drop soma and sequential-thinking, the two servers the lead itself serves');
   assert.deepEqual(cov.seats[1].own, { servers: [] });
   assert.deepEqual(cov.seats[2].own, { servers: [], absent: true });
   // …and `mcp deny drift`'s subject is the SAME enumeration, read through the probe that check

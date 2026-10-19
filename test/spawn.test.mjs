@@ -433,6 +433,26 @@ test('buildLeadEnv sets SOMA_LEAD_SESSION_UUID, which is what tells a lead from 
   assert.ok(!('SOMA_LEAD_SESSION_UUID' in without), 'absent rather than the string "undefined", which would match a session id never minted');
 });
 
+/**
+ * `teammate_mcp_allow` reaches the gate. The lead's reasoning server is no longer denied in the
+ * worktree guard file (the lead loads that file, and a bare server deny would take its own server
+ * away), so `lead-gate.mjs` refuses it to teammates unless the operator's allowlist names it. The
+ * gate reads the list from the environment every teammate inherits from its lead.
+ */
+test('buildLeadEnv carries teammate_mcp_allow as SOMA_TEAMMATE_MCP_ALLOW, and nothing when it is empty', () => {
+  const env = s.buildLeadEnv({ id: 'cr-1', env: SPAWNER_ENV, teammateMcpAllow: ['playwright', 'sequential-thinking'] });
+  assert.equal(env.SOMA_TEAMMATE_MCP_ALLOW, 'playwright,sequential-thinking');
+  for (const empty of [undefined, null, [], 'sequential-thinking', {}, ['', 42, null]]) {
+    const none = s.buildLeadEnv({ id: 'cr-1', env: SPAWNER_ENV, teammateMcpAllow: empty });
+    assert.ok(!('SOMA_TEAMMATE_MCP_ALLOW' in none), `${JSON.stringify(empty)} names no server, so the variable is absent`);
+  }
+  // A name that cannot be told apart inside a comma list is dropped rather than split in two.
+  assert.equal(s.buildLeadEnv({ id: 'cr-1', env: SPAWNER_ENV, teammateMcpAllow: ['a,b', 'kite'] }).SOMA_TEAMMATE_MCP_ALLOW, 'kite');
+  // Injected, never copied: a value in the spawner's own environment does not reach the lead.
+  const copied = s.buildLeadEnv({ id: 'cr-1', env: { ...SPAWNER_ENV, SOMA_TEAMMATE_MCP_ALLOW: 'sequential-thinking' } });
+  assert.ok(!('SOMA_TEAMMATE_MCP_ALLOW' in copied), 'the allowlist comes from soma.json, not from whoever ran the spawner');
+});
+
 test('SOMA_HOME reaches the lead resolved and identical to what the bus config records', () => {
   const env = s.buildLeadEnv({ id: 'cr-1', env: { ...SPAWNER_ENV, SOMA_HOME: `${SOMA_HOME()}/` } });
   assert.equal(env.SOMA_HOME, SOMA_HOME(),
@@ -748,6 +768,20 @@ test('spawnLead and resumeLead hand lead_branch_push to the gate through the lea
       assert.ok(!('SOMA_LEAD_BRANCH_PUSH' in launch(off, resume)), `resume=${resume}: ${JSON.stringify(off)} must keep the old rule`);
     }
   }
+});
+
+test('spawnLead and resumeLead hand the configured teammate_mcp_allow to the gate through the lead env', () => {
+  const allow = () => ({ ...CFG, teammate_mcp_allow: ['sequential-thinking'] });
+  const fresh = harness({ loadConfig: allow });
+  s.spawnLead({ id: 'cr-1', repo: 'r', brief: 'do x' }, fresh.deps);
+  assert.equal(fresh.calls.newSession[0].env.SOMA_TEAMMATE_MCP_ALLOW, 'sequential-thinking',
+    'a spawner that drops the allowlist takes the reasoning server off every teammate the operator handed it to');
+  const again = harness({ loadConfig: allow });
+  s.resumeLead(RESUMABLE, again.deps);
+  assert.equal(again.calls.newSession[0].env.SOMA_TEAMMATE_MCP_ALLOW, 'sequential-thinking', 'a resume must carry it too');
+  const none = harness();
+  s.spawnLead({ id: 'cr-1', repo: 'r', brief: 'do x' }, none.deps);
+  assert.ok(!('SOMA_TEAMMATE_MCP_ALLOW' in none.calls.newSession[0].env), 'an empty allowlist hands nothing back');
 });
 
 test('a bad task id is refused before a worktree, a trust mark or a session exists', () => {

@@ -14,7 +14,9 @@
  *      and refused to everything else in the worktree: a teammate that mounted the
  *      user-scope bus would hold the role-less CANDIDATE surface, which carries
  *      `soma_adopt` — the orchestrator lease. Fails CLOSED on an unidentifiable
- *      session; arm (b2) below states why that is safe.
+ *      session; arm (b2) below states why that is safe. The lead's other server,
+ *      `sequential-thinking`, is held the same way (arm b3): the lead always, a teammate
+ *      only when `teammate_mcp_allow` names it.
  *   3. **The lead's push/merge ban** — all that remains of the old lead-only
  *      write-idiom arm, now that a lead's shell-write surface matches a teammate's:
  *      `git push` and `git merge`, in every global-option spelling, lead only. One
@@ -114,6 +116,25 @@ const LEAD_RE = /^[a-z][a-z0-9-]{0,63}$/;
  * exactly like a lead that died. None of the three bus tools touch a repo.
  */
 const BUS_TOOL = /^mcp__soma__/;
+
+/**
+ * The lead's other MCP server, and its tools: `settings-gen.writeLeadMcpConfig` writes exactly two
+ * servers into a lead's mcp.json, `soma` and this one. Spelled here rather than imported, because
+ * this module stays dependency-free. Arm (b3) is its whole use.
+ */
+const REASONING_SERVER = 'sequential-thinking';
+const REASONING_TOOL = /^mcp__sequential-thinking__/;
+
+/**
+ * Has the operator handed `server` back to teammates? `SOMA_TEAMMATE_MCP_ALLOW` is soma.json's
+ * `teammate_mcp_allow`, comma-joined by `spawn.buildLeadEnv` and inherited by every teammate from
+ * its lead. Exact names only, so `sequential-thinking-x` does not name `sequential-thinking`;
+ * anything that is not a string names nothing.
+ */
+function teammateAllowed(env, server) {
+  const list = env?.SOMA_TEAMMATE_MCP_ALLOW;
+  return typeof list === 'string' && list.split(',').some((name) => name.trim() === server);
+}
 
 /**
  * Shell idioms that write without a redirect operator.
@@ -1858,7 +1879,7 @@ const CLAUDE_DENY = 'soma: .claude/ configures the agent harness itself — the 
 
 /**
  * Is this call the lead's own? The one discriminator between a lead and its teammates, asked by
- * `evaluateGate` (arms b2 and d) and by `budgetWarning` through this one function, so no two arms
+ * `evaluateGate` (arms b2, b3 and d) and by `budgetWarning` through this one function, so no two arms
  * can ever disagree about who the lead is. Its shape is argued in full by the comment inside, which
  * stays with the expression it explains.
  */
@@ -1989,11 +2010,14 @@ export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
    * Bash, and the same answer applies — the session id is the only discriminator, and this
    * hook is the only place that has it.
    *
-   * **And the exposure this replaces is real, not theoretical.** A teammate does not inherit
-   * `--mcp-config`/`--strict-mcp-config` (measured during the build), so it falls back to
-   * normal discovery and mounts the *user-scope* bus, which carries no `SOMA_ROLE` and is
-   * therefore a **candidate**: `soma_adopt` and `soma_status`. A teammate could take the
-   * orchestrator lease. So the deny stays; it just moves to where roles are distinguishable.
+   * **And the exposure this replaces is real, not theoretical.** Measured during the build on
+   * claude 2.1.220, a teammate did not inherit `--mcp-config`/`--strict-mcp-config`, fell back
+   * to normal discovery and mounted the *user-scope* bus, which carries no `SOMA_ROLE` and is
+   * therefore a **candidate**: `soma_adopt` and `soma_status`, so a teammate could take the
+   * orchestrator lease. On Claude Code 2.1.299 a teammate is launched with the lead's
+   * `--mcp-config`, `--strict-mcp-config` and `--settings` instead, so it mounts the lead's own
+   * bus, in the lead role, and could report as the lead. Either way the deny stays; it just
+   * moves to where roles are distinguishable.
    *
    * Placed AFTER arm (a), which deliberately carves bus tools OUT of the budget breaker so a
    * tripped lead can still file COMPLETED or ERROR. A tripped lead returns `{}` there and
@@ -2019,6 +2043,37 @@ export function evaluateGate(input, env, flagExists, realpath = realpathSync) {
         + ' scope gets the CANDIDATE tool set, which carries soma_adopt — it could take the'
         + ' orchestrator lease out from under the operator. Report through the lead: finish your'
         + ' work, and the lead files soma_report.');
+  }
+
+  /**
+   * (b3) **The lead's reasoning server belongs to the lead, and to a teammate only when the
+   * operator hands it over.**
+   *
+   * MEASURED on a live fleet: the operator also had a `sequential-thinking` server at user
+   * scope, so `settings-gen` wrote a bare `mcp__sequential-thinking` deny into every worktree
+   * guard file, the lead loads that file, and a bare server deny matches by name — so every lead
+   * lost the tool its standing orders make mandatory before a hard call. Same mechanism as the
+   * bus in (b2), same fix: the enumeration no longer emits a deny for any server the lead's own
+   * mcp.json serves, and the teammate half moves here, where the session id tells them apart.
+   *
+   * What a teammate would call is soma's own server: on Claude Code 2.1.299 a teammate is
+   * launched with every `--mcp-config` the lead has, plus `--strict-mcp-config`, and the lead's
+   * `--settings` (an in-process teammate shares the lead's connection outright). So this arm's
+   * job is to keep that server lead-only, as the static deny did for every teammate before, and
+   * to hand it to teammates exactly when it was handed before: when `teammate_mcp_allow` names
+   * `sequential-thinking`. The spawner passes that list to every lead as
+   * `SOMA_TEAMMATE_MCP_ALLOW` (`spawn.buildLeadEnv`), and teammates inherit the lead's
+   * environment. Fails CLOSED on an unidentifiable session, as (b2) does, and never touches any
+   * other server: those stay the settings file's business.
+   *
+   * "Teammate" here means a teammate in its own session. An in-process teammate (Claude Code's
+   * built-in default `teammateMode`) carries the lead's session id, as the lead's subagents do,
+   * so to this arm it is the lead and keeps the tool; the session id is all the gate can see.
+   */
+  if (REASONING_TOOL.test(tool) && !isLead && !teammateAllowed(env, REASONING_SERVER)) {
+    return deny('soma: the sequential-thinking server in this worktree belongs to the lead session.'
+      + ' A teammate gets it only when the operator lists sequential-thinking in teammate_mcp_allow.'
+      + ' Reason the step through in your own words instead, or ask the lead to take the hard call.');
   }
 
   if (tool === 'Bash') {

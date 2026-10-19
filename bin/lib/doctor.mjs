@@ -95,7 +95,7 @@ import { SOMA_HOME, claudeConfigRoot, leadDir, p } from './paths.mjs';
 import { loadConfig } from './config.mjs';
 import { loadSeats, loggedIn, readSeatState, seatsPath } from './seats.mjs';
 import { loadHarnesses } from './harness.mjs';
-import { enumerateUserMcpServers, writeLeadSettings, writeWorktreeGuardrails } from './settings-gen.mjs';
+import { LEAD_MCP_SERVERS, enumerateUserMcpServers, writeLeadSettings, writeWorktreeGuardrails } from './settings-gen.mjs';
 // `buildLeadArgv` and `seatRoots` only — the lead's no-code ban is on argv now, and a check
 // that cannot see the mechanism it names is the "reports health it never measured" shape; and
 // the drift probe must enumerate from the seat list the spawner writes guard files from. Both
@@ -379,17 +379,17 @@ export const PROTECTED_CONTROLS = Object.freeze([
 export const LEAD_BANNED_TOOLS = Object.freeze(['Edit', 'NotebookEdit', 'Write']);
 
 /**
- * The servers a lead's `mcp.json` may name — **doctor's own spelling of them**, for the
- * reason `LEAD_BANNED_TOOLS` is one: a re-export of what `settings-gen.writeLeadMcpConfig`
- * writes would let a third server join both sides of `lead mcp single-server` at once.
- * `test/doctor.test.mjs` pins this list equal to the servers the generator really writes,
- * which is where adding one is declared. `soma` is the lead's own bus; `sequential-thinking`
- * is stateless and carries no credential (`writeLeadMcpConfig` says why that clears the
- * recursion guard).
- *
- * Sorted, because the check compares a sorted copy of what it read against it.
+ * The servers a lead's `mcp.json` may name. Defined once, in `settings-gen.mjs`, which also uses
+ * it to keep those names out of the guard file's deny list; re-exported here because the check
+ * below and its tests read it from doctor. It used to be a second, independent spelling, so that
+ * a third server could not join both sides of `lead mcp single-server` in one edit. That job now
+ * sits in the tests: `test/doctor.test.mjs` spells the allowed set out by hand
+ * (`['soma', 'sequential-thinking']` passes, any third name fails), and
+ * `test/settings-gen.test.mjs` pins this list to what `writeLeadMcpConfig` writes. `soma` is the
+ * lead's own bus; `sequential-thinking` is stateless and carries no credential
+ * (`writeLeadMcpConfig` says why that clears the recursion guard).
  */
-export const LEAD_MCP_SERVERS = Object.freeze(['sequential-thinking', 'soma']);
+export { LEAD_MCP_SERVERS };
 
 /**
  * The published check names, in report order.
@@ -1807,9 +1807,11 @@ const realpathOf = (fp) => {
 
 /**
  * One `.claude.json`'s own MCP server names — top-level `mcpServers` plus every
- * `projects[*].mcpServers`, the two scopes `enumerateUserMcpServers` reads — minus `soma`.
- * ENOENT is a live reading (the file defines nothing) and is marked `absent`; any other
- * failure is `{error}`, because a file that exists and will not open is not "defines nothing".
+ * `projects[*].mcpServers`, the two scopes `enumerateUserMcpServers` reads — minus the two
+ * servers the lead itself serves (LEAD_MCP_SERVERS), which the enumeration drops for the same
+ * reason: a bare deny in the guard file would take them off the lead. ENOENT is a live reading
+ * (the file defines nothing) and is marked `absent`; any other failure is `{error}`, because a
+ * file that exists and will not open is not "defines nothing".
  *
  * WHEN THE `{error}` ARMS ARE REACHED, measured. For a seat `soma.json` lists they are dead:
  * `seatMcpCoverage` evaluates `union: allPersonalServers()` first, `configFiles` joins
@@ -1841,7 +1843,7 @@ const ownMcpServers = (fp) => {
   const names = new Set();
   const add = (servers) => {
     if (servers === null || typeof servers !== 'object' || Array.isArray(servers)) return;
-    for (const name of Object.keys(servers)) if (name && name !== '__proto__' && name !== 'soma') names.add(name);
+    for (const name of Object.keys(servers)) if (name && name !== '__proto__' && !LEAD_MCP_SERVERS.includes(name)) names.add(name);
   };
   add(parsed.mcpServers);
   if (parsed.projects !== null && typeof parsed.projects === 'object' && !Array.isArray(parsed.projects)) {
@@ -2234,8 +2236,9 @@ export function defaultProbes(env = process.env) {
      * OWN servers read straight from its `.claude.json`. One enumeration, deliberately not a
      * second one built here from `seats`: this check exists to catch production reading fewer
      * roots than the pool has, and a union computed from this probe's own argument would pass
-     * while production's did not. `soma` is dropped from `own` for the reason the enumeration
-     * drops it: `soma init --seat` registers the bus in every seat and it must never be denied.
+     * while production's did not. `soma` and `sequential-thinking` are dropped from `own` for the
+     * reason the enumeration drops them: they are the lead's own servers, so the guard file must
+     * never deny them (and `soma init --seat` registers the bus in every seat).
      */
     seatMcpCoverage: (seats) => ({
       union: allPersonalServers(),
