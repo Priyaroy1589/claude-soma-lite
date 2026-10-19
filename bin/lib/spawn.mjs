@@ -26,7 +26,8 @@
  *                    no settings file may ever carry the old bare-name ban again.
  *   no personal MCP  `--strict-mcp-config` with a `--mcp-config` naming only `soma` and the
  *                    stateless `sequential-thinking` for the lead, and the worktree guard
- *                    file's deny list for its teammates.
+ *                    file's deny list for its teammates. The guard file never denies those
+ *                    two names (the lead loads it too); the gate holds them for the lead.
  *   scrubbed env     `env -i` plus ENV_ALLOW (applied by `tmux.newSession`). The operator's
  *                    exported API keys never reach a lead, a teammate, or a workflow agent.
  *   its own cwd      the lead's worktree, which is what keeps ten leads in ten
@@ -765,12 +766,15 @@ export function buildLeadArgv({ id, sessionUuid, brief, settingsPath, mcpPath, s
  * typo alike — so neither a config that has not been written nor one that was written wrong
  * can un-pin the fleet. `EFFORT_LEVELS` records why that direction is the safe one.
  *
+ * **`teammateMcpAllow`** — soma.json's `teammate_mcp_allow`, set as `SOMA_TEAMMATE_MCP_ALLOW` for
+ * the gate's arm (b3), which refuses the lead's reasoning server to teammates unless it is named.
+ *
  * **`configDir`** — a seat for THIS launch (account rotation, spec §3.3). It replaces the copied
  * `CLAUDE_CONFIG_DIR` and nothing else; `undefined`, `null` and `''` all mean "the spawner's own",
  * which is exactly what every lead got before seats existed. `seatConfigDir` says why each of
  * those three reads that way and why a relative dir is refused.
  */
-export function buildLeadEnv({ id, sessionUuid, teammateEffort, env = process.env, configDir } = {}) {
+export function buildLeadEnv({ id, sessionUuid, teammateEffort, teammateMcpAllow, env = process.env, configDir } = {}) {
   leadId(id, 'buildLeadEnv');
   const seat = seatConfigDir(configDir, 'buildLeadEnv');
   const out = {};
@@ -794,6 +798,22 @@ export function buildLeadEnv({ id, sessionUuid, teammateEffort, env = process.en
   // field, another fleet's orchestrator (issue #1).
   out.SOMA_TMUX_SOCKET = tmux.socketName();
   if (typeof sessionUuid === 'string' && sessionUuid !== '') out.SOMA_LEAD_SESSION_UUID = sessionUuid;
+  // soma.json's `teammate_mcp_allow`, for the one reader that cannot get it from the guard file:
+  // `lead-gate.mjs` arm (b3). The guard file no longer denies the lead's own reasoning server (the
+  // lead loads that file, and a bare server deny would take the server off the lead), so the gate
+  // refuses it to teammates unless this list names it. Teammates inherit the lead's environment,
+  // which is the only way a value set here reaches their hooks. Injected from the config, never
+  // copied from the spawner's environment; a name with a comma in it cannot be told apart inside
+  // the list, so it is dropped, and an empty list sets nothing.
+  //
+  // Not a secrets boundary, and not tamper-proof: a split-pane teammate (an operator's own
+  // `teammateMode: tmux`) is started through the login shell, so a shell startup file a teammate
+  // wrote can set this variable for later teammates. The most that buys them is soma's own
+  // stateless reasoning server, which is why a variable is good enough here.
+  const handedBack = Array.isArray(teammateMcpAllow)
+    ? teammateMcpAllow.filter((name) => typeof name === 'string' && name !== '' && !name.includes(','))
+    : [];
+  if (handedBack.length) out.SOMA_TEAMMATE_MCP_ALLOW = handedBack.join(',');
   out.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = '1';
   out.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION = '0';
   out.DISABLE_AUTOUPDATER = '1';
@@ -936,7 +956,7 @@ function launch({ id, cwd, sessionUuid, resume, task, cfg, deps, configDir }) {
   // then carries the seat into `preTrust` and `trustFileFor` below; that is what makes the three
   // agree by construction, and why neither of them takes the seat as a separate argument — a
   // second spelling would be a second place for them to disagree.
-  const env = buildLeadEnv({ id, sessionUuid, teammateEffort: cfg.teammate_effort, env: deps.env ?? process.env, configDir });
+  const env = buildLeadEnv({ id, sessionUuid, teammateEffort: cfg.teammate_effort, teammateMcpAllow: cfg.teammate_mcp_allow, env: deps.env ?? process.env, configDir });
 
   // Immediately before this launch, never batched across launches: the file is
   // last-writer-wins against claude's own rewrites of it, so a mark made for an earlier

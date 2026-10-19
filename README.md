@@ -209,9 +209,10 @@ Every lead and teammate runs with permission prompts bypassed, so soma puts thes
   token file, browser cookie and password stores), as both `Bash(...)` and `Read(...)` rules.
 - **A PreToolUse gate** (`bin/hooks/lead-gate.mjs`) on every tool call in the worktree. It enforces
   the budget breaker, keeps the soma bus for the lead alone (so no teammate can take the
-  orchestrator lease), denies `git push` and `git merge` to the lead, and refuses writes into
-  `.claude/` and under `$SOMA_HOME/leads/` from anyone. It is also registered from a settings file
-  outside the worktree, so emptying the guard file does not unregister it.
+  orchestrator lease), keeps the lead's sequential-thinking server from teammates unless
+  `teammate_mcp_allow` names it, denies `git push` and `git merge` to the lead, and refuses writes
+  into `.claude/` and under `$SOMA_HOME/leads/` from anyone. It is also registered from a settings
+  file outside the worktree, so emptying the guard file does not unregister it.
 - **A scrubbed environment**: `env -i` plus `HOME`, `PATH`, `SHELL`, `TERM`, `LANG`, `TMPDIR`,
   `CLAUDE_CONFIG_DIR` and `USER`, and the few variables soma sets itself. API keys exported in your
   shell do not reach a lead.
@@ -523,6 +524,10 @@ measured rather than assumed:
   nothing can enumerate them by name. Deny beats allow in Claude Code's resolver, and an allow
   entry, exact name *or* wildcard, does not lift a prefix deny. Exempting a connector means editing
   `STANDING_DENIES` in `bin/lib/settings-gen.mjs`, not `soma.json`.
+- **`sequential-thinking` is also the lead's own server, so the gate guards it, not the file.**
+  The worktree file never denies it: the lead loads that file too, and a deny by server name would
+  take the server away from the lead, whose standing orders make it mandatory. A teammate in its
+  own session is refused the tool by the PreToolUse gate instead, unless this list names it.
 - **It does not hand back write tools that a standing rule already covers.**
   `teammate_mcp_allow: ["github"]` restores GitHub reads while `create_pull_request`,
   `merge_pull_request`, `push_files` and the rest stay denied by name, so draft-only PRs and the

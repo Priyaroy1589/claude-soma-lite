@@ -44,7 +44,8 @@
  *   authenticated Slack, Microsoft 365 (send mail, SharePoint writes) and Google
  *   Drive. The teammates are unattended and permission-bypassed. Two mechanisms
  *   hold the line, because one cannot: a bare `mcp__<server>` deny per server
- *   *discoverable on disk* (minus `teammate_mcp_allow` from soma.json), and two
+ *   *discoverable on disk* (minus `teammate_mcp_allow` from soma.json, and minus the
+ *   two names the lead's own mcp.json serves, which the gate guards instead), and two
  *   prefix denies for the servers that are **not on disk at all** — account
  *   connectors and plugin servers. See `enumerateUserMcpServers` for what each
  *   source can and cannot see, and STANDING_DENIES for the prefix rules.
@@ -406,15 +407,29 @@ export function enumerateUserMcpServers(home = homedir(), env = process.env, opt
    * promoted; this list must read user scope or it misses the servers it exists to deny.
    * Nobody had connected them.
    *
-   * **The teammate exposure is real and is handled where it can be:** a teammate does not
-   * inherit `--mcp-config`, falls back to discovery, and mounts the user-scope bus as a
-   * CANDIDATE — `soma_adopt` and `soma_status`. It could take the orchestrator lease. A static
-   * deny cannot express "the lead may, a teammate may not", because they share one cwd and
-   * therefore one settings file. `bin/hooks/lead-gate.mjs` arm (b2) does express it, using the
-   * session id — the same discriminator, and the same reasoning, as the Bash arm.
+   * **The teammate exposure is real and is handled where it can be.** On claude 2.1.220 a
+   * teammate did not inherit `--mcp-config`, fell back to discovery, and mounted the user-scope
+   * bus as a CANDIDATE — `soma_adopt` and `soma_status` — so it could take the orchestrator
+   * lease. On Claude Code 2.1.299 a teammate is launched with the lead's `--mcp-config`,
+   * `--strict-mcp-config` and `--settings`, so it mounts the lead's own bus, in the lead role,
+   * instead. A static deny cannot express "the lead may, a teammate may not", because they share
+   * one cwd and therefore one settings file. `bin/hooks/lead-gate.mjs` arm (b2) does express it,
+   * using the session id — the same discriminator, and the same reasoning, as the Bash arm.
    *
    * So do not "tidy" this back in. A green suite would not tell you: the tests that would
    * redden are the gate's, not this file's.
+   *
+   * **`sequential-thinking` is the same case, and it broke the same way.** MEASURED on a live
+   * fleet: the operator also had a server of that name at user scope, so every worktree guard
+   * file carried `mcp__sequential-thinking`, and every lead reported the tool missing although
+   * its standing orders make it mandatory before a hard call. A bare `mcp__<server>` deny matches
+   * by server NAME, so it took the lead's own `--mcp-config` server of that name as well. The
+   * rule is therefore every name `writeLeadMcpConfig` writes (LEAD_MCP_SERVERS), not `soma`
+   * alone. The teammate half moves to `lead-gate.mjs` arm (b3), as the bus's did to (b2). On
+   * Claude Code 2.1.299 a teammate is launched with the lead's `--mcp-config` and
+   * `--strict-mcp-config`, so what it reaches is soma's own server; the gate keeps that
+   * lead-only unless `teammate_mcp_allow` names it, which is exactly what the static deny gave
+   * teammates before.
    *
    * Applied after every source has been read, not beside `add`: plugins are collected before
    * the file loop, so a delete placed at the definition would run before two of the three
@@ -440,11 +455,27 @@ export function enumerateUserMcpServers(home = homedir(), env = process.env, opt
     add(parsed.mcpServers);
     if (isObject(parsed.projects)) for (const project of Object.values(parsed.projects)) if (isObject(project)) add(project.mcpServers);
   }
-  // See the long note beside `add`: soma's own bus must not appear here. Deleted after every
-  // source has contributed, because plugins are collected before the file loop above.
-  names.delete('soma');
+  // See the long note beside `add`: no server the lead itself serves may appear here. Deleted
+  // after every source has contributed, because plugins are collected before the file loop above.
+  for (const name of LEAD_MCP_SERVERS) names.delete(name);
   return [...names];
 }
+
+/**
+ * The server names `writeLeadMcpConfig` writes into a lead's mcp.json, which is the lead's whole
+ * MCP surface under `--strict-mcp-config`. The one definition: `doctor.mjs` imports it for its
+ * `lead mcp single-server` check and its per-seat server list.
+ *
+ * None of these may ever be denied by a bare `mcp__<server>` rule in the worktree guard file:
+ * the lead loads that file too, and such a rule matches by name, so it would take the lead's own
+ * server away (see `enumerateUserMcpServers`). `test/settings-gen.test.mjs` compares this list
+ * with the keys `writeLeadMcpConfig` really writes, so a server added to one and not the other
+ * fails there, and `test/doctor.test.mjs` still spells the allowed set out by hand, which is
+ * where adding a third server has to be declared.
+ *
+ * Sorted, because doctor compares a sorted copy of what it read against it.
+ */
+export const LEAD_MCP_SERVERS = Object.freeze(['sequential-thinking', 'soma']);
 
 /**
  * Write `leads/<id>/mcp.json` — the lead's whole MCP surface — and return its path.
